@@ -11,9 +11,10 @@ l'apiserver reconnaît — sans toucher à la configuration du control plane.
 
 Compagnon de [kdt](https://github.com/agardenat/kdt).
 
-> **État : Phase 1.** Le noyau fonctionne de bout en bout (CRDs, contrôleur, émission de
-> kubeconfig, CLI). Le portail web, l'invitation par mail, le TOTP et le plugin `exec` ne sont
-> pas encore écrits. Pas de chart Helm pour l'instant.
+> **État : Phase 2 en cours.** Le noyau fonctionne de bout en bout (CRDs, contrôleur, émission
+> de kubeconfig, invitations, CLI), et les primitives d'authentification sont écrites et
+> testées. Le portail web qui les assemble, lui, n'existe pas encore : l'activation d'un compte
+> n'est donc pas encore possible. Le plugin `exec` et le chart Helm restent à faire.
 
 ## Ce que ça fait
 
@@ -54,6 +55,51 @@ subjects:
   name: kdt:lecteurs        # le sujet est publié dans KdtGroup.status.subject
   apiGroup: rbac.authorization.k8s.io
 ```
+
+## Inviter quelqu'un
+
+L'invitation est une action d'administrateur, pas un envoi automatique : aucun SMTP n'est requis
+pour faire tourner kdt-identity.
+
+```console
+$ kdt-identity-server invite alice
+Invitation pour alice <alice@example.com>
+  expire le      24/08/2026 à 12:17 UTC
+  lien           https://identity.example.com/activate?u=alice&t=rcMTOCKBV_69KSvnpRVKfyRJx…
+  code           FXJK-MNUQ
+
+Transmettez le lien et le code par deux canaux différents :
+le code de vive voix, pour qu'intercepter le lien ne suffise pas.
+```
+
+Activer un compte demande **les deux**. C'est délibéré : le lien voyage presque toujours par
+courriel, c'est-à-dire par le canal le moins maîtrisé de la chaîne, et l'intercepter ne doit pas
+suffire. Le code est court, prononçable et dépourvu de caractères confondables (`O`/`0`,
+`I`/`1`/`L`) pour être dicté au téléphone sans erreur.
+
+C'est un mot de passe à usage unique au sens strict : il est consommé au moment où le mot de
+passe est posé, dans la même écriture, donc aucun chemin ne peut le laisser rejouable.
+
+`--send-mail` envoie le lien par courriel si un SMTP est configuré. Le code reste affiché dans
+le terminal : l'envoyer par le même canal que le lien annulerait tout l'intérêt de la
+séparation.
+
+Ni le lien ni le code ne sont journalisés, ni écrits dans le statut du `KdtUser` — un statut est
+lisible par quiconque peut lister les utilisateurs. Ils n'apparaissent que dans le terminal de
+l'administrateur qui les demande, une seule fois.
+
+Relancer `invite` sur un compte existant réémet une invitation et efface le mot de passe
+précédent : c'est aussi le chemin de réinitialisation.
+
+### Pourquoi pas un code TOTP par SMS
+
+TOTP ne se bootstrape pas par un code : les codes sont *dérivés* d'un secret partagé. Il
+faudrait donc transmettre le secret lui-même — or il est permanent, là où le SMS est en clair,
+conservé par l'opérateur et vulnérable au SIM-swap. Une passerelle SMS serait par ailleurs une
+dépendance au moins aussi lourde que le SMTP qu'on cherche à éviter.
+
+Le TOTP s'enrôle par QR code dans le navigateur au moment de l'activation, ce qui est la seule
+façon correcte. Le code d'activation, lui, joue le rôle de second canal.
 
 ## Comment ça marche
 

@@ -2,7 +2,10 @@ use anyhow::{bail, Context as _};
 use clap::{Parser, Subcommand};
 use kdt_identity_api::naming::Subject;
 use kdt_identity_api::{KdtGroup, KdtUser};
+use kdt_identity_server::auth;
+use kdt_identity_server::config::ServerConfig;
 use kdt_identity_server::controller::logic;
+use kdt_identity_server::mail::{self, Encryption, Mailer};
 use kdt_identity_server::credentials::{endpoint, kubeconfig, Issuer};
 use kube::api::{Api, ListParams};
 use std::time::Duration;
@@ -25,6 +28,26 @@ enum Command {
 
     /// Réconcilie les KdtUser et KdtGroup jusqu'à l'arrêt du processus.
     Controller,
+
+    /// Crée une invitation et affiche, une seule fois, le lien et le code d'activation.
+    ///
+    /// Les deux sont à transmettre par des canaux différents : le lien par écrit, le code de
+    /// vive voix. Intercepter l'un des deux ne suffit alors pas à activer le compte.
+    Invite {
+        /// Nom du KdtUser, sans le préfixe.
+        user: String,
+
+        /// Durée de validité de l'invitation.
+        #[arg(long, default_value = "72h", value_parser = parse_duration)]
+        validity: Duration,
+
+        /// Envoie aussi le lien par courriel, si un SMTP est configuré.
+        ///
+        /// Le code reste affiché ici : le transmettre par le même canal que le lien annulerait
+        /// tout l'intérêt de la séparation.
+        #[arg(long)]
+        send_mail: bool,
+    },
 
     /// Émet un kubeconfig pour un KdtUser existant.
     ///
@@ -77,13 +100,101 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Crd => print!("{}", kdt_identity_server::manifests::all()?),
         Command::Controller => {
+            let config = ServerConfig::from_env().context("configuration")?;
             let client = kube::Client::try_default()
                 .await
                 .context("connexion au cluster")?;
-            kdt_identity_server::controller::run(client).await;
+            kdt_identity_server::controller::run(client, config).await;
         }
+        Command::Invite {
+            user,
+            validity,
+            send_mail,
+        } => invite(&user, validity, send_mail).await?,
         Command::Issue { user, ttl } => issue(&user, ttl).await?,
     }
+    Ok(())
+}
+
+/// Crée une invitation et la remet à l'administrateur.
+///
+/// Le lien et le code ne sont affichés qu'ici, et une seule fois : ils ne sont ni journalisés,
+/// ni écrits dans le statut du `KdtUser` — un statut est lisible par quiconque peut lister les
+/// utilisateurs, ce qui reviendrait à publier l'invitation.
+async fn invite(name: &str, validity: Duration, send_mail: bool) -> anyhow::Result<()> {
+    let config = ServerConfig::from_env().context("configuration")?;
+    let client = kube::Client::try_default()
+        .await
+        .context("connexion au cluster")?;
+
+    let users: Api<KdtUser> = Api::all(client.clone());
+    let user = users
+        .get(name)
+        .await
+        .with_context(|| format!("KdtUser {name:?} introuvable"))?;
+
+    if user.spec.disabled {
+        bail!("{name:?} est désactivé (spec.disabled) : inviter n'aurait aucun effet");
+    }
+
+    let validity = chrono::Duration::from_std(validity).context("durée de validité")?;
+    let new_invite = auth::invite::create(chrono::Utc::now(), validity);
+
+    // Une nouvelle invitation remplace la précédente et efface tout mot de passe existant :
+    // c'est ce qui fait de cette commande le chemin de réinitialisation autant que celui de
+    // l'invitation initiale, sans qu'un ancien mot de passe survive à la réémission.
+    let store = auth::store::CredentialStore::new(client, &config.namespace);
+    let credentials = auth::store::Credentials {
+        invite: Some(new_invite.record.clone()),
+        ..Default::default()
+    };
+    store
+        .put(&user, &credentials)
+        .await
+        .context("enregistrement de l'invitation")?;
+
+    let url = config.activation_url(name, &new_invite.token);
+
+    if send_mail {
+        let smtp = config
+            .smtp
+            .as_ref()
+            .context("--send-mail demandé mais aucun SMTP configuré")?;
+        if smtp.encryption == Encryption::None {
+            tracing::warn!(
+                "SMTP en clair : le lien d'activation circulera lisible sur le réseau"
+            );
+        }
+        Mailer::new(smtp)
+            .context("transport SMTP")?
+            .send_invitation(
+                &user.spec.email,
+                &mail::template::Invitation {
+                    display_name: user.spec.display_name.as_deref().unwrap_or(name),
+                    activation_url: &url,
+                    expires_at: new_invite.record.expires_at,
+                    cluster: &config.cluster_name,
+                },
+            )
+            .await
+            .context("envoi du courriel")?;
+        tracing::info!(destinataire = %user.spec.email, "lien envoyé par courriel");
+    }
+
+    // Sur stdout, pour être redirigeable ; les traces, elles, restent sur stderr.
+    println!("Invitation pour {name} <{}>", user.spec.email);
+    println!("  expire le      {}", new_invite.record.expires_at.format("%d/%m/%Y à %H:%M UTC"));
+    if !send_mail {
+        println!("  lien           {url}");
+    }
+    println!(
+        "  code           {}",
+        auth::invite::format_code(&new_invite.activation_code)
+    );
+    println!();
+    println!("Transmettez le lien et le code par deux canaux différents :");
+    println!("le code de vive voix, pour qu'intercepter le lien ne suffise pas.");
+
     Ok(())
 }
 

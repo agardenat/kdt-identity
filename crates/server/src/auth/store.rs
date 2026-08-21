@@ -32,6 +32,7 @@ mod keys {
     pub const TOTP_SECRET: &str = "totp-secret";
     pub const TOTP_LAST_STEP: &str = "totp-last-step";
     pub const INVITE_TOKEN_HASH: &str = "invite-token-hash";
+    pub const INVITE_CODE_HASH: &str = "invite-code-hash";
     pub const INVITE_EXPIRES_AT: &str = "invite-expires-at";
     pub const FAILED_ATTEMPTS: &str = "failed-attempts";
     pub const LOCKED_UNTIL: &str = "locked-until";
@@ -81,6 +82,28 @@ impl Credentials {
     /// pas encore enrôlé — ne doit pas pouvoir servir.
     pub fn is_activated(&self) -> bool {
         self.password_hash.is_some() && self.totp_secret.is_some()
+    }
+
+    /// Active le compte et consomme l'invitation dans le même mouvement.
+    ///
+    /// Le caractère à usage unique du code d'activation tient à cette fonction, et non à la
+    /// discipline de l'appelant : poser le mot de passe et effacer l'invitation ne peuvent pas
+    /// être dissociés, donc aucun chemin ne peut laisser un code réutilisable derrière lui.
+    ///
+    /// Le compteur d'échecs est remis à zéro : une activation réussie prouve que la personne
+    /// détient le lien et le code, il n'y a plus de raison de la faire patienter.
+    pub fn activated(
+        &self,
+        password_hash: Zeroizing<String>,
+        totp_secret: Zeroizing<String>,
+    ) -> Self {
+        Self {
+            password_hash: Some(password_hash),
+            totp_secret: Some(totp_secret),
+            totp_last_step: None,
+            invite: None,
+            lockout: Lockout::default(),
+        }
     }
 }
 
@@ -163,6 +186,7 @@ fn encode(credentials: &Credentials) -> BTreeMap<String, ByteString> {
     }
     if let Some(invite) = &credentials.invite {
         put(keys::INVITE_TOKEN_HASH, invite.token_hash.clone());
+        put(keys::INVITE_CODE_HASH, invite.code_hash.clone());
         put(keys::INVITE_EXPIRES_AT, invite.expires_at.to_rfc3339());
     }
     if credentials.lockout.failed_attempts > 0 {
@@ -203,19 +227,22 @@ fn decode(data: &BTreeMap<String, ByteString>) -> Result<Credentials, StoreError
 
     let invite = match (
         text(keys::INVITE_TOKEN_HASH)?,
+        text(keys::INVITE_CODE_HASH)?,
         timestamp(keys::INVITE_EXPIRES_AT)?,
     ) {
-        (Some(token_hash), Some(expires_at)) => Some(InviteRecord {
+        (Some(token_hash), Some(code_hash), Some(expires_at)) => Some(InviteRecord {
             token_hash,
+            code_hash,
             expires_at,
         }),
-        (None, None) => None,
-        // Une invitation sans date d'expiration serait éternelle, une date sans empreinte est
-        // orpheline : dans les deux cas la donnée est incohérente, pas incomplète.
+        (None, None, None) => None,
+        // Une invitation sans expiration serait éternelle, sans code elle n'exigerait plus
+        // qu'un seul facteur, sans jeton elle est orpheline : dans les trois cas la donnée est
+        // incohérente, pas incomplète. La compléter par un défaut affaiblirait le dispositif.
         _ => {
             return Err(StoreError::CorruptField(
                 keys::INVITE_TOKEN_HASH,
-                "empreinte et date d'expiration doivent être présentes ensemble".to_string(),
+                "jeton, code et date d'expiration doivent être présents ensemble".to_string(),
             ))
         }
     };
@@ -258,6 +285,7 @@ mod tests {
             totp_last_step: Some(56_666_666),
             invite: Some(InviteRecord {
                 token_hash: "a".repeat(64),
+                code_hash: "b".repeat(64),
                 expires_at: instant() + Duration::hours(72),
             }),
             lockout: Lockout {
@@ -326,16 +354,41 @@ mod tests {
         ));
     }
 
-    /// Une invitation sans expiration serait éternelle.
+    /// Une invitation sans expiration serait éternelle ; sans code, elle n'exigerait plus
+    /// qu'un seul facteur.
     #[test]
     fn une_invitation_incomplete_est_refusee() {
-        let mut data = encode(&complete());
-        data.remove(keys::INVITE_EXPIRES_AT);
-        assert!(matches!(decode(&data), Err(StoreError::CorruptField(_, _))));
+        for champ in [
+            keys::INVITE_EXPIRES_AT,
+            keys::INVITE_TOKEN_HASH,
+            keys::INVITE_CODE_HASH,
+        ] {
+            let mut data = encode(&complete());
+            data.remove(champ);
+            assert!(
+                matches!(decode(&data), Err(StoreError::CorruptField(_, _))),
+                "l'absence de {champ:?} aurait dû être refusée"
+            );
+        }
+    }
 
-        let mut data = encode(&complete());
-        data.remove(keys::INVITE_TOKEN_HASH);
-        assert!(matches!(decode(&data), Err(StoreError::CorruptField(_, _))));
+    /// Le caractère à usage unique du code d'activation repose sur cette fonction : elle ne
+    /// laisse aucun chemin qui poserait le mot de passe en conservant l'invitation.
+    #[test]
+    fn l_activation_consomme_l_invitation() {
+        let avant = complete();
+        assert!(avant.invite.is_some());
+
+        let apres = avant.activated(
+            Zeroizing::new("$argon2id$nouveau".to_string()),
+            Zeroizing::new("NOUVEAUSECRET".to_string()),
+        );
+
+        assert!(apres.invite.is_none(), "invitation encore rejouable");
+        assert!(apres.is_activated());
+        assert_eq!(apres.lockout, Lockout::default());
+        // Le compteur anti-rejeu TOTP repart de zéro : le secret n'est plus le même.
+        assert_eq!(apres.totp_last_step, None);
     }
 
     #[test]

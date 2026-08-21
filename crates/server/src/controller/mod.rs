@@ -7,6 +7,8 @@
 
 pub mod logic;
 
+use crate::auth::store::{self, CredentialStore};
+use crate::config::ServerConfig;
 use futures::StreamExt;
 use kdt_identity_api::crd::{KdtGroupStatus, KdtUserStatus};
 use kdt_identity_api::naming::Subject;
@@ -33,20 +35,24 @@ pub enum Error {
     Unnamed,
     #[error("nom stocké invalide : {0}")]
     Name(#[from] kdt_identity_api::NameError),
+    #[error("credentials : {0}")]
+    Store(#[from] store::StoreError),
 }
 
 pub struct Context {
     users: Api<KdtUser>,
     groups: Api<KdtGroup>,
+    store: CredentialStore,
 }
 
 /// Fait tourner les deux contrôleurs jusqu'à l'arrêt du processus.
-pub async fn run(client: Client) {
+pub async fn run(client: Client, config: ServerConfig) {
     let users: Api<KdtUser> = Api::all(client.clone());
-    let groups: Api<KdtGroup> = Api::all(client);
+    let groups: Api<KdtGroup> = Api::all(client.clone());
     let ctx = Arc::new(Context {
         users: users.clone(),
         groups: groups.clone(),
+        store: CredentialStore::new(client, &config.namespace),
     });
 
     // L'appartenance d'un utilisateur est portée par les groupes : modifier un `KdtGroup` doit
@@ -97,10 +103,19 @@ async fn reconcile_user(user: Arc<KdtUser>, ctx: Arc<Context>) -> Result<Action,
     let name = user.metadata.name.clone().ok_or(Error::Unnamed)?;
     let groups = ctx.groups.list(&ListParams::default()).await?.items;
 
+    // Le contrôleur n'invite personne : créer une invitation produit un lien et un code qui
+    // valent une authentification, et qui n'ont qu'une destination légitime — le terminal de
+    // l'administrateur qui la demande. Un contrôleur, lui, n'a que ses journaux et le statut
+    // de l'objet, deux endroits où ces valeurs n'ont rien à faire.
+    let credentials = ctx.store.get(&name).await?;
+
     let desired = KdtUserStatus {
         member_of: logic::member_of(&name, &groups),
-        // Les credentials n'existent pas encore : la phase reste dérivée de la seule spec.
-        phase: Some(logic::phase(&user, false)),
+        phase: Some(logic::phase(
+            &user,
+            credentials.as_ref().is_some_and(|c| c.is_activated()),
+        )),
+        credential_secret_ref: credentials.as_ref().map(|_| store::secret_name(&name)),
         ..user.status.clone().unwrap_or_default()
     };
 
@@ -161,7 +176,9 @@ async fn reconcile_group(group: Arc<KdtGroup>, ctx: Arc<Context>) -> Result<Acti
 }
 
 fn equivalent_user(current: &KdtUserStatus, desired: &KdtUserStatus) -> bool {
-    current.member_of == desired.member_of && current.phase == desired.phase
+    current.member_of == desired.member_of
+        && current.phase == desired.phase
+        && current.credential_secret_ref == desired.credential_secret_ref
 }
 
 fn equivalent_group(current: &KdtGroupStatus, desired: &KdtGroupStatus) -> bool {

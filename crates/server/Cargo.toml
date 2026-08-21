@@ -34,6 +34,7 @@ argon2 = { version = "0.5", features = ["std"] }
 totp-rs = { version = "6", features = ["gen_secret", "otpauth", "zeroize"] }
 getrandom = "0.4.3"
 subtle = "2.6.1"
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "pool", "rustls-native-certs", "rustls-tls", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
 
 [dev-dependencies]
 der = "0.8"
