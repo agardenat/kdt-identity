@@ -23,7 +23,7 @@ use kube::runtime::wait::await_condition;
 use std::time::Duration;
 use x509_parser::prelude::*;
 
-use super::csr;
+use kdt_identity_api::csr;
 
 /// Le seul signeur que kdt-identity sollicite.
 pub const SIGNER_NAME: &str = "kubernetes.io/kube-apiserver-client";

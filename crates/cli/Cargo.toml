@@ -4,13 +4,26 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Plugin d'authentification kubectl pour kdt-identity"
 
 [[bin]]
 name = "kdt-identity"
 path = "src/main.rs"
 
 [dependencies]
-kdt-identity-api = { path = "../api" }
+# Sans la feature `crd` : le plugin n'a besoin que du nommage et de la génération de CSR, pas
+# des types Kubernetes ni du client kube.
+kdt-identity-api = { path = "../api", default-features = false }
 anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
+sha2 = "0.11"
+thiserror.workspace = true
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rpassword = "7"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

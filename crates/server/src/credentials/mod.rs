@@ -8,10 +8,10 @@
 //!
 //! Dans les deux cas, [`issuer::Issuer`] vérifie le sujet de la demande avant de l'approuver.
 
-pub mod csr;
 pub mod endpoint;
 pub mod kubeconfig;
 pub mod issuer;
 
+pub use kdt_identity_api::csr;
 pub use kubeconfig::{ClusterEndpoint, KubeconfigError};
 pub use issuer::{IssueError, IssuedCredential, Issuer, SIGNER_NAME};

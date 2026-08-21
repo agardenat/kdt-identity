@@ -12,9 +12,8 @@ l'apiserver reconnaît — sans toucher à la configuration du control plane.
 Compagnon de [kdt](https://github.com/agardenat/kdt).
 
 > **État : le chemin complet fonctionne.** Créer un compte, l'inviter, l'activer depuis le
-> portail avec mot de passe et TOTP, se connecter et télécharger un kubeconfig que l'apiserver
-> reconnaît — tout est en place. Restent le plugin `exec` (renouvellement automatique) et le
-> chart Helm.
+> portail avec mot de passe et TOTP, puis obtenir un accès — par téléchargement d'un kubeconfig
+> ou par le plugin `exec`. Reste le chart Helm.
 
 ## Ce que ça fait
 
@@ -139,6 +138,56 @@ Variables d'environnement du portail :
 
 Sans `KDT_IDENTITY_SESSION_KEY`, une clé est tirée au démarrage : les sessions ne survivent
 alors ni à un redémarrage ni à une seconde instance. Le serveur le signale au lancement.
+
+## Le plugin `exec`
+
+Le téléchargement d'un kubeconfig depuis le portail est pratique, mais il fait voyager une clé
+privée sur le réseau et il faut recommencer à chaque expiration. Le plugin fait mieux :
+
+```sh
+kdt-identity kubeconfig --portal https://identity.example.com --user alice \
+    --cluster production --server https://k8s.example.com:6443 --ca-file ca.crt > ~/.kube/config
+```
+
+Le kubeconfig produit ne contient **aucun secret** : il déclare simplement `kubectl` doit
+appeler `kdt-identity` quand il a besoin d'un credential.
+
+À la première commande, le plugin demande le mot de passe et un code TOTP, engendre une paire
+de clés **sur le poste**, en envoie seulement la demande de signature, et met le certificat en
+cache jusqu'à son expiration. Les commandes suivantes ne demandent rien.
+
+La clé privée ne traverse jamais le réseau — c'est ce que le téléchargement navigateur ne peut
+pas offrir. Le cache est écrit en 0600 dans `~/.kube/cache/kdt-identity/`.
+
+`kdt-identity logout` efface le cache et force une nouvelle authentification.
+
+### Pourquoi deux appels HTTP
+
+Le sujet d'un certificat X.509 — nom d'utilisateur et groupes — est fixé dans la demande de
+signature, elle-même signée par la clé du client. Le portail ne peut donc pas compléter un
+sujet incomplet : il ne peut que l'accepter ou le refuser. Le plugin doit connaître ses groupes
+**avant** de signer, et un code TOTP ne servant qu'une fois, il ne peut pas s'authentifier deux
+fois pour les apprendre. Le premier appel authentifie et rend l'identité effective avec un
+jeton valable une minute ; le second fait signer.
+
+### Faire vivre les groupes
+
+Ajouter ou retirer quelqu'un d'un groupe fonctionne normalement : le portail comme le plugin
+relisent les groupes depuis le cluster **au moment d'émettre**, jamais depuis un cache.
+
+```console
+$ kubectl patch kdtgroup ops --type=merge -p '{"spec":{"members":[]}}'
+
+$ kubectl auth whoami                    # certificat déjà émis : inchangé
+Groups   [kdt:ops kdt:lecteurs system:authenticated]
+
+$ kdt-identity logout --portal … --user alice && kubectl auth whoami
+Groups   [kdt:lecteurs system:authenticated]
+```
+
+Le certificat déjà émis garde ses groupes jusqu'à expiration — c'est la contrepartie du modèle
+par certificats, détaillée dans [Révocation](#révocation). Un changement d'appartenance prend
+donc effet au renouvellement suivant, soit au plus tard huit heures.
 
 ## Comment ça marche
 

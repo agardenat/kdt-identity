@@ -4,9 +4,13 @@
 //! pour que la validation des noms soit exactement la même côté admission, côté API et côté
 //! émission de certificat.
 
+#[cfg(feature = "crd")]
 pub mod crd;
+pub mod csr;
 pub mod naming;
+pub mod portal;
 
+#[cfg(feature = "crd")]
 pub use crd::{
     KdtGroup, KdtGroupSpec, KdtGroupStatus, KdtUser, KdtUserSpec, KdtUserStatus, UserPhase,
     API_GROUP, API_VERSION, CREDENTIAL_SECRET_TYPE,

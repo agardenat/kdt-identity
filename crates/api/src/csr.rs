@@ -7,7 +7,7 @@
 //! invariants sont malgré tout rejoués ci-dessous, pour ne pas dépendre d'un appelant.
 
 use der::{EncodePem, pem::LineEnding};
-use kdt_identity_api::naming::{self, Subject};
+use crate::naming::{self, Subject};
 use p256::ecdsa::{DerSignature, SigningKey};
 use p256::elliptic_curve::Generate;
 use p256::pkcs8::EncodePrivateKey;
@@ -18,7 +18,7 @@ use x509_cert::name::Name;
 #[derive(Debug, thiserror::Error)]
 pub enum CsrError {
     #[error("identité refusée : {0}")]
-    Name(#[from] kdt_identity_api::NameError),
+    Name(#[from] crate::NameError),
     #[error("encodage DER : {0}")]
     Der(#[from] der::Error),
     #[error("construction de la demande : {0}")]

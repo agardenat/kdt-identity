@@ -6,14 +6,26 @@ license.workspace = true
 repository.workspace = true
 description = "Types partagés (CRDs KdtUser/KdtGroup) et règles de nommage de kdt-identity"
 
+[features]
+default = ["crd"]
+# Les types CRD tirent kube et k8s-openapi. Le plugin client n'a besoin que du nommage et de
+# la génération de CSR : il compile ce crate sans cette feature, et sans ces dépendances.
+crd = ["dep:kube", "dep:k8s-openapi", "dep:schemars"]
+
 [dependencies]
-kube = { workspace = true, features = ["derive"] }
-k8s-openapi.workspace = true
-schemars.workspace = true
+kube = { workspace = true, features = ["derive"], optional = true }
+k8s-openapi = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+zeroize = "1"
+der = { version = "0.8", features = ["pem"] }
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+sha2 = { version = "0.11", features = ["oid"] }
+x509-cert = { version = "0.3", features = ["builder"] }
 
 [dev-dependencies]
 regex = "1.13.1"
+x509-parser = { version = "0.16", features = ["verify"] }

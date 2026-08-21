@@ -30,6 +30,9 @@ use axum::routing::{get, post};
 use axum::Router;
 use chrono::Utc;
 use kdt_identity_api::naming::Subject;
+use kdt_identity_api::portal::{
+    CredentialRequest, CredentialResponse, SessionRequest, SessionResponse,
+};
 use kdt_identity_api::{KdtGroup, KdtUser};
 use kube::api::{Api, ListParams};
 use serde::Deserialize;
@@ -43,6 +46,8 @@ use zeroize::Zeroizing;
 mod purpose {
     pub const SESSION: &str = "session";
     pub const CSRF: &str = "csrf";
+    /// Jeton remis au plugier `exec` entre l'authentification et la demande de certificat.
+    pub const API_CREDENTIAL: &str = "api-credential";
 }
 
 const SESSION_COOKIE: &str = "kdt_identity_session";
@@ -78,6 +83,8 @@ pub fn router(state: Shared) -> Router {
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", post(logout))
         .route("/kubeconfig", post(download_kubeconfig))
+        .route(kdt_identity_api::portal::SESSION_PATH, post(api_session))
+        .route(kdt_identity_api::portal::CREDENTIAL_PATH, post(api_credential))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
 }
@@ -294,41 +301,69 @@ pub struct LoginForm {
 }
 
 async fn login_submit(State(state): State<Shared>, Form(form): Form<LoginForm>) -> Response {
-    let refuse = |reason: &str| {
-        warn!(user = %form.user, raison = reason, "connexion refusée");
-        (
-            StatusCode::UNAUTHORIZED,
-            Html(views::login(Some(GENERIC_AUTH_FAILURE)).into_string()),
-        )
-            .into_response()
-    };
+    match authenticate(&state, &form.user, &form.password, &form.totp).await {
+        Ok(_) => {
+            info!(user = %form.user, "connexion réussie");
+            let token = state.signer.sign(
+                purpose::SESSION,
+                &form.user,
+                (Utc::now() + SESSION_TTL).timestamp(),
+            );
+            (
+                [(header::SET_COOKIE, session_cookie(&token, SESSION_TTL.num_seconds()))],
+                Redirect::to("/"),
+            )
+                .into_response()
+        }
+        Err(reason) => {
+            warn!(user = %form.user, raison = reason, "connexion refusée");
+            (
+                StatusCode::UNAUTHORIZED,
+                Html(views::login(Some(GENERIC_AUTH_FAILURE)).into_string()),
+            )
+                .into_response()
+        }
+    }
+}
 
+/// Authentifie un compte par mot de passe et code TOTP.
+///
+/// Chemin unique pour le formulaire du portail et pour l'API du plugin `exec` : verrouillage,
+/// anti-rejeu TOTP et remise à zéro du compteur ne doivent pas dépendre de la porte d'entrée.
+/// La raison de l'échec est rendue à l'appelant pour le journal, jamais pour le visiteur.
+async fn authenticate(
+    state: &AppState,
+    name: &str,
+    password: &str,
+    totp_code: &str,
+) -> Result<KdtUser, &'static str> {
     let now = Utc::now();
-    let Ok(user) = state.users.get(&form.user).await else {
-        return refuse("compte inconnu");
-    };
-    let Ok(Some(credentials)) = state.store.get(&form.user).await else {
-        return refuse("aucun credential");
-    };
+    let user = state.users.get(name).await.map_err(|_| "compte inconnu")?;
+    let credentials = state
+        .store
+        .get(name)
+        .await
+        .map_err(|_| "credentials illisibles")?
+        .ok_or("aucun credential")?;
 
     if credentials.lockout.is_locked(now) {
-        return refuse("verrouillé");
+        return Err("verrouillé");
     }
     if user.spec.disabled {
-        return refuse("compte désactivé");
+        return Err("compte désactivé");
     }
     let (Some(stored_hash), Some(totp_secret)) =
         (&credentials.password_hash, &credentials.totp_secret)
     else {
-        return refuse("compte non activé");
+        return Err("compte non activé");
     };
 
-    let password_ok = match password::verify(&form.password, stored_hash) {
+    let password_ok = match password::verify(password, stored_hash) {
         Ok(ok) => ok,
         Err(e) => {
             // Empreinte illisible : ce n'est pas la faute de l'utilisateur, et ça demande une
             // intervention. Le journal doit le dire, le visiteur n'a pas à le savoir.
-            warn!(user = %form.user, erreur = %e, "empreinte de mot de passe inutilisable");
+            warn!(user = %name, erreur = %e, "empreinte de mot de passe inutilisable");
             false
         }
     };
@@ -338,14 +373,14 @@ async fn login_submit(State(state): State<Shared>, Form(form): Form<LoginForm>) 
     // ce qui distinguerait les deux cas malgré le message unique.
     let step = totp::verify(
         totp_secret,
-        &form.totp,
+        totp_code,
         now.timestamp() as u64,
         credentials.totp_last_step,
     );
 
     let (true, Ok(step)) = (password_ok, step) else {
-        record_failure(&state, &user, &credentials, now).await;
-        return refuse("mot de passe ou code invalide");
+        record_failure(state, &user, &credentials, now).await;
+        return Err("mot de passe ou code invalide");
     };
 
     // Le pas TOTP est mémorisé : c'est ce qui rend le code inutilisable une seconde fois.
@@ -354,22 +389,13 @@ async fn login_submit(State(state): State<Shared>, Form(form): Form<LoginForm>) 
         lockout: Lockout::default(),
         ..credentials.clone()
     };
-    if state.store.put(&user, &ok).await.is_err() {
-        return refuse("enregistrement de la session");
-    }
+    state
+        .store
+        .put(&user, &ok)
+        .await
+        .map_err(|_| "enregistrement du pas TOTP")?;
 
-    info!(user = %form.user, "connexion réussie");
-    let token = state.signer.sign(
-        purpose::SESSION,
-        &form.user,
-        (now + SESSION_TTL).timestamp(),
-    );
-
-    (
-        [(header::SET_COOKIE, session_cookie(&token, SESSION_TTL.num_seconds()))],
-        Redirect::to("/"),
-    )
-        .into_response()
+    Ok(user)
 }
 
 /// Incrémente le compteur d'échecs, ce qui déclenche le verrouillage progressif.
@@ -552,6 +578,140 @@ async fn subjects(state: &AppState, user: &str) -> Result<(Subject, Vec<Subject>
         .map_err(|e| e.to_string())?;
 
     Ok((subject, group_subjects))
+}
+
+// ---------------------------------------------------------------- API plugin
+
+/// Durée de vie du jeton remis au plugin entre les deux appels.
+///
+/// Le temps de construire une demande de signature, pas davantage : ce jeton autorise
+/// l'émission d'un certificat, il n'a aucune raison de survivre à l'échange.
+const API_TOKEN_TTL: chrono::Duration = chrono::Duration::seconds(60);
+
+/// Authentifie le plugin et lui rend de quoi construire sa demande.
+///
+/// Séparé de l'émission parce qu'un code TOTP ne sert qu'une fois : le plugin ne peut pas
+/// s'authentifier deux fois de suite pour apprendre ses groupes puis demander son certificat.
+async fn api_session(
+    State(state): State<Shared>,
+    axum::Json(request): axum::Json<SessionRequest>,
+) -> Response {
+    let user = match authenticate(&state, &request.user, &request.password, &request.totp).await {
+        Ok(user) => user,
+        Err(reason) => {
+            warn!(user = %request.user, raison = reason, "session API refusée");
+            return unauthorized_json();
+        }
+    };
+
+    let phase = match state.store.get(&request.user).await {
+        Ok(Some(credentials)) => logic::phase(&user, credentials.is_activated()),
+        _ => return unauthorized_json(),
+    };
+    if !logic::may_request_own_credential(phase) {
+        warn!(user = %request.user, ?phase, "session API refusée");
+        return unauthorized_json();
+    }
+
+    let (subject, groups) = match subjects(&state, &request.user).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(user = %request.user, erreur = %e, "groupes illisibles");
+            return internal_error_json();
+        }
+    };
+
+    info!(user = %request.user, "session API ouverte");
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        axum::Json(SessionResponse {
+            token: state.signer.sign(
+                purpose::API_CREDENTIAL,
+                &request.user,
+                (Utc::now() + API_TOKEN_TTL).timestamp(),
+            ),
+            subject: subject.as_str().to_string(),
+            groups: groups.iter().map(|g| g.as_str().to_string()).collect(),
+        }),
+    )
+        .into_response()
+}
+
+/// Émet un certificat pour une demande construite par le client.
+///
+/// Le sujet de la demande n'est pas cru sur parole : [`Issuer::issue_from_csr`] le confronte à
+/// l'identité authentifiée, et les groupes sont **relus depuis le cluster** plutôt que repris
+/// de ce que la session avait annoncé. Un groupe retiré entre les deux appels doit faire
+/// échouer l'émission, pas se glisser dans un certificat valide huit heures.
+async fn api_credential(
+    State(state): State<Shared>,
+    axum::Json(request): axum::Json<CredentialRequest>,
+) -> Response {
+    let Ok(name) = state
+        .signer
+        .verify(purpose::API_CREDENTIAL, &request.token, Utc::now().timestamp())
+    else {
+        warn!("jeton d'émission absent, invalide ou expiré");
+        return unauthorized_json();
+    };
+
+    let (subject, groups) = match subjects(&state, &name).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(user = %name, erreur = %e, "groupes illisibles");
+            return internal_error_json();
+        }
+    };
+
+    match state
+        .issuer
+        .issue_from_csr(&request.csr, &subject, &groups, CERT_TTL)
+        .await
+    {
+        Ok(credential) => {
+            info!(user = %name, expire = %credential.not_after, "credential émis pour le plugin");
+            (
+                [(header::CACHE_CONTROL, "no-store")],
+                axum::Json(CredentialResponse {
+                    certificate: credential.certificate_pem,
+                    expires_at: credential.not_after.to_rfc3339(),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            warn!(user = %name, erreur = %e, "émission refusée");
+            // Un sujet qui ne correspond pas est une tentative, ou des groupes qui ont changé
+            // entre les deux appels : dans les deux cas ce n'est pas une panne, et le
+            // distinguer d'une 500 évite que ça se noie dans les erreurs d'exploitation.
+            match e {
+                crate::credentials::IssueError::SubjectMismatch(_) => (
+                    StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({
+                        "error": "la demande ne correspond pas à l'identité authentifiée"
+                    })),
+                )
+                    .into_response(),
+                _ => internal_error_json(),
+            }
+        }
+    }
+}
+
+fn unauthorized_json() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({ "error": GENERIC_AUTH_FAILURE })),
+    )
+        .into_response()
+}
+
+fn internal_error_json() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(serde_json::json!({ "error": "émission impossible" })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------- outils
