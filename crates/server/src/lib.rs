@@ -1,5 +1,6 @@
 //! Serveur kdt-identity : contrôleur, émission de credentials, portail web.
 
+pub mod auth;
 pub mod controller;
 pub mod credentials;
 pub mod manifests;
