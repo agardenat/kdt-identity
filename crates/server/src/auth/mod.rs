@@ -7,4 +7,5 @@
 pub mod invite;
 pub mod lockout;
 pub mod password;
+pub mod store;
 pub mod totp;
