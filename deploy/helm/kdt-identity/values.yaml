@@ -1,0 +1,97 @@
+# Nom du cluster tel qu'il apparaît aux utilisateurs, dans le portail et dans leur kubeconfig.
+clusterName: ""
+
+# Racine publique du portail. Sert à construire les liens d'activation, qui sont envoyés à des
+# gens : elle doit être l'adresse qu'ils peuvent réellement ouvrir.
+portalUrl: ""
+
+# Adresse publique de l'apiserver, telle que les postes de travail l'atteignent.
+#
+# Ce n'est pas https://kubernetes.default.svc : cette URL finit dans le kubeconfig d'un
+# utilisateur, qui n'est pas dans le cluster.
+apiserverUrl: ""
+
+image:
+  repository: ghcr.io/agardenat/kdt-identity
+  pullPolicy: IfNotPresent
+  # Par défaut, l'appVersion du chart.
+  tag: ""
+
+logLevel: kdt_identity_server=info
+
+serviceAccount:
+  name: ""
+
+controller:
+  # Une seule instance : le contrôleur n'a pas d'élection de leader, et deux réplicas
+  # réconcilieraient les mêmes objets en concurrence. Les écritures sont idempotentes, mais le
+  # gain serait nul et les conflits réels.
+  replicas: 1
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {memory: 128Mi}
+
+portal:
+  replicas: 1
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {memory: 128Mi}
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  tls:
+    enabled: true
+    secretName: ""
+
+# Clé de signature des sessions, 32 octets en base64.
+#
+# Laissée vide, le chart en engendre une et la conserve d'une montée de version à l'autre.
+# Sans elle, chaque instance signerait avec la sienne et une session ouverte sur l'une ne
+# serait pas reconnue par l'autre.
+sessionKey: ""
+
+# SMTP est facultatif : l'invitation s'obtient par `kdt-identity-server invite`, qui affiche le
+# lien et le code à transmettre. `--send-mail` n'a besoin de ceci que pour envoyer le lien.
+smtp:
+  enabled: false
+  host: ""
+  port: 587
+  from: ""
+  # starttls | implicit | none
+  encryption: starttls
+  # Nom du Secret portant KDT_IDENTITY_SMTP_USERNAME et KDT_IDENTITY_SMTP_PASSWORD.
+  existingSecret: ""
+
+networkPolicy:
+  # Refuse tout par défaut, n'ouvre que ce qui est nécessaire. kdt-identity peut forger
+  # n'importe quelle identité du cluster : il n'a rien à faire sur le réseau au-delà de
+  # l'apiserver, du DNS et, le cas échéant, du relais SMTP.
+  enabled: true
+  # Sélecteur des pods autorisés à joindre le portail, typiquement le contrôleur d'ingress.
+  ingressFrom: []
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+nameOverride: ""
+fullnameOverride: ""

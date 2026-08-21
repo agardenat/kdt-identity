@@ -1,0 +1,110 @@
+{{- $image := printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kdt-identity.fullname" . }}-controller
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "kdt-identity.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  selector:
+    matchLabels:
+      {{- include "kdt-identity.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        {{- include "kdt-identity.labels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: {{ include "kdt-identity.serviceAccountName" . }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: controller
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["controller"]
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env: {{- include "kdt-identity.env" . | nindent 12 }}
+          resources: {{- toYaml .Values.controller.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kdt-identity.fullname" . }}-portal
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "kdt-identity.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.portal.replicas }}
+  selector:
+    matchLabels:
+      {{- include "kdt-identity.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: portal
+  template:
+    metadata:
+      labels:
+        {{- include "kdt-identity.labels" . | nindent 8 }}
+        app.kubernetes.io/component: portal
+    spec:
+      serviceAccountName: {{ include "kdt-identity.serviceAccountName" . }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: portal
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve"]
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            {{- include "kdt-identity.env" . | nindent 12 }}
+            - name: KDT_IDENTITY_LISTEN
+              value: "0.0.0.0:8080"
+            - name: KDT_IDENTITY_SESSION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kdt-identity.fullname" . }}-session
+                  key: session-key
+            {{- if .Values.smtp.enabled }}
+            - name: KDT_IDENTITY_SMTP_HOST
+              value: {{ .Values.smtp.host | quote }}
+            - name: KDT_IDENTITY_SMTP_PORT
+              value: {{ .Values.smtp.port | quote }}
+            - name: KDT_IDENTITY_SMTP_FROM
+              value: {{ .Values.smtp.from | quote }}
+            - name: KDT_IDENTITY_SMTP_ENCRYPTION
+              value: {{ .Values.smtp.encryption | quote }}
+            {{- end }}
+          {{- if and .Values.smtp.enabled .Values.smtp.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.smtp.existingSecret }}
+          {{- end }}
+          # `/healthz` ne touche ni au cluster ni aux Secrets : une sonde qui authentifierait
+          # ferait échouer le pod dès que l'apiserver hoquette.
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          resources: {{- toYaml .Values.portal.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kdt-identity.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "kdt-identity.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+  selector:
+    {{- include "kdt-identity.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: portal

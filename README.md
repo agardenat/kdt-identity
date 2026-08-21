@@ -11,9 +11,9 @@ l'apiserver reconnaît — sans toucher à la configuration du control plane.
 
 Compagnon de [kdt](https://github.com/agardenat/kdt).
 
-> **État : le chemin complet fonctionne.** Créer un compte, l'inviter, l'activer depuis le
-> portail avec mot de passe et TOTP, puis obtenir un accès — par téléchargement d'un kubeconfig
-> ou par le plugin `exec`. Reste le chart Helm.
+> **État : complet et déployable.** Créer un compte, l'inviter, l'activer depuis le portail
+> avec mot de passe et TOTP, puis obtenir un accès — par téléchargement d'un kubeconfig ou par
+> le plugin `exec`. Chart Helm et image fournis.
 
 ## Ce que ça fait
 
@@ -257,17 +257,48 @@ Une révocation individuelle instantanée demanderait le mode OIDC ou un proxy d
 
 ## Installation
 
-Les manifestes sont dérivés des types Rust — rien n'est recopié à la main :
+```sh
+helm install kdt-identity deploy/helm/kdt-identity \
+    --namespace kdt-identity --create-namespace \
+    --set clusterName=production \
+    --set portalUrl=https://identity.example.com \
+    --set apiserverUrl=https://k8s.example.com:6443 \
+    --set ingress.enabled=true \
+    --set ingress.host=identity.example.com
+```
+
+`apiserverUrl` n'est pas `https://kubernetes.default.svc` : cette adresse finit dans le
+kubeconfig d'un utilisateur, qui n'est pas dans le cluster.
+
+Le chart refuse de s'installer avec un ingress sans TLS. Ce n'est pas du zèle : le cookie de
+session porte l'attribut `Secure`, donc un navigateur ne le renverrait pas sur du HTTP — le
+portail serait inutilisable, et silencieusement.
+
+Sans ingress, pour essayer :
+
+```sh
+kubectl -n kdt-identity port-forward svc/kdt-identity-kdt-identity 8080:80
+```
+
+### Ce que le chart installe
+
+| Ressource | Pourquoi |
+|---|---|
+| `ClusterRole` | lecture des CRDs, écriture de leur statut, cycle de vie des CSR |
+| `signers` avec `resourceNames` | l'autorisation d'approuver est restreinte au seul `kubernetes.io/kube-apiserver-client` |
+| `Role` namespacé | les Secrets de credentials, **sans le verbe `list`** : le contrôleur y accède toujours par leur nom, et l'absence de ce verbe empêche d'énumérer les comptes |
+| `NetworkPolicy` | apiserver, DNS et SMTP uniquement — le reste est refusé |
+| `ValidatingAdmissionPolicy` | les règles de nommage, rejouées côté apiserver |
+
+Les CRDs et la politique d'admission du chart sont **générées depuis le code**, et un test
+échoue si le YAML committé s'en écarte. Sans ce verrou, le schéma servi par le contrôleur et le
+schéma installé dans le cluster finiraient par diverger en silence.
+
+Sans Helm, pour un essai rapide :
 
 ```sh
 kdt-identity-server crd | kubectl apply -f -
 kdt-identity-server controller
-```
-
-Pour tout retirer :
-
-```sh
-kubectl delete -f <(kdt-identity-server crd)
 ```
 
 ## Développement

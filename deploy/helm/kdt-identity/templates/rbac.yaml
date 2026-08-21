@@ -1,0 +1,93 @@
+{{/*
+  Le RBAC de kdt-identity.
+
+  Approuver une CSR « kubernetes.io/kube-apiserver-client » revient à choisir une identité
+  auprès de l'apiserver : ce ServiceAccount est, de fait, équivalent cluster-admin. Chaque
+  règle ci-dessous est donc réduite au strict nécessaire, et le `resourceNames` sur les signers
+  est ce qui empêche kdt-identity d'approuver des demandes pour un autre signeur.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kdt-identity.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "kdt-identity.labels" . | nindent 4 }}
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kdt-identity.fullname" . }}
+  labels: {{- include "kdt-identity.labels" . | nindent 4 }}
+rules:
+  # Les identités elles-mêmes. Aucune écriture sur la spec : créer et modifier des comptes
+  # relève de l'administrateur, pas du contrôleur, qui n'en dérive que le statut.
+  - apiGroups: ["identity.kdt.sh"]
+    resources: ["kdtusers", "kdtgroups"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["identity.kdt.sh"]
+    resources: ["kdtusers/status", "kdtgroups/status"]
+    verbs: ["get", "update", "patch"]
+
+  # Les demandes de signature sont éphémères : créées, approuvées, lues, puis supprimées.
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["certificatesigningrequests/approval"]
+    verbs: ["update"]
+
+  # La règle la plus sensible du chart. Sans `resourceNames`, kdt-identity pourrait approuver
+  # des demandes pour n'importe quel signeur du cluster, y compris ceux qui émettent des
+  # certificats serveur ou des identités de kubelet.
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["signers"]
+    resourceNames: ["kubernetes.io/kube-apiserver-client"]
+    verbs: ["approve"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kdt-identity.fullname" . }}
+  labels: {{- include "kdt-identity.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kdt-identity.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kdt-identity.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+{{/*
+  Les Secrets de credentials sont namespacés, et volontairement hors du ClusterRole : rien ne
+  justifie que kdt-identity puisse lire les Secrets d'un autre namespace.
+
+  `list` est absent : le contrôleur accède toujours à un Secret par son nom. Sans ce verbe, une
+  faille dans le portail ne permet pas d'énumérer les comptes du cluster.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "kdt-identity.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "kdt-identity.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "kdt-identity.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "kdt-identity.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "kdt-identity.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kdt-identity.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

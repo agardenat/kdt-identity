@@ -1,0 +1,33 @@
+kdt-identity est installé dans le namespace {{ .Release.Namespace }}.
+
+Créer un utilisateur et un groupe :
+
+  kubectl apply -f - <<'YAML'
+  apiVersion: identity.kdt.sh/v1alpha1
+  kind: KdtUser
+  metadata: {name: alice}
+  spec: {email: alice@example.com}
+  YAML
+
+L'inviter — le lien et le code ne s'affichent qu'une fois, et sont à transmettre par deux
+canaux différents :
+
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "kdt-identity.fullname" . }}-controller -- \
+      /usr/local/bin/kdt-identity-server invite alice
+
+  (chemin absolu : l'image ne contient ni shell ni PATH)
+
+{{ if .Values.ingress.enabled }}Portail : https://{{ .Values.ingress.host }}
+{{- else }}
+Aucun ingress n'est activé. Pour essayer le portail :
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "kdt-identity.fullname" . }} 8080:{{ .Values.service.port }}
+
+Attention : le cookie de session porte l'attribut Secure, donc le portail n'est pas utilisable
+en HTTP depuis un navigateur. Activez l'ingress avec TLS pour un usage réel.
+{{- end }}
+
+Un groupe n'accorde rien tant qu'aucun binding ne le vise. Le sujet à référencer est publié
+dans le statut du groupe :
+
+  kubectl get kdtgroup -o custom-columns=NOM:.metadata.name,SUJET:.status.subject

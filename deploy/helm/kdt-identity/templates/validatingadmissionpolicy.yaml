@@ -1,0 +1,40 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kdt-identity-names
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - identity.kdt.sh
+      apiVersions:
+      - v1alpha1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - kdtusers
+      - kdtgroups
+  validations:
+  - expression: object.metadata.name.size() <= 60
+    message: 'le nom dépasse 60 caractères : préfixé de ''kdt:'', il ne tiendrait pas dans un CN/O X.509 (plafonné à 64 par la RFC 5280)'
+    reason: Invalid
+  - expression: object.metadata.name.matches('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$')
+    message: le nom doit être composé de [a-z0-9], '-' et '.', et commencer et finir par [a-z0-9]
+    reason: Invalid
+  - expression: '!object.metadata.name.lowerAscii().startsWith(''system:'') && !object.metadata.name.lowerAscii().startsWith(''kubernetes:'') && !object.metadata.name.lowerAscii().startsWith(''kdt:'')'
+    message: 'préfixe réservé : kdt-identity ajoute lui-même ''kdt:'' à l''émission, et n''émettra jamais d''identité ''system:'''
+    reason: Invalid
+  - expression: '!has(object.spec) || !has(object.spec.members) || object.spec.members.all(m, m.size() <= 60 && m.matches(''^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$''))'
+    message: un membre de groupe doit être un nom de KdtUser valide
+    reason: Invalid
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kdt-identity-names
+spec:
+  policyName: kdt-identity-names
+  validationActions:
+  - Deny

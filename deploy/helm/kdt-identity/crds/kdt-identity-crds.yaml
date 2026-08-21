@@ -1,0 +1,230 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: kdtusers.identity.kdt.sh
+spec:
+  group: identity.kdt.sh
+  names:
+    categories: []
+    kind: KdtUser
+    plural: kdtusers
+    shortNames:
+    - kdtuser
+    singular: kdtuser
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.email
+      name: Email
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.memberOf
+      name: Groupes
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for KdtUserSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              certTtl:
+                description: |-
+                  Durée de validité demandée pour les certificats de cet utilisateur, ex. `"8h"`.
+
+                  À défaut, la valeur globale du déploiement s'applique. L'API impose un plancher de
+                  600 s et le `--cluster-signing-duration` du kube-controller-manager un plafond.
+                nullable: true
+                type: string
+              disabled:
+                default: false
+                description: |-
+                  Bloque immédiatement toute nouvelle émission de credential.
+
+                  N'invalide pas les certificats déjà émis : Kubernetes ne consulte aucune CRL. Pour
+                  couper l'accès sans attendre l'expiration, retirer les bindings du groupe concerné.
+                type: boolean
+              displayName:
+                description: |-
+                  Nom affiché dans l'interface. Sans effet sur l'identité émise, qui dérive toujours de
+                  `metadata.name`.
+                nullable: true
+                type: string
+              email:
+                description: Adresse à laquelle est envoyée l'invitation de première connexion.
+                type: string
+            required:
+            - email
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                items:
+                  description: |-
+                    Condition au format `metav1.Condition`, redéclarée ici pour éviter d'imposer la feature
+                    `schemars` de k8s-openapi à tous les consommateurs du crate.
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              credentialSecretRef:
+                description: Nom du `Secret` portant hash de mot de passe, secret TOTP et invitation en cours.
+                nullable: true
+                type: string
+              issuedCount:
+                default: 0
+                description: Nombre total de certificats émis, pour l'audit.
+                format: uint64
+                minimum: 0.0
+                type: integer
+              lastIssuedAt:
+                description: Horodatage RFC 3339 de la dernière émission de certificat.
+                nullable: true
+                type: string
+              lastLogin:
+                description: Horodatage RFC 3339 de la dernière connexion réussie au portail.
+                nullable: true
+                type: string
+              memberOf:
+                description: Groupes dont l'utilisateur est membre, dérivés des `KdtGroup`. Lecture seule.
+                items:
+                  type: string
+                type: array
+              phase:
+                enum:
+                - Pending
+                - Active
+                - Disabled
+                - Locked
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: KdtUser
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: kdtgroups.identity.kdt.sh
+spec:
+  group: identity.kdt.sh
+  names:
+    categories: []
+    kind: KdtGroup
+    plural: kdtgroups
+    shortNames:
+    - kdtgroup
+    singular: kdtgroup
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.memberCount
+      name: Membres
+      type: integer
+    - jsonPath: .status.subject
+      name: Sujet
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for KdtGroupSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              description:
+                nullable: true
+                type: string
+              members:
+                default: []
+                description: Noms des `KdtUser` membres. Source de vérité de l'appartenance.
+                items:
+                  type: string
+                type: array
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                items:
+                  description: |-
+                    Condition au format `metav1.Condition`, redéclarée ici pour éviter d'imposer la feature
+                    `schemars` de k8s-openapi à tous les consommateurs du crate.
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              memberCount:
+                default: 0
+                format: uint32
+                minimum: 0.0
+                type: integer
+              resolvedMembers:
+                description: Membres effectivement résolus vers un `KdtUser` existant.
+                items:
+                  type: string
+                type: array
+              subject:
+                description: |-
+                  Sujet RBAC à référencer dans les bindings, préfixe compris. Affiché tel quel pour que
+                  personne n'ait à deviner qu'il faut écrire `kdt:<nom>`.
+                nullable: true
+                type: string
+              unknownMembers:
+                description: Membres listés dans la spec mais sans `KdtUser` correspondant.
+                items:
+                  type: string
+                type: array
+            type: object
+        required:
+        - spec
+        title: KdtGroup
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -14,13 +14,29 @@ pub const POLICY_NAME: &str = "kdt-identity-names";
 
 /// Tous les manifestes d'installation, concaténés en un flux YAML multi-documents.
 pub fn all() -> Result<String, serde_yaml::Error> {
-    let documents = [
+    Ok([crds()?, admission_policy()?].join("---\n"))
+}
+
+/// Les seules définitions de ressources personnalisées.
+///
+/// Séparées de la politique d'admission parce que Helm les traite différemment : ce qui est
+/// dans `crds/` est installé une fois et jamais mis à jour, ce qui est dans `templates/` suit
+/// les montées de version.
+pub fn crds() -> Result<String, serde_yaml::Error> {
+    Ok([
         serde_yaml::to_string(&KdtUser::crd())?,
         serde_yaml::to_string(&KdtGroup::crd())?,
+    ]
+    .join("---\n"))
+}
+
+/// La politique d'admission et son binding.
+pub fn admission_policy() -> Result<String, serde_yaml::Error> {
+    Ok([
         validating_admission_policy()?,
         validating_admission_policy_binding()?,
-    ];
-    Ok(documents.join("---\n"))
+    ]
+    .join("---\n"))
 }
 
 /// Politique d'admission rejouant, côté apiserver, les règles de nommage du code.
@@ -178,6 +194,36 @@ mod tests {
 
     /// Le seuil de longueur vient de la constante Rust : si `MAX_NAME_LEN` change, la
     /// politique doit changer avec lui.
+    /// Helm veut du YAML sur disque, le code veut être la seule source de vérité. Le chart est
+    /// donc committé, et ce test garantit qu'il correspond à ce que le code produit — sans
+    /// quoi le schéma servi et le schéma installé finiraient par diverger en silence.
+    ///
+    /// En cas d'échec :
+    /// `cargo run -p kdt-identity-server -- crd` puis reporter dans le chart.
+    #[test]
+    fn le_chart_correspond_aux_manifestes_generes() {
+        let chart = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/helm/kdt-identity");
+
+        for (fichier, attendu) in [
+            ("crds/kdt-identity-crds.yaml", crds().unwrap()),
+            (
+                "templates/validatingadmissionpolicy.yaml",
+                admission_policy().unwrap(),
+            ),
+        ] {
+            let chemin = chart.join(fichier);
+            let sur_disque = std::fs::read_to_string(&chemin)
+                .unwrap_or_else(|e| panic!("{} illisible : {e}", chemin.display()));
+
+            assert_eq!(
+                sur_disque.trim(),
+                attendu.trim(),
+                "{fichier} a divergé du code ; régénérer avec `kdt-identity-server crd`"
+            );
+        }
+    }
+
     #[test]
     fn les_regles_derivent_des_constantes_du_code() {
         let policy = validating_admission_policy().unwrap();
