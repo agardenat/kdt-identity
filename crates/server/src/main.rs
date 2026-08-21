@@ -6,6 +6,7 @@ use kdt_identity_server::auth;
 use kdt_identity_server::config::ServerConfig;
 use kdt_identity_server::controller::logic;
 use kdt_identity_server::mail::{self, Encryption, Mailer};
+use kdt_identity_server::web;
 use kdt_identity_server::credentials::{endpoint, kubeconfig, Issuer};
 use kube::api::{Api, ListParams};
 use std::time::Duration;
@@ -28,6 +29,9 @@ enum Command {
 
     /// Réconcilie les KdtUser et KdtGroup jusqu'à l'arrêt du processus.
     Controller,
+
+    /// Sert le portail web : activation, connexion, téléchargement du kubeconfig.
+    Serve,
 
     /// Crée une invitation et affiche, une seule fois, le lien et le code d'activation.
     ///
@@ -106,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("connexion au cluster")?;
             kdt_identity_server::controller::run(client, config).await;
         }
+        Command::Serve => serve().await?,
         Command::Invite {
             user,
             validity,
@@ -113,6 +118,64 @@ async fn main() -> anyhow::Result<()> {
         } => invite(&user, validity, send_mail).await?,
         Command::Issue { user, ttl } => issue(&user, ttl).await?,
     }
+    Ok(())
+}
+
+async fn serve() -> anyhow::Result<()> {
+    let config = ServerConfig::from_env().context("configuration")?;
+    let client = kube::Client::try_default()
+        .await
+        .context("connexion au cluster")?;
+
+    let endpoint = endpoint::resolve(
+        config.apiserver_url.as_deref(),
+        &config.cluster_name,
+        config.cluster_ca_file.as_deref(),
+    )
+    .context("description du cluster")?;
+
+    // Sans clé partagée, chaque instance signe avec la sienne : une session ouverte sur l'une
+    // n'est plus reconnue par l'autre, et un redémarrage déconnecte tout le monde. Acceptable
+    // en instance unique, à corriger dès qu'il y en a deux.
+    let signer = match &config.session_key {
+        Some(encoded) => {
+            use base64::Engine;
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(encoded.as_bytes())
+                .context("KDT_IDENTITY_SESSION_KEY n'est pas du base64")?;
+            let key: [u8; web::signer::KEY_BYTES] = raw.try_into().map_err(|v: Vec<u8>| {
+                anyhow::anyhow!(
+                    "KDT_IDENTITY_SESSION_KEY fait {} octets, {} attendus",
+                    v.len(),
+                    web::signer::KEY_BYTES
+                )
+            })?;
+            web::signer::Signer::new(key)
+        }
+        None => {
+            tracing::warn!(
+                "aucune KDT_IDENTITY_SESSION_KEY : clé tirée au démarrage, les sessions ne \
+                 survivront ni à un redémarrage ni à une seconde instance"
+            );
+            web::signer::Signer::generate()
+        }
+    };
+
+    let listener = tokio::net::TcpListener::bind(&config.listen)
+        .await
+        .with_context(|| format!("écoute sur {}", config.listen))?;
+
+    tracing::info!(
+        adresse = %config.listen,
+        cluster = %config.cluster_name,
+        apiserver = %endpoint.server,
+        "portail démarré"
+    );
+
+    let state = web::state(client, config, endpoint, signer);
+    axum::serve(listener, web::router(state))
+        .await
+        .context("service HTTP")?;
     Ok(())
 }
 

@@ -11,10 +11,10 @@ l'apiserver reconnaît — sans toucher à la configuration du control plane.
 
 Compagnon de [kdt](https://github.com/agardenat/kdt).
 
-> **État : Phase 2 en cours.** Le noyau fonctionne de bout en bout (CRDs, contrôleur, émission
-> de kubeconfig, invitations, CLI), et les primitives d'authentification sont écrites et
-> testées. Le portail web qui les assemble, lui, n'existe pas encore : l'activation d'un compte
-> n'est donc pas encore possible. Le plugin `exec` et le chart Helm restent à faire.
+> **État : le chemin complet fonctionne.** Créer un compte, l'inviter, l'activer depuis le
+> portail avec mot de passe et TOTP, se connecter et télécharger un kubeconfig que l'apiserver
+> reconnaît — tout est en place. Restent le plugin `exec` (renouvellement automatique) et le
+> chart Helm.
 
 ## Ce que ça fait
 
@@ -100,6 +100,45 @@ dépendance au moins aussi lourde que le SMTP qu'on cherche à éviter.
 
 Le TOTP s'enrôle par QR code dans le navigateur au moment de l'activation, ce qui est la seule
 façon correcte. Le code d'activation, lui, joue le rôle de second canal.
+
+## Le portail
+
+```sh
+kdt-identity-server serve
+```
+
+Trois pages, rendues côté serveur, sans script ni ressource externe — le portail manipule des
+credentials, il doit rester lisible sur un réseau isolé et incapable d'exfiltrer ce qu'il
+affiche.
+
+| Page | Ce qu'elle demande |
+|---|---|
+| `/activate` | le code d'activation, un mot de passe, et un code TOTP prouvant que le QR a bien été scanné |
+| `/login` | mot de passe et code TOTP |
+| `/` | rien — affiche l'identité effective et produit le kubeconfig |
+
+Aucune réponse ne distingue « ce compte n'existe pas » de « le mot de passe est faux », ni « ce
+lien est faux » de « ce lien a expiré ». Un portail qui répond précisément est un annuaire : il
+laisse énumérer les comptes du cluster depuis l'extérieur. Les journaux, eux, gardent la raison
+exacte — c'est là qu'elle sert.
+
+Un code TOTP n'est accepté qu'une fois, comme l'exige la [RFC 6238
+§5.2](https://datatracker.ietf.org/doc/html/rfc6238#section-5.2). Les échecs répétés allongent
+progressivement l'attente, sans jamais verrouiller définitivement : un verrou permanent
+déclenché à distance serait un déni de service offert à qui connaît un nom de compte.
+
+Variables d'environnement du portail :
+
+| Variable | Rôle |
+|---|---|
+| `KDT_IDENTITY_PORTAL_URL` | racine publique, pour construire les liens d'activation |
+| `KDT_IDENTITY_CLUSTER_NAME` | nom affiché aux utilisateurs |
+| `KDT_IDENTITY_APISERVER_URL` | adresse publique de l'apiserver ; à défaut, le kubeconfig courant |
+| `KDT_IDENTITY_SESSION_KEY` | clé de signature, 32 octets en base64 |
+| `KDT_IDENTITY_LISTEN` | adresse d'écoute, `0.0.0.0:8080` par défaut |
+
+Sans `KDT_IDENTITY_SESSION_KEY`, une clé est tirée au démarrage : les sessions ne survivent
+alors ni à un redémarrage ni à une seconde instance. Le serveur le signale au lancement.
 
 ## Comment ça marche
 

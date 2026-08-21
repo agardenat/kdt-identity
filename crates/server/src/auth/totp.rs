@@ -86,6 +86,16 @@ pub fn verify(
     Ok(step)
 }
 
+/// URL `otpauth://` d'un secret déjà tiré.
+///
+/// Sépare l'enrôlement en deux temps : le formulaire d'activation peut être réaffiché après
+/// une erreur de saisie sans imposer un nouveau QR à scanner.
+pub fn enroll_url(account: &str, issuer: &str, secret_base32: &str) -> Result<String, TotpError> {
+    build(secret_base32, account, issuer)?
+        .to_url()
+        .map_err(|e| TotpError::Build(format!("{e:?}")))
+}
+
 fn build(secret_base32: &str, account: &str, issuer: &str) -> Result<Totp, TotpError> {
     let secret = Secret::try_from_base32(secret_base32)
         .map_err(|e| TotpError::BadSecret(format!("{e:?}")))?;

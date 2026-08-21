@@ -25,6 +25,19 @@ pub struct ServerConfig {
     pub cluster_name: String,
     /// Absente si aucun serveur sortant n'est configuré.
     pub smtp: Option<SmtpConfig>,
+    /// Adresse d'écoute du portail.
+    pub listen: String,
+    /// URL publique de l'apiserver, telle que les postes clients l'atteignent.
+    ///
+    /// Absente hors cluster, où le kubeconfig courant la fournit.
+    pub apiserver_url: Option<String>,
+    /// Chemin de la CA du cluster ; à défaut, celle montée dans le pod.
+    pub cluster_ca_file: Option<String>,
+    /// Clé de signature des jetons, 32 octets en base64.
+    ///
+    /// Absente, une clé est tirée au démarrage : les sessions ne survivent alors ni à un
+    /// redémarrage ni à une seconde instance.
+    pub session_key: Option<Zeroizing<String>>,
 }
 
 impl ServerConfig {
@@ -50,6 +63,10 @@ impl ServerConfig {
                 .ok_or(ConfigError::Missing("KDT_IDENTITY_CLUSTER_NAME"))?,
 
             smtp: smtp_from_env()?,
+            listen: env("KDT_IDENTITY_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".to_string()),
+            apiserver_url: env("KDT_IDENTITY_APISERVER_URL"),
+            cluster_ca_file: env("KDT_IDENTITY_CLUSTER_CA_FILE"),
+            session_key: env("KDT_IDENTITY_SESSION_KEY").map(Zeroizing::new),
         })
     }
 
@@ -141,6 +158,10 @@ mod tests {
             portal_url: "https://identity.example.com".to_string(),
             cluster_name: "production".to_string(),
             smtp: None,
+            listen: "0.0.0.0:8080".to_string(),
+            apiserver_url: None,
+            cluster_ca_file: None,
+            session_key: None,
         }
     }
 

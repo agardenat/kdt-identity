@@ -3,8 +3,13 @@
 use super::kubeconfig::ClusterEndpoint;
 use base64::Engine;
 
+/// CA du cluster telle qu'elle est montée dans un pod.
+const IN_CLUSTER_CA: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+
 #[derive(Debug, thiserror::Error)]
 pub enum EndpointError {
+    #[error("URL de l'apiserver absente : renseigner KDT_IDENTITY_APISERVER_URL")]
+    NoApiserverUrl,
     #[error("lecture du kubeconfig : {0}")]
     Kubeconfig(#[from] kube::config::KubeconfigError),
     #[error("aucun contexte courant dans le kubeconfig")]
@@ -70,6 +75,32 @@ pub fn from_ambient_kubeconfig() -> Result<ClusterEndpoint, EndpointError> {
             .server
             .clone()
             .ok_or(EndpointError::NoServer(cluster_name))?,
+        certificate_authority_pem,
+    })
+}
+
+/// Décrit le cluster pour les kubeconfigs émis, en préférant la configuration explicite.
+///
+/// Dans un pod, le kubeconfig ambiant n'existe pas, et l'URL interne
+/// `https://kubernetes.default.svc` ne sert à rien à un poste de travail : l'adresse publique
+/// de l'apiserver doit donc être fournie. Hors cluster, le kubeconfig courant suffit et évite
+/// d'avoir à la répéter.
+pub fn resolve(
+    apiserver_url: Option<&str>,
+    cluster_name: &str,
+    ca_file: Option<&str>,
+) -> Result<ClusterEndpoint, EndpointError> {
+    let Some(server) = apiserver_url else {
+        return from_ambient_kubeconfig();
+    };
+
+    let ca_path = ca_file.unwrap_or(IN_CLUSTER_CA);
+    let certificate_authority_pem = std::fs::read_to_string(ca_path)
+        .map_err(|e| EndpointError::BadCertificateAuthority(format!("{ca_path} : {e}")))?;
+
+    Ok(ClusterEndpoint {
+        name: cluster_name.to_string(),
+        server: server.to_string(),
         certificate_authority_pem,
     })
 }
