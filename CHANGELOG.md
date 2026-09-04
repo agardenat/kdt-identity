@@ -25,6 +25,8 @@ Chaque version publiée est accompagnée de notes de version reprenant la sectio
 
 - Guide d'[administration](docs/administration.md) : cycle de vie des comptes, appartenance aux
   groupes, passage des groupes aux droits RBAC, et dépannage.
+- Section « Obtenir les binaires » du README : où vit chacun des deux binaires, comment extraire
+  le client de l'image ou le compiler, et pourquoi il doit être dans le `PATH`.
 - Labels OCI sur l'image (`source`, `licenses`, `description`), qui rattachent le package à son
   dépôt.
 

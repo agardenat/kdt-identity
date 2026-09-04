@@ -258,6 +258,50 @@ Un certificat émis vaut jusqu'à son expiration, sans exception. Trois moyens d
 
 Une révocation individuelle instantanée demanderait le mode OIDC ou un proxy d'impersonation.
 
+## Obtenir les binaires
+
+Le projet en produit deux, qui ne s'installent pas au même endroit ni par les mêmes gens :
+
+| Binaire | Où | Pour qui |
+| --- | --- | --- |
+| `kdt-identity-server` | dans le cluster, fourni par l'image | contrôleur, portail, et les commandes d'administration |
+| `kdt-identity` | sur le poste de travail | le plugin `exec` de kubectl |
+
+**Côté administration, il n'y a rien à installer.** Les commandes du serveur s'exécutent dans le
+pod déjà déployé :
+
+```sh
+kubectl -n kdt-identity exec deploy/kdt-identity-controller -- \
+    /usr/local/bin/kdt-identity-server invite alice
+```
+
+Le chemin est absolu parce que l'image ne contient ni shell ni `PATH`.
+
+**Côté poste de travail**, il n'y a pas encore de paquets `deb`, `rpm` ni de formule Homebrew.
+En attendant, le plus simple est d'extraire le binaire de l'image : il est lié statiquement et
+ne dépend d'aucune libc.
+
+```sh
+c=$(podman create ghcr.io/agardenat/kdt-identity:0.1.0)
+podman cp $c:/usr/local/bin/kdt-identity ~/.local/bin/kdt-identity
+podman rm $c
+```
+
+Sinon, depuis les sources, avec une chaîne Rust :
+
+```sh
+cargo install --git https://github.com/agardenat/kdt-identity kdt-identity-cli
+```
+
+Dans les deux cas, le binaire doit se trouver dans le `PATH` : le kubeconfig produit par
+`kdt-identity kubeconfig` déclare `command: kdt-identity`, sans chemin, et c'est `kubectl` qui
+l'exécutera.
+
+```console
+$ kdt-identity --version
+kdt-identity 0.1.0
+```
+
 ## Installation
 
 ```sh

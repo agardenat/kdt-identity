@@ -36,8 +36,13 @@ $ kubectl -n <namespace> exec deploy/<release>-controller -- \
       /usr/local/bin/kdt-identity-server invite alice
 ```
 
-Le chemin est absolu parce que l'image ne contient ni shell ni `PATH`. Le lien et le code ne
-s'affichent qu'une fois : ils ne sont ni journalisés, ni écrits dans le statut.
+Le chemin est absolu parce que l'image ne contient ni shell ni `PATH`. Il n'y a rien à
+installer sur le poste de l'administrateur : la commande s'exécute dans le pod déjà déployé.
+Pour le binaire client, destiné aux utilisateurs, voir
+[Obtenir les binaires](../README.md#obtenir-les-binaires).
+
+Le lien et le code ne s'affichent qu'une fois : ils ne sont ni journalisés, ni écrits dans le
+statut.
 
 Relancer `invite` sur un compte déjà actif réémet une invitation et efface le mot de passe
 précédent — c'est aussi le chemin de réinitialisation.
