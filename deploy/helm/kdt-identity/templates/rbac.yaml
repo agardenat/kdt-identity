@@ -33,9 +33,12 @@ rules:
   - apiGroups: ["certificates.k8s.io"]
     resources: ["certificatesigningrequests"]
     verbs: ["create", "get", "list", "watch", "delete"]
+  # `patch` autant qu'`update` : l'émetteur pose la condition Approved par un PATCH, et un
+  # ClusterRole qui n'accorde que `update` laisse passer tout le reste du parcours — le compte
+  # s'active, la session s'ouvre — pour échouer au seul moment qui compte, l'émission.
   - apiGroups: ["certificates.k8s.io"]
     resources: ["certificatesigningrequests/approval"]
-    verbs: ["update"]
+    verbs: ["update", "patch"]
 
   # La règle la plus sensible du chart. Sans `resourceNames`, kdt-identity pourrait approuver
   # des demandes pour n'importe quel signeur du cluster, y compris ceux qui émettent des
