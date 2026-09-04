@@ -189,6 +189,9 @@ Le certificat déjà émis garde ses groupes jusqu'à expiration — c'est la co
 par certificats, détaillée dans [Révocation](#révocation). Un changement d'appartenance prend
 donc effet au renouvellement suivant, soit au plus tard huit heures.
 
+Les opérations courantes — créer, inviter, désactiver, gérer l'appartenance, et surtout passer
+des groupes aux droits RBAC — sont rassemblées dans le [guide d'administration](docs/administration.md).
+
 ## Comment ça marche
 
 Les identités sont des certificats clients X.509 obtenus via l'API
