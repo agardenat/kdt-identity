@@ -76,6 +76,11 @@ networkPolicy:
   enabled: true
   # Sélecteur des pods autorisés à joindre le portail, typiquement le contrôleur d'ingress.
   ingressFrom: []
+  # À activer sur un cluster sous Cilium. La règle egress ci-dessus vise l'apiserver par son
+  # CIDR, or Cilium traite le trafic vers un nœud comme les entités `host`/`remote-node`, hors
+  # d'atteinte d'un `ipBlock` tant que `policy-cidr-match-mode=nodes` n'est pas posé. Ajoute
+  # une CiliumNetworkPolicy qui autorise l'entité `kube-apiserver`, sans rien ouvrir d'autre.
+  cilium: false
 
 podSecurityContext:
   runAsNonRoot: true
