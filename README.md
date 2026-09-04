@@ -304,6 +304,13 @@ kdt-identity 0.1.0
 
 ## Installation
 
+Le chart n'est pas encore publié dans un registre : il s'installe depuis une copie du dépôt.
+
+```sh
+git clone https://github.com/agardenat/kdt-identity
+cd kdt-identity
+```
+
 ```sh
 helm install kdt-identity deploy/helm/kdt-identity \
     --namespace kdt-identity --create-namespace \
@@ -341,11 +348,19 @@ Les CRDs et la politique d'admission du chart sont **générées depuis le code*
 échoue si le YAML committé s'en écarte. Sans ce verrou, le schéma servi par le contrôleur et le
 schéma installé dans le cluster finiraient par diverger en silence.
 
-Sans Helm, pour un essai rapide :
+Sans Helm, pour un essai rapide, avec le binaire du serveur extrait de l'image comme décrit
+dans [Obtenir les binaires](#obtenir-les-binaires) — le chemin dans l'image est
+`/usr/local/bin/kdt-identity-server` :
 
 ```sh
 kdt-identity-server crd | kubectl apply -f -
 kdt-identity-server controller
+```
+
+Les CRDs seules s'appliquent aussi directement depuis le dépôt, sans rien installer :
+
+```sh
+kubectl apply -f https://raw.githubusercontent.com/agardenat/kdt-identity/main/deploy/helm/kdt-identity/crds/kdt-identity-crds.yaml
 ```
 
 ## Développement

@@ -27,6 +27,8 @@ Chaque version publiée est accompagnée de notes de version reprenant la sectio
   groupes, passage des groupes aux droits RBAC, et dépannage.
 - Section « Obtenir les binaires » du README : où vit chacun des deux binaires, comment extraire
   le client de l'image ou le compiler, et pourquoi il doit être dans le `PATH`.
+- L'installation part désormais du dépôt public plutôt que d'une copie locale supposée : le
+  chart s'installe après un `git clone`, et les CRDs seules s'appliquent depuis une URL.
 - Labels OCI sur l'image (`source`, `licenses`, `description`), qui rattachent le package à son
   dépôt.
 
