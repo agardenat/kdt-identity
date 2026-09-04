@@ -402,7 +402,7 @@ mod tests {
         let rendu = kubeconfig_yaml(
             "https://identity.example.com",
             "alice",
-            "hz",
+            "demo",
             "https://10.0.0.1:6443",
             ca.to_str().unwrap(),
         )
@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn le_kubeconfig_refuse_un_nom_de_compte_invalide() {
-        assert!(kubeconfig_yaml("https://p", "system:masters", "hz", "https://s", "/dev/null")
+        assert!(kubeconfig_yaml("https://p", "system:masters", "demo", "https://s", "/dev/null")
             .is_err());
     }
 }

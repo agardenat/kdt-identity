@@ -290,7 +290,7 @@ mod tests {
             activate("alice", "t", "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>", "JBSW", 12, None)
                 .into_string(),
             login(None).into_string(),
-            account("alice", "kdt:alice", &["kdt:ops".into()], "hz", "x", None).into_string(),
+            account("alice", "kdt:alice", &["kdt:ops".into()], "demo", "x", None).into_string(),
         ] {
             for chargeur in ["<script", "src=", "url(", "@import", "<iframe", "<link"] {
                 assert!(!rendu.contains(chargeur), "{chargeur} présent dans {rendu}");

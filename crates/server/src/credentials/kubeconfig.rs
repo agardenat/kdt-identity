@@ -193,7 +193,7 @@ mod tests {
 
     fn endpoint() -> ClusterEndpoint {
         ClusterEndpoint {
-            name: "hz".to_string(),
+            name: "demo".to_string(),
             server: "https://127.0.0.1:6443".to_string(),
             certificate_authority_pem: "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n"
                 .to_string(),
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(parsed["apiVersion"], "v1");
         assert_eq!(parsed["kind"], "Config");
         // Kebab-case : `currentContext` serait silencieusement ignoré par client-go.
-        assert_eq!(parsed["current-context"], "kdt:alice@hz");
+        assert_eq!(parsed["current-context"], "kdt:alice@demo");
         assert_eq!(parsed["contexts"][0]["context"]["user"], "kdt:alice");
         assert!(parsed["users"][0]["user"]["client-certificate-data"]
             .as_str()
