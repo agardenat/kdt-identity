@@ -35,6 +35,13 @@ RUN touch crates/*/src/*.rs && cargo build --release --locked
 
 FROM scratch
 
+# Rattache l'image à son dépôt. GitHub lit ce label au push pour lier le package au dépôt : la
+# page du package y gagne le README et le lien vers les sources, et les droits d'accès suivent
+# ceux du dépôt. Sans lui, le package reste un objet isolé dont la visibilité se règle à la main.
+LABEL org.opencontainers.image.source=https://github.com/agardenat/kdt-identity
+LABEL org.opencontainers.image.licenses=Apache-2.0
+LABEL org.opencontainers.image.description="Utilisateurs et groupes locaux pour Kubernetes, avec portail d'activation et émission de kubeconfig"
+
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /src/target/release/kdt-identity-server /usr/local/bin/
 COPY --from=build /src/target/release/kdt-identity /usr/local/bin/
