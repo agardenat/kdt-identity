@@ -282,7 +282,7 @@ En attendant, le plus simple est d'extraire le binaire de l'image : il est lié 
 ne dépend d'aucune libc.
 
 ```sh
-c=$(podman create ghcr.io/agardenat/kdt-identity:0.1.0)
+c=$(podman create ghcr.io/agardenat/kdt-identity:0.1.1)
 podman cp $c:/usr/local/bin/kdt-identity ~/.local/bin/kdt-identity
 podman rm $c
 ```
@@ -299,7 +299,7 @@ l'exécutera.
 
 ```console
 $ kdt-identity --version
-kdt-identity 0.1.0
+kdt-identity 0.1.1
 ```
 
 ## Installation

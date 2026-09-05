@@ -1530,7 +1530,7 @@ dependencies = [
 
 [[package]]
 name = "kdt-identity-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "der",
@@ -1550,7 +1550,7 @@ dependencies = [
 
 [[package]]
 name = "kdt-identity-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1570,7 +1570,7 @@ dependencies = [
 
 [[package]]
 name = "kdt-identity-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "argon2",

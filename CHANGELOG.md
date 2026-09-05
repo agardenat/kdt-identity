@@ -5,7 +5,7 @@ le [versionnage sémantique](https://semver.org/lang/fr/).
 
 Chaque version publiée est accompagnée de notes de version reprenant la section correspondante.
 
-## [Non publié]
+## [0.1.1] - 2026-09-05
 
 ### Corrigé
 
