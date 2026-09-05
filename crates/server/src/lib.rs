@@ -6,6 +6,8 @@ pub mod config;
 pub mod credentials;
 pub mod mail;
 pub mod manifests;
+pub mod oidc;
+pub mod sessions;
 pub mod web;
 
 /// Installe le fournisseur cryptographique de rustls.

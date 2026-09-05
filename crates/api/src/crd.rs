@@ -48,13 +48,6 @@ pub struct KdtUserSpec {
     /// couper l'accès sans attendre l'expiration, retirer les bindings du groupe concerné.
     #[serde(default)]
     pub disabled: bool,
-
-    /// Durée de validité demandée pour les certificats de cet utilisateur, ex. `"8h"`.
-    ///
-    /// À défaut, la valeur globale du déploiement s'applique. L'API impose un plancher de
-    /// 600 s et le `--cluster-signing-duration` du kube-controller-manager un plafond.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cert_ttl: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

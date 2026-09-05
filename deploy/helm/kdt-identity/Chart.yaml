@@ -2,8 +2,8 @@ apiVersion: v2
 name: kdt-identity
 description: Utilisateurs et groupes locaux pour Kubernetes, avec portail d'activation et émission de kubeconfig
 type: application
-version: 0.1.1
-appVersion: "0.1.1"
+version: 1.0.0
+appVersion: "1.0.0"
 home: https://github.com/agardenat/kdt-identity
 sources:
   - https://github.com/agardenat/kdt-identity

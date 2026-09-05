@@ -37,6 +37,20 @@ portal:
     requests: {cpu: 10m, memory: 32Mi}
     limits: {memory: 128Mi}
 
+  # Le portail propose-t-il un kubeconfig à télécharger ?
+  #
+  # C'est le seul accès que la révocation ne peut pas couper : le fichier est autoportant,
+  # personne ne le renouvelle, et il vit donc `downloadCertTtl` quoi qu'il arrive. En échange,
+  # il n'y a rien à installer sur le poste — ce qui est une des raisons d'être du portail.
+  #
+  # À désactiver dès lors que la révocation doit être sans exception : sinon quiconque a encore
+  # son mot de passe contourne la fermeture de ses sessions en repassant par le portail.
+  kubeconfigDownload: true
+
+  # Durée de validité de ce kubeconfig, entre 10m et 30d. Dix minutes n'aurait aucun sens ici :
+  # le fichier serait périmé avant d'être rangé.
+  downloadCertTtl: 8h
+
 service:
   type: ClusterIP
   port: 80
@@ -49,6 +63,45 @@ ingress:
   tls:
     enabled: true
     secretName: ""
+
+# Ce que le portail remet aux utilisateurs : `certificate` ou `oidc`.
+#
+# `certificate` — le défaut — signe des certificats X.509 avec la CA du cluster. Ne demande
+# aucune configuration de l'apiserver, fonctionne sur les clusters managés dont les drapeaux ne
+# sont pas accessibles, mais ne se révoque pas : un certificat émis vaut jusqu'à son expiration.
+#
+# `oidc` émet des jetons de quelques minutes, renouvelés contre un droit conservé dans le
+# cluster. La révocation devient immédiate et les groupes sont relus à chaque renouvellement,
+# au prix d'une configuration de l'apiserver — voir docs/oidc.md. Le mode se choisit une fois :
+# en changer invalide les accès déjà distribués.
+credentialMode: certificate
+
+# Durée de validité des certificats remis au plugin, entre 10m et 30d. Sans effet en mode oidc.
+#
+# Dix minutes, soit le plancher de l'API Kubernetes : c'est le délai maximal entre une
+# révocation et sa prise d'effet, et il ne coûte rien puisque le plugin renouvelle tout seul.
+#
+# Le plafond réel est celui du signeur du cluster (`--cluster-signing-duration`, 24 h par
+# défaut) : au-delà, la durée demandée est raccourcie sans erreur, et l'émission le journalise.
+certTtl: 10m
+
+# Durée de validité du droit de renouveler, entre 1h et 90d.
+#
+# C'est l'intervalle entre deux saisies de mot de passe et de code. Aussi long n'aurait pas de
+# sens sans révocation ; ici, ce droit vit dans le cluster et se retire à tout moment — par
+# `kdt-identity-server revoke`, ou en posant `spec.disabled` sur le compte.
+refreshTtl: 7d
+
+oidc:
+  # Audience attendue dans les jetons. À reporter à l'identique dans la configuration de
+  # l'apiserver : `--oidc-client-id`, ou `audiences` en configuration structurée.
+  audience: kdt-identity
+  # Durée de vie d'un jeton d'identité, entre 60s et 1h.
+  #
+  # Même rôle que `certTtl` en mode certificat : le délai maximal entre une révocation et sa
+  # prise d'effet. Peut descendre plus bas qu'un certificat, dont le plancher est imposé par
+  # l'API Kubernetes.
+  tokenTtl: 5m
 
 # Clé de signature des sessions, 32 octets en base64.
 #

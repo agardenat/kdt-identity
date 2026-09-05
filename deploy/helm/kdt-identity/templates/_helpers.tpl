@@ -45,4 +45,45 @@ app.kubernetes.io/instance: {{ .Release.Name }}
   value: {{ required "apiserverUrl est obligatoire : l'URL interne du service ne sert à rien à un poste de travail" .Values.apiserverUrl | quote }}
 - name: RUST_LOG
   value: {{ .Values.logLevel | quote }}
+{{- /*
+  Le mode est commun aux deux déploiements : les commandes d'administration s'exécutent dans le
+  pod du contrôleur, et « revoke » doit savoir s'il y a des sessions à fermer.
+*/}}
+- name: KDT_IDENTITY_CREDENTIAL_MODE
+  value: {{ .Values.credentialMode | quote }}
+- name: KDT_IDENTITY_REFRESH_TTL
+  value: {{ .Values.refreshTtl | quote }}
+{{- if eq .Values.credentialMode "certificate" }}
+- name: KDT_IDENTITY_CERT_TTL
+  value: {{ .Values.certTtl | quote }}
+- name: KDT_IDENTITY_DOWNLOAD_CERT_TTL
+  value: {{ .Values.portal.downloadCertTtl | quote }}
+- name: KDT_IDENTITY_KUBECONFIG_DOWNLOAD
+  value: {{ .Values.portal.kubeconfigDownload | quote }}
+{{- end }}
+{{- if eq .Values.credentialMode "oidc" }}
+- name: KDT_IDENTITY_OIDC_AUDIENCE
+  value: {{ .Values.oidc.audience | quote }}
+- name: KDT_IDENTITY_OIDC_TOKEN_TTL
+  value: {{ .Values.oidc.tokenTtl | quote }}
+{{- end }}
+{{- end -}}
+
+{{/*
+  Refuse une combinaison de valeurs qui produirait un déploiement inerte : le portail
+  démarrerait, signerait des jetons parfaitement formés, et l'apiserver les refuserait tous
+  sans que rien ne dise pourquoi.
+*/}}
+{{- define "kdt-identity.validate" -}}
+{{- if not (has .Values.credentialMode (list "certificate" "oidc")) -}}
+{{- fail (printf "credentialMode vaut %q : attendu certificate ou oidc" .Values.credentialMode) -}}
+{{- end -}}
+{{- if eq .Values.credentialMode "oidc" -}}
+{{- if not (hasPrefix "https://" .Values.portalUrl) -}}
+{{- fail "credentialMode=oidc exige un portalUrl en https : c'est l'émetteur que l'apiserver vérifie, et il n'en accepte pas d'autre" -}}
+{{- end -}}
+{{- if not .Values.ingress.enabled -}}
+{{- fail "credentialMode=oidc exige que l'apiserver puisse joindre le portail : activez l'ingress, ou exposez-le autrement et retirez ce garde-fou" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}

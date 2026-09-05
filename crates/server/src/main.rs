@@ -1,11 +1,14 @@
 use anyhow::{bail, Context as _};
 use clap::{Parser, Subcommand};
 use kdt_identity_api::naming::Subject;
+use kdt_identity_api::portal::CredentialMode;
 use kdt_identity_api::{KdtGroup, KdtUser};
 use kdt_identity_server::auth;
-use kdt_identity_server::config::ServerConfig;
+use kdt_identity_server::config::{parse_duration, ServerConfig};
 use kdt_identity_server::controller::logic;
 use kdt_identity_server::mail::{self, Encryption, Mailer};
+use kdt_identity_server::oidc;
+use kdt_identity_server::sessions::SessionStore;
 use kdt_identity_server::web;
 use kdt_identity_server::credentials::{endpoint, kubeconfig, Issuer};
 use kube::api::{Api, ListParams};
@@ -66,25 +69,16 @@ enum Command {
         #[arg(long, default_value = "8h", value_parser = parse_duration)]
         ttl: Duration,
     },
-}
 
-/// Accepte les suffixes `s`, `m`, `h`, `d`.
-fn parse_duration(raw: &str) -> Result<Duration, String> {
-    let (digits, unit) = raw.split_at(
-        raw.find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(raw.len()),
-    );
-    let value: u64 = digits
-        .parse()
-        .map_err(|_| format!("durée {raw:?} : chiffres attendus avant l'unité"))?;
-    let seconds = match unit {
-        "s" | "" => value,
-        "m" => value * 60,
-        "h" => value * 3600,
-        "d" => value * 86400,
-        other => return Err(format!("unité {other:?} inconnue, attendu s, m, h ou d")),
-    };
-    Ok(Duration::from_secs(seconds))
+    /// Ferme toutes les sessions d'un compte, sur tous ses postes.
+    ///
+    /// Pour un poste perdu ou volé : la personne reste habilitée et se reconnecte ailleurs.
+    /// Pour couper quelqu'un, c'est `spec.disabled` qu'il faut poser — le contrôleur ferme
+    /// alors les sessions de lui-même, et le portail refuse la connexion.
+    Revoke {
+        /// Nom du KdtUser, sans le préfixe.
+        user: String,
+    },
 }
 
 #[tokio::main]
@@ -117,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
             send_mail,
         } => invite(&user, validity, send_mail).await?,
         Command::Issue { user, ttl } => issue(&user, ttl).await?,
+        Command::Revoke { user } => revoke(&user).await?,
     }
     Ok(())
 }
@@ -161,6 +156,26 @@ async fn serve() -> anyhow::Result<()> {
         }
     };
 
+    // La clé de signature des jetons, elle, n'est jamais tirée à la volée : un jeton signé
+    // par une clé qui disparaît au redémarrage serait refusé par l'apiserver, qui a mis la
+    // précédente en cache. Elle vit dans un Secret, créé au premier démarrage.
+    let oidc = match config.credential_mode {
+        CredentialMode::Certificate => None,
+        CredentialMode::Oidc => {
+            let material = oidc::key::load_or_create(client.clone(), &config.namespace)
+                .await
+                .context("clé de signature OIDC")?;
+            tracing::info!(
+                emetteur = %config.portal_url,
+                audience = %config.oidc_audience,
+                kid = %material.kid(),
+                jeton = ?config.oidc_token_ttl,
+                "mode OIDC"
+            );
+            Some(web::OidcState { material })
+        }
+    };
+
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("écoute sur {}", config.listen))?;
@@ -169,10 +184,11 @@ async fn serve() -> anyhow::Result<()> {
         adresse = %config.listen,
         cluster = %config.cluster_name,
         apiserver = %endpoint.server,
+        mode = %config.credential_mode,
         "portail démarré"
     );
 
-    let state = web::state(client, config, endpoint, signer);
+    let state = web::state(client, config, endpoint, signer, oidc);
     axum::serve(listener, web::router(state))
         .await
         .context("service HTTP")?;
@@ -307,25 +323,71 @@ async fn issue(name: &str, ttl: Duration) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Ferme toutes les sessions d'un compte.
+///
+/// Ne touche ni au mot de passe ni au TOTP : la personne peut se reconnecter aussitôt. Pour
+/// l'empêcher, c'est `spec.disabled` qu'il faut poser — les deux gestes vont souvent ensemble,
+/// mais ils ne disent pas la même chose.
+async fn revoke(name: &str) -> anyhow::Result<()> {
+    let config = ServerConfig::from_env().context("configuration")?;
+    let client = kube::Client::try_default()
+        .await
+        .context("connexion au cluster")?;
+    let users: Api<KdtUser> = Api::all(client.clone());
+    let user = users
+        .get(name)
+        .await
+        .with_context(|| format!("KdtUser {name:?} introuvable"))?;
+
+    let closed = SessionStore::new(client, &config.namespace)
+        .update(&user, |sessions| sessions.close_all())
+        .await
+        .context("fermeture des sessions")?;
+
+    match closed {
+        0 => println!("{name} : aucune session ouverte"),
+        1 => println!("{name} : 1 session fermée"),
+        n => println!("{name} : {n} sessions fermées"),
+    }
+    let fenetre = match config.credential_mode {
+        CredentialMode::Certificate => config.cert_ttl,
+        CredentialMode::Oidc => config.oidc_token_ttl,
+    };
+    println!(
+        "L'accès s'arrête au prochain renouvellement, dans {} au plus.",
+        humanise(fenetre)
+    );
+    if !user.spec.disabled {
+        println!(
+            "Le compte reste actif : il peut rouvrir une session. Pour l'en empêcher, \
+             kubectl patch kdtuser {name} --type=merge -p '{{\"spec\":{{\"disabled\":true}}}}'"
+        );
+    }
+    Ok(())
+}
+
+/// Rend une durée sous une forme lisible dans un message d'administration.
+fn humanise(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds {
+        0..=59 => format!("{seconds} s"),
+        60..=3599 => format!("{} min", seconds / 60),
+        _ => format!("{} h", seconds / 3600),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_duration;
+    use super::humanise;
     use std::time::Duration;
 
+    /// Le message d'une révocation annonce le délai avant effet : une durée en secondes brutes
+    /// s'y lirait mal, et c'est précisément le chiffre que l'administrateur retient.
     #[test]
-    fn interprete_les_unites_de_duree() {
-        assert_eq!(parse_duration("600s"), Ok(Duration::from_secs(600)));
-        assert_eq!(parse_duration("600"), Ok(Duration::from_secs(600)));
-        assert_eq!(parse_duration("15m"), Ok(Duration::from_secs(900)));
-        assert_eq!(parse_duration("8h"), Ok(Duration::from_secs(28800)));
-        assert_eq!(parse_duration("2d"), Ok(Duration::from_secs(172800)));
-    }
-
-    /// Une durée mal comprise silencieusement, c'est un certificat qui vit trop longtemps.
-    #[test]
-    fn refuse_ce_qu_elle_ne_comprend_pas() {
-        for entree in ["", "h", "8j", "huit", "8 h", "-8h", "8hh"] {
-            assert!(parse_duration(entree).is_err(), "{entree:?} accepté à tort");
-        }
+    fn les_durees_s_annoncent_lisiblement() {
+        assert_eq!(humanise(Duration::from_secs(30)), "30 s");
+        assert_eq!(humanise(Duration::from_secs(300)), "5 min");
+        assert_eq!(humanise(Duration::from_secs(3600)), "1 h");
+        assert_eq!(humanise(Duration::from_secs(7200)), "2 h");
     }
 }

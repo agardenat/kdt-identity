@@ -152,6 +152,7 @@ impl Issuer {
 
         let certificate_pem = outcome?;
         let not_after = parse_not_after(&certificate_pem)?;
+        warn_if_shortened(ttl, not_after);
 
         Ok(IssuedCredential {
             certificate_pem,
@@ -323,6 +324,30 @@ fn parse_not_after(certificate_pem: &str) -> Result<DateTime<Utc>, IssueError> {
 /// Encode un PEM pour les champs `*-data` d'un kubeconfig.
 pub fn b64(pem: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(pem.as_bytes())
+}
+
+/// Signale une durée raccourcie par le signeur du cluster.
+///
+/// Le kube-controller-manager plafonne à `--cluster-signing-duration` — 24 h par défaut — sans
+/// rien renvoyer : la demande est signée, simplement plus courte. Le taire produirait un accès
+/// qui expire au milieu d'une session, et un plugin `exec` qui annonce à `kubectl` une échéance
+/// que le certificat n'a pas.
+///
+/// La tolérance de cinq minutes absorbe le délai entre la demande et la signature, qui n'est
+/// pas un raccourcissement.
+fn warn_if_shortened(requested: Duration, not_after: chrono::DateTime<chrono::Utc>) {
+    let Ok(requested) = chrono::Duration::from_std(requested) else {
+        return;
+    };
+    let expected = chrono::Utc::now() + requested;
+
+    if not_after < expected - chrono::Duration::minutes(5) {
+        tracing::warn!(
+            demande = ?requested.to_std().unwrap_or_default(),
+            expire = %not_after,
+            "durée raccourcie par le signeur du cluster (--cluster-signing-duration)"
+        );
+    }
 }
 
 #[cfg(test)]

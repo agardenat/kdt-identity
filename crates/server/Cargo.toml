@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-kdt-identity-api = { version = "0.1.1", path = "../api" }
+kdt-identity-api = { version = "1.0.0", path = "../api" }
 kube.workspace = true
 k8s-openapi.workspace = true
 serde.workspace = true

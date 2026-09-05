@@ -9,6 +9,7 @@ pub mod logic;
 
 use crate::auth::store::{self, CredentialStore};
 use crate::config::ServerConfig;
+use crate::sessions::SessionStore;
 use futures::StreamExt;
 use kdt_identity_api::crd::{KdtGroupStatus, KdtUserStatus};
 use kdt_identity_api::naming::Subject;
@@ -37,12 +38,15 @@ pub enum Error {
     Name(#[from] kdt_identity_api::NameError),
     #[error("credentials : {0}")]
     Store(#[from] store::StoreError),
+    #[error("sessions : {0}")]
+    Sessions(#[from] crate::sessions::SessionStoreError),
 }
 
 pub struct Context {
     users: Api<KdtUser>,
     groups: Api<KdtGroup>,
     store: CredentialStore,
+    sessions: SessionStore,
 }
 
 /// Fait tourner les deux contrôleurs jusqu'à l'arrêt du processus.
@@ -52,7 +56,8 @@ pub async fn run(client: Client, config: ServerConfig) {
     let ctx = Arc::new(Context {
         users: users.clone(),
         groups: groups.clone(),
-        store: CredentialStore::new(client, &config.namespace),
+        store: CredentialStore::new(client.clone(), &config.namespace),
+        sessions: SessionStore::new(client, &config.namespace),
     });
 
     // L'appartenance d'un utilisateur est portée par les groupes : modifier un `KdtGroup` doit
@@ -108,6 +113,20 @@ async fn reconcile_user(user: Arc<KdtUser>, ctx: Arc<Context>) -> Result<Action,
     // l'administrateur qui la demande. Un contrôleur, lui, n'a que ses journaux et le statut
     // de l'objet, deux endroits où ces valeurs n'ont rien à faire.
     let credentials = ctx.store.get(&name).await?;
+
+    // Désactiver un compte ferme ses sessions. Sans cela, la révocation n'existerait que par la
+    // ligne de commande, alors que le geste naturel — et le seul disponible depuis un dépôt
+    // GitOps — est de poser `spec.disabled` dans la spec. Le portail refuse déjà la connexion
+    // d'un compte désactivé ; ce qui manquait, c'est de couper les renouvellements en cours.
+    if user.spec.disabled {
+        let closed = ctx
+            .sessions
+            .update(&user, |sessions| sessions.close_all())
+            .await?;
+        if closed > 0 {
+            info!(user = %name, sessions = closed, "compte désactivé : sessions fermées");
+        }
+    }
 
     let desired = KdtUserStatus {
         member_of: logic::member_of(&name, &groups),

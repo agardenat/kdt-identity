@@ -30,15 +30,19 @@ use axum::routing::{get, post};
 use axum::Router;
 use chrono::Utc;
 use kdt_identity_api::naming::Subject;
+use crate::oidc::discovery::{self, DISCOVERY_PATH, JWKS_PATH};
+use crate::oidc::key::JwkSet;
+use crate::oidc::{jwt, SigningMaterial};
+use crate::sessions::SessionStore;
 use kdt_identity_api::portal::{
-    CredentialRequest, CredentialResponse, SessionRequest, SessionResponse,
+    CredentialMode, CredentialRequest, CredentialResponse, RevokeRequest, SessionGrant,
+    SessionRequest, SessionResponse, TokenRequest, TokenResponse,
 };
 use kdt_identity_api::{KdtGroup, KdtUser};
 use kube::api::{Api, ListParams};
 use serde::Deserialize;
 use signer::Signer;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
@@ -53,9 +57,6 @@ mod purpose {
 const SESSION_COOKIE: &str = "kdt_identity_session";
 const SESSION_TTL: chrono::Duration = chrono::Duration::hours(12);
 
-/// Durée de validité du certificat émis par le portail.
-const CERT_TTL: Duration = Duration::from_secs(8 * 3600);
-
 /// Message unique de tout échec d'authentification.
 const GENERIC_AUTH_FAILURE: &str =
     "Compte, mot de passe ou code incorrect. Vérifiez vos identifiants et réessayez.";
@@ -64,20 +65,35 @@ const GENERIC_ACTIVATION_FAILURE: &str =
     "Ce lien ou ce code d'activation est invalide ou a expiré. Demandez une nouvelle invitation \
      à votre administrateur.";
 
+/// Ce que le mode OIDC ajoute à l'état du portail : de quoi signer des jetons.
+///
+/// Absent en mode certificat, et les points d'accès correspondants ne sont alors pas montés du
+/// tout, plutôt que montés et refusant tout. Un apiserver qui découvrirait un document de
+/// découverte servi par un portail incapable d'émettre des jetons échouerait plus tard, et
+/// plus obscurément.
+///
+/// Le magasin de sessions n'en fait pas partie : il sert dans les deux modes, puisque c'est de
+/// lui que vient la révocation.
+pub struct OidcState {
+    pub material: SigningMaterial,
+}
+
 pub struct AppState {
     users: Api<KdtUser>,
     groups: Api<KdtGroup>,
     store: CredentialStore,
+    sessions: SessionStore,
     issuer: Issuer,
     signer: Signer,
     endpoint: ClusterEndpoint,
     config: ServerConfig,
+    oidc: Option<OidcState>,
 }
 
 type Shared = Arc<AppState>;
 
 pub fn router(state: Shared) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/", get(account_page))
         .route("/activate", get(activate_page).post(activate_submit))
         .route("/login", get(login_page).post(login_submit))
@@ -85,8 +101,23 @@ pub fn router(state: Shared) -> Router {
         .route("/kubeconfig", post(download_kubeconfig))
         .route(kdt_identity_api::portal::SESSION_PATH, post(api_session))
         .route(kdt_identity_api::portal::CREDENTIAL_PATH, post(api_credential))
-        .route("/healthz", get(|| async { "ok" }))
-        .with_state(state)
+        // La fermeture de session vaut dans les deux modes : c'est le mécanisme de
+        // renouvellement qu'elle coupe, pas la façon dont l'identité est ensuite matérialisée.
+        .route(kdt_identity_api::portal::REVOKE_PATH, post(api_revoke))
+        .route("/healthz", get(|| async { "ok" }));
+
+    // Les points d'accès OIDC n'existent qu'en mode OIDC. Le document de découverte est
+    // public et non authentifié : le servir sans pouvoir émettre de jeton inviterait un
+    // administrateur à configurer un apiserver contre un émetteur inerte.
+    let router = match state.oidc {
+        None => router,
+        Some(_) => router
+            .route(DISCOVERY_PATH, get(discovery_document))
+            .route(JWKS_PATH, get(jwks_document))
+            .route(kdt_identity_api::portal::TOKEN_PATH, post(api_token)),
+    };
+
+    router.with_state(state)
 }
 
 pub fn state(
@@ -94,15 +125,18 @@ pub fn state(
     config: ServerConfig,
     endpoint: ClusterEndpoint,
     signer: Signer,
+    oidc: Option<OidcState>,
 ) -> Shared {
     Arc::new(AppState {
         users: Api::all(client.clone()),
         groups: Api::all(client.clone()),
         store: CredentialStore::new(client.clone(), &config.namespace),
+        sessions: SessionStore::new(client.clone(), &config.namespace),
         issuer: Issuer::new(client),
         signer,
         endpoint,
         config,
+        oidc,
     })
 }
 
@@ -450,6 +484,23 @@ async fn download_kubeconfig(
     let Some(user) = current_user(&state, &headers) else {
         return Redirect::to("/login").into_response();
     };
+
+    // La page n'affiche plus ce bouton quand le téléchargement est fermé, mais la route reste
+    // atteignable. Émettre ici rendrait un accès de plusieurs heures que « revoke » ne peut
+    // pas couper : exactement ce que la fermeture du téléchargement vise à empêcher.
+    if !state.config.kubeconfig_download || state.config.credential_mode == CredentialMode::Oidc {
+        warn!(user = %user, "téléchargement de kubeconfig refusé : mode oidc");
+        return render_account(
+            &state,
+            &user,
+            Some(
+                "Le téléchargement d'un kubeconfig n'est pas proposé sur ce cluster. Utilisez \
+                 le plugin kdt-identity, comme indiqué ci-dessous.",
+            ),
+        )
+        .await;
+    }
+
     if state
         .signer
         .verify(purpose::CSRF, &form.csrf, Utc::now().timestamp())
@@ -487,7 +538,7 @@ async fn download_kubeconfig(
 
     let credential = match state
         .issuer
-        .issue_with_generated_key(&subject, &group_subjects, CERT_TTL)
+        .issue_with_generated_key(&subject, &group_subjects, state.config.download_cert_ttl)
         .await
     {
         Ok(c) => c,
@@ -545,14 +596,18 @@ async fn render_account(state: &AppState, user: &str, error: Option<&str>) -> Re
     );
 
     Html(
-        views::account(
+        views::account(views::Account {
             user,
-            &subject,
-            &groups,
-            &state.config.cluster_name,
-            &csrf,
+            subject: &subject,
+            groups: &groups,
+            cluster: &state.config.cluster_name,
+            csrf: &csrf,
             error,
-        )
+            mode: state.config.credential_mode,
+            portal_url: &state.config.portal_url,
+            download: state.config.kubeconfig_download
+                && state.config.credential_mode == CredentialMode::Certificate,
+        })
         .into_string(),
     )
     .into_response()
@@ -588,22 +643,62 @@ async fn subjects(state: &AppState, user: &str) -> Result<(Subject, Vec<Subject>
 /// l'émission d'un certificat, il n'a aucune raison de survivre à l'échange.
 const API_TOKEN_TTL: chrono::Duration = chrono::Duration::seconds(60);
 
-/// Authentifie le plugin et lui rend de quoi construire sa demande.
+/// Ouvre une session pour le plugin et lui rend de quoi construire sa demande.
 ///
 /// Séparé de l'émission parce qu'un code TOTP ne sert qu'une fois : le plugin ne peut pas
-/// s'authentifier deux fois de suite pour apprendre ses groupes puis demander son certificat.
+/// s'authentifier deux fois de suite pour apprendre ses groupes puis demander son credential.
+///
+/// Deux façons d'entrer, un seul chemin ensuite. Le mot de passe et le code ouvrent un droit
+/// de renouveler ; ce droit rouvre une session sans rien redemander. Dans les deux cas l'état
+/// du compte est relu depuis le cluster et ses groupes depuis les `KdtGroup` : c'est ce qui
+/// fait qu'une désactivation ou un changement d'appartenance prend effet au renouvellement
+/// suivant, sans attendre l'expiration de quoi que ce soit.
 async fn api_session(
     State(state): State<Shared>,
     axum::Json(request): axum::Json<SessionRequest>,
 ) -> Response {
-    let user = match authenticate(&state, &request.user, &request.password, &request.totp).await {
-        Ok(user) => user,
-        Err(reason) => {
-            warn!(user = %request.user, raison = reason, "session API refusée");
-            return unauthorized_json();
+    let grant = match request.grant() {
+        Ok(grant) => grant,
+        Err(raison) => {
+            warn!(user = %request.user, raison, "demande de session mal formée");
+            return bad_request_json(raison);
+        }
+    };
+    let now = Utc::now();
+
+    // Une ouverture par mot de passe rend un droit de renouveler ; un renouvellement n'en rend
+    // pas un second. Sans cela, une session volée se prolongerait indéfiniment d'elle-même.
+    let ouvre_un_droit = match grant {
+        SessionGrant::Password { password, totp } => {
+            if let Err(reason) = authenticate(&state, &request.user, password, totp).await {
+                warn!(user = %request.user, raison = reason, "session API refusée");
+                return unauthorized_json();
+            }
+            true
+        }
+        SessionGrant::Refresh { refresh_token } => {
+            let sessions = match state.sessions.get(&request.user).await {
+                Ok(sessions) => sessions,
+                Err(e) => {
+                    warn!(user = %request.user, erreur = %e, "sessions illisibles");
+                    return internal_error_json();
+                }
+            };
+            if let Err(e) = sessions.verify(refresh_token, now) {
+                // Refus d'identité, pas panne : le client doit repasser par une
+                // authentification complète, et le distinguer lui évite de réessayer en boucle.
+                warn!(user = %request.user, raison = %e, "renouvellement refusé");
+                return unauthorized_json();
+            }
+            false
         }
     };
 
+    // L'état courant fait foi, quelle que soit la porte d'entrée.
+    let Ok(user) = state.users.get(&request.user).await else {
+        warn!(user = %request.user, "compte introuvable");
+        return unauthorized_json();
+    };
     let phase = match state.store.get(&request.user).await {
         Ok(Some(credentials)) => logic::phase(&user, credentials.is_activated()),
         _ => return unauthorized_json(),
@@ -621,17 +716,41 @@ async fn api_session(
         }
     };
 
-    info!(user = %request.user, "session API ouverte");
+    let refresh = if ouvre_un_droit {
+        let validity = chrono::Duration::from_std(state.config.refresh_ttl)
+            .expect("durée bornée à la lecture de la configuration");
+        match state
+            .sessions
+            .update(&user, |sessions| {
+                let issued = sessions.open(now, validity);
+                (issued.token.to_string(), issued.session.expires_at)
+            })
+            .await
+        {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                warn!(user = %request.user, erreur = %e, "ouverture de session impossible");
+                return internal_error_json();
+            }
+        }
+    } else {
+        None
+    };
+
+    info!(user = %request.user, renouvellement = !ouvre_un_droit, "session API ouverte");
     (
         [(header::CACHE_CONTROL, "no-store")],
         axum::Json(SessionResponse {
             token: state.signer.sign(
                 purpose::API_CREDENTIAL,
                 &request.user,
-                (Utc::now() + API_TOKEN_TTL).timestamp(),
+                (now + API_TOKEN_TTL).timestamp(),
             ),
             subject: subject.as_str().to_string(),
             groups: groups.iter().map(|g| g.as_str().to_string()).collect(),
+            mode: state.config.credential_mode,
+            refresh_token: refresh.as_ref().map(|(token, _)| token.clone()),
+            refresh_expires_at: refresh.as_ref().map(|(_, at)| at.to_rfc3339()),
         }),
     )
         .into_response()
@@ -647,6 +766,14 @@ async fn api_credential(
     State(state): State<Shared>,
     axum::Json(request): axum::Json<CredentialRequest>,
 ) -> Response {
+    // En mode OIDC, aucun certificat n'est émis : un client qui en demande un est un plugin
+    // trop ancien pour connaître le mode, ou un client qui a ignoré ce que la session lui a
+    // annoncé. Les deux méritent une réponse qui le dise.
+    if state.config.credential_mode == CredentialMode::Oidc {
+        warn!("demande de certificat sur un déploiement en mode oidc");
+        return mode_mismatch_json(CredentialMode::Oidc);
+    }
+
     let Ok(name) = state
         .signer
         .verify(purpose::API_CREDENTIAL, &request.token, Utc::now().timestamp())
@@ -665,7 +792,7 @@ async fn api_credential(
 
     match state
         .issuer
-        .issue_from_csr(&request.csr, &subject, &groups, CERT_TTL)
+        .issue_from_csr(&request.csr, &subject, &groups, state.config.cert_ttl)
         .await
     {
         Ok(credential) => {
@@ -696,6 +823,166 @@ async fn api_credential(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------- API OIDC
+
+/// Le document de découverte, lu par l'apiserver pour trouver le JWKS.
+///
+/// Public et non authentifié : il ne contient aucun secret, et l'apiserver le récupère sans
+/// identifiants. Le cache est court — l'émetteur ne change pas, mais une clé peut être
+/// remplacée, et cinq minutes bornent la fenêtre pendant laquelle un intermédiaire servirait
+/// une réponse périmée.
+async fn discovery_document(State(state): State<Shared>) -> Response {
+    (
+        [(header::CACHE_CONTROL, "public, max-age=300")],
+        axum::Json(discovery::document(&state.config.portal_url)),
+    )
+        .into_response()
+}
+
+/// Les clés publiques de vérification.
+async fn jwks_document(State(state): State<Shared>) -> Response {
+    let Some(oidc) = &state.oidc else {
+        return mode_mismatch_json(CredentialMode::Certificate);
+    };
+
+    (
+        [(header::CACHE_CONTROL, "public, max-age=300")],
+        axum::Json(JwkSet {
+            keys: vec![oidc.material.public_jwk()],
+        }),
+    )
+        .into_response()
+}
+
+/// Émet un jeton d'identité pour une session déjà ouverte.
+///
+/// Le contrôle de l'état du compte a eu lieu à l'ouverture de session, quelques secondes plus
+/// tôt : c'est la durée de vie du jeton présenté ici. Les groupes sont malgré tout relus, pour
+/// la même raison qu'à l'émission d'un certificat — ce qui décide du contenu d'une identité
+/// doit venir de la source, pas de ce qu'un appel précédent a annoncé.
+async fn api_token(
+    State(state): State<Shared>,
+    axum::Json(request): axum::Json<TokenRequest>,
+) -> Response {
+    let Some(oidc) = &state.oidc else {
+        return mode_mismatch_json(CredentialMode::Certificate);
+    };
+    let now = Utc::now();
+
+    let Ok(name) = state
+        .signer
+        .verify(purpose::API_CREDENTIAL, &request.token, now.timestamp())
+    else {
+        warn!("jeton de session absent, invalide ou expiré");
+        return unauthorized_json();
+    };
+
+    let (subject, groups) = match subjects(&state, &name).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(user = %name, erreur = %e, "groupes illisibles");
+            return internal_error_json();
+        }
+    };
+
+    let ttl = chrono::Duration::from_std(state.config.oidc_token_ttl)
+        .expect("durée bornée à la lecture de la configuration");
+    match jwt::issue(
+        &oidc.material,
+        &state.config.portal_url,
+        &state.config.oidc_audience,
+        &subject,
+        &groups,
+        now,
+        ttl,
+    ) {
+        Ok(issued) => {
+            info!(user = %name, expire = %issued.expires_at, "jeton émis");
+            (
+                [(header::CACHE_CONTROL, "no-store")],
+                axum::Json(TokenResponse {
+                    id_token: issued.token,
+                    expires_at: issued.expires_at.to_rfc3339(),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            warn!(user = %name, erreur = %e, "signature du jeton en échec");
+            internal_error_json()
+        }
+    }
+}
+
+/// Ferme une session : le jeton de renouvellement cesse immédiatement de valoir.
+///
+/// Présenter le jeton est l'autorisation : personne d'autre ne le détient. La réponse est la
+/// même qu'il ait été fermé ou qu'il n'ait jamais existé — se déconnecter deux fois n'est pas
+/// une erreur, et une réponse qui distinguerait les deux cas dirait à qui essaie s'il a mis la
+/// main sur un jeton valide.
+async fn api_revoke(
+    State(state): State<Shared>,
+    axum::Json(request): axum::Json<RevokeRequest>,
+) -> Response {
+    let Ok(user) = state.users.get(&request.user).await else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let now = Utc::now();
+
+    let closed = state
+        .sessions
+        .update(&user, |sessions| match sessions.verify(&request.refresh_token, now) {
+            Ok(id) => {
+                sessions.close(&id);
+                true
+            }
+            // Le ménage des sessions expirées a lieu quand même : c'est le seul moment où
+            // quelqu'un regarde cette liste.
+            Err(_) => {
+                sessions.prune(now);
+                false
+            }
+        })
+        .await;
+
+    match closed {
+        Ok(true) => info!(user = %request.user, "session fermée"),
+        Ok(false) => warn!(user = %request.user, "fermeture d'une session inconnue"),
+        Err(e) => {
+            warn!(user = %request.user, erreur = %e, "fermeture de session impossible");
+            return internal_error_json();
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Refus d'un point d'accès qui n'appartient pas au mode en service.
+///
+/// Ce n'est ni une panne ni un défaut d'identifiants : c'est un client qui parle le mauvais
+/// protocole, et le lui dire explicitement évite de chercher une erreur d'authentification qui
+/// n'existe pas.
+fn mode_mismatch_json(expected: CredentialMode) -> Response {
+    (
+        StatusCode::CONFLICT,
+        axum::Json(serde_json::json!({
+            "error": format!(
+                "ce cluster est en mode {expected} : ce point d'accès n'y est pas servi"
+            )
+        })),
+    )
+        .into_response()
+}
+
+/// Refus d'une demande mal formée. Le motif est rendu : ce n'est pas une question d'identité,
+/// et le taire laisserait un client corriger à l'aveugle.
+fn bad_request_json(reason: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(serde_json::json!({ "error": reason })),
+    )
+        .into_response()
 }
 
 fn unauthorized_json() -> Response {

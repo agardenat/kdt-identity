@@ -117,7 +117,6 @@ mod tests {
                 email: format!("{name}@example.com"),
                 display_name: None,
                 disabled,
-                cert_ttl: None,
             },
             status: None,
         }

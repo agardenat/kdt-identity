@@ -1,3 +1,4 @@
+{{- include "kdt-identity.validate" . -}}
 {{- $image := printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) -}}
 apiVersion: apps/v1
 kind: Deployment

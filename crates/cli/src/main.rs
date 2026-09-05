@@ -16,8 +16,9 @@ use clap::{Parser, Subcommand};
 use kdt_identity_api::csr;
 use kdt_identity_api::naming::Subject;
 use kdt_identity_api::portal::{
-    CredentialRequest, CredentialResponse, SessionRequest, SessionResponse, CREDENTIAL_PATH,
-    SESSION_PATH,
+    CredentialMode, CredentialRequest, CredentialResponse, RevokeRequest, SessionRequest,
+    SessionResponse, TokenRequest, TokenResponse, CREDENTIAL_PATH, REVOKE_PATH, SESSION_PATH,
+    TOKEN_PATH,
 };
 use serde::Serialize;
 use std::io::Write;
@@ -81,12 +82,21 @@ struct ExecCredential {
     status: ExecCredentialStatus,
 }
 
+/// Un `ExecCredential` porte soit un certificat et sa clé, soit un jeton — jamais les deux.
+///
+/// Les champs inutilisés sont omis plutôt que vides : client-go tente de lire tout champ
+/// présent, et une chaîne vide là où il attend du PEM échoue sur « failed to find any PEM
+/// data » plutôt que sur ce qui manque réellement.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExecCredentialStatus {
     expiration_timestamp: String,
-    client_certificate_data: String,
-    client_key_data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_certificate_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_key_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
 }
 
 #[tokio::main]
@@ -97,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
 
     match Cli::parse().command {
         Command::Credential { portal, user } => credential(&portal, &user).await,
-        Command::Logout { portal, user } => logout(&portal, &user),
+        Command::Logout { portal, user } => logout(&portal, &user).await,
         Command::Kubeconfig {
             portal,
             user,
@@ -111,57 +121,129 @@ async fn main() -> anyhow::Result<()> {
 async fn credential(portal: &str, user: &str) -> anyhow::Result<()> {
     let portal = portal.trim_end_matches('/');
     let path = cache::path(portal, user)?;
+    let now = chrono::Utc::now();
+    let cached = cache::read(&path);
 
-    if let Some(cached) = cache::read(&path) {
-        if cached.is_fresh(chrono::Utc::now()) {
-            return emit(&cached);
+    if let Some(cached) = &cached {
+        if cached.is_fresh(now) {
+            return emit(cached);
         }
     }
 
-    let fresh = obtain(portal, user).await?;
-    // Un échec d'écriture du cache ne doit pas priver l'utilisateur du credential qu'il vient
-    // d'obtenir : il paiera une authentification de plus, rien de pire.
-    if let Err(e) = cache::write(&path, &fresh) {
-        eprintln!("kdt-identity : cache non écrit ({e})");
+    // Le renouvellement silencieux d'abord. C'est lui qui rend les durées courtes tenables :
+    // sans lui, un credential de dix minutes redemanderait un mot de passe six fois par heure.
+    if let Some(refresh) = cached.as_ref().and_then(|c| c.usable_refresh(now)) {
+        match obtain(portal, SessionRequest::refresh(user, &refresh.token), Some(refresh)).await {
+            Ok(fresh) => {
+                store(&path, &fresh);
+                return emit(&fresh);
+            }
+            // Refus explicite : session révoquée, compte désactivé, ou jeton inconnu. Se
+            // ré-authentifier est la suite normale, pas un échec.
+            Err(Attempt::Refused(raison)) => {
+                eprintln!("kdt-identity : renouvellement refusé ({raison})");
+            }
+            // Une panne du portail ne doit pas se traduire par une demande de mot de passe :
+            // la saisie serait perdue, et l'utilisateur croirait ses identifiants en cause.
+            Err(Attempt::Unreachable(e)) => return Err(e),
+        }
     }
+
+    let (password, totp) = prompt_credentials(user, portal)?;
+    let fresh = obtain(
+        portal,
+        SessionRequest::password(user, &password, &totp),
+        None,
+    )
+    .await
+    .map_err(|e| match e {
+        Attempt::Refused(raison) => anyhow::anyhow!("{raison}"),
+        Attempt::Unreachable(e) => e,
+    })?;
+
+    store(&path, &fresh);
     emit(&fresh)
 }
 
-/// Authentifie, fait signer une demande construite localement, rend le credential.
+/// Écrit le cache sans faire échouer la commande en cas de problème.
+///
+/// Un échec d'écriture ne doit pas priver l'utilisateur du credential qu'il vient d'obtenir :
+/// il paiera une authentification de plus, rien de pire.
+fn store(path: &std::path::Path, credential: &cache::CachedCredential) {
+    if let Err(e) = cache::write(path, credential) {
+        eprintln!("kdt-identity : cache non écrit ({e})");
+    }
+}
+
+/// Ce qui peut arriver à une tentative, et qui ne se traite pas pareil.
+enum Attempt {
+    /// Le serveur a répondu, et il refuse.
+    Refused(String),
+    /// Le serveur n'a pas répondu, ou a répondu autre chose. Rien ne sert d'insister.
+    Unreachable(anyhow::Error),
+}
+
+/// Ouvre une session et en tire un credential utilisable.
 ///
 /// L'échange se fait en deux temps, et pas par confort : le sujet d'un certificat X.509 est
 /// fixé dans la demande, signée par une clé que seul ce processus détient. Le portail ne peut
 /// donc pas corriger un sujet incomplet — il ne peut que l'accepter ou le refuser. Le plugin
 /// doit connaître ses groupes **avant** de signer, et un code TOTP ne servant qu'une fois, il
 /// ne peut pas s'authentifier deux fois pour les apprendre.
-async fn obtain(portal: &str, user: &str) -> anyhow::Result<cache::CachedCredential> {
+///
+/// `kept_refresh` est le droit de renouveler déjà en cache : le portail ne le renvoie qu'à une
+/// ouverture par mot de passe, et le perdre ici imposerait une saisie à chaque expiration.
+async fn obtain(
+    portal: &str,
+    request: SessionRequest,
+    kept_refresh: Option<&cache::CachedRefresh>,
+) -> Result<cache::CachedCredential, Attempt> {
     let http = reqwest::Client::new();
-    let (password, totp) = prompt_credentials(user, portal)?;
+    let user = request.user.clone();
 
-    // Premier temps : s'authentifier et apprendre son identité effective.
-    let session: SessionResponse = read_json(
-        http.post(format!("{portal}{SESSION_PATH}"))
-            .json(&SessionRequest {
-                user: user.to_string(),
-                password,
-                totp,
-            })
-            .send()
-            .await
-            .with_context(|| format!("appel du portail {portal}"))?,
-    )
-    .await?;
+    let response = http
+        .post(format!("{portal}{SESSION_PATH}"))
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| {
+            Attempt::Unreachable(anyhow::Error::new(e).context(format!("appel du portail {portal}")))
+        })?;
 
-    let subject = Subject::user(user).context("nom de compte invalide")?;
+    // Tout refus du serveur conduit à une authentification complète, pas à un échec : session
+    // révoquée (401), ou déploiement dont le contrat a changé (400, 404, 409).
+    if response.status().is_client_error() {
+        let status = response.status();
+        let detail = error_detail(response).await;
+        return Err(Attempt::Refused(match status.as_u16() {
+            401 => "compte, mot de passe, code ou session invalide".to_string(),
+            _ => detail,
+        }));
+    }
+
+    let session: SessionResponse = read_json(response).await.map_err(Attempt::Unreachable)?;
+
+    let subject = Subject::user(&user)
+        .context("nom de compte invalide")
+        .map_err(Attempt::Unreachable)?;
     if session.subject != subject.as_str() {
         // Le portail désigne quelqu'un d'autre que ce qui a été demandé : construire une
         // demande là-dessus reviendrait à réclamer une identité qui n'est pas la nôtre.
-        bail!(
+        return Err(Attempt::Unreachable(anyhow::anyhow!(
             "le portail a répondu pour {} alors que {} était demandé",
             session.subject,
             subject.as_str()
-        );
+        )));
     }
+
+    let refresh = match (&session.refresh_token, &session.refresh_expires_at) {
+        (Some(token), Some(expires_at)) => Some(cache::CachedRefresh {
+            token: token.clone(),
+            expires_at: parse_time(expires_at).map_err(Attempt::Unreachable)?,
+        }),
+        // Un renouvellement ne rend pas de nouveau droit : celui du cache reste en vigueur.
+        _ => kept_refresh.cloned(),
+    };
 
     let groups = session
         .groups
@@ -171,16 +253,41 @@ async fn obtain(portal: &str, user: &str) -> anyhow::Result<cache::CachedCredent
                 .ok_or_else(|| anyhow::anyhow!("groupe {g:?} sans préfixe attendu"))
                 .and_then(|name| Ok(Subject::group(name)?))
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(Attempt::Unreachable)?;
 
-    let generated = csr::generate(&subject, &groups).context("génération de la demande")?;
+    let material = match session.mode {
+        CredentialMode::Certificate => {
+            certificate(&http, portal, &subject, &groups, session.token).await
+        }
+        CredentialMode::Oidc => token(&http, portal, session.token).await,
+    }
+    .map_err(Attempt::Unreachable)?;
 
-    // Second temps : faire signer. Le portail relit les groupes depuis le cluster et refusera
-    // si l'appartenance a changé entre les deux appels — auquel cas il suffit de recommencer.
+    Ok(cache::CachedCredential {
+        material: material.0,
+        expires_at: material.1,
+        refresh,
+    })
+}
+
+/// Fait signer une demande construite localement, et rend le certificat obtenu.
+///
+/// Le portail relit les groupes depuis le cluster et refusera si l'appartenance a changé entre
+/// les deux appels — auquel cas il suffit de recommencer.
+async fn certificate(
+    http: &reqwest::Client,
+    portal: &str,
+    subject: &Subject,
+    groups: &[Subject],
+    session_token: String,
+) -> anyhow::Result<(cache::Material, chrono::DateTime<chrono::Utc>)> {
+    let generated = csr::generate(subject, groups).context("génération de la demande")?;
+
     let issued: CredentialResponse = read_json(
         http.post(format!("{portal}{CREDENTIAL_PATH}"))
             .json(&CredentialRequest {
-                token: session.token,
+                token: session_token,
                 csr: generated.csr_pem.clone(),
             })
             .send()
@@ -189,14 +296,59 @@ async fn obtain(portal: &str, user: &str) -> anyhow::Result<cache::CachedCredent
     )
     .await?;
 
-    Ok(cache::CachedCredential {
-        certificate_pem: issued.certificate,
-        // La clé n'a jamais quitté ce processus : elle rejoint le cache, pas le réseau.
-        key_pem: generated.key_pem.to_string(),
-        expires_at: chrono::DateTime::parse_from_rfc3339(&issued.expires_at)
-            .context("date d'expiration illisible")?
-            .with_timezone(&chrono::Utc),
-    })
+    Ok((
+        cache::Material::Certificate {
+            certificate_pem: issued.certificate,
+            // La clé n'a jamais quitté ce processus : elle rejoint le cache, pas le réseau.
+            key_pem: generated.key_pem.to_string(),
+        },
+        parse_time(&issued.expires_at)?,
+    ))
+}
+
+/// Obtient un jeton d'identité signé par le portail.
+///
+/// Aucune demande de signature ici : le sujet du jeton est décidé par le portail, qui le signe
+/// lui-même. Le client n'a rien à construire ni à prouver au-delà de sa session.
+async fn token(
+    http: &reqwest::Client,
+    portal: &str,
+    session_token: String,
+) -> anyhow::Result<(cache::Material, chrono::DateTime<chrono::Utc>)> {
+    let issued: TokenResponse = read_json(
+        http.post(format!("{portal}{TOKEN_PATH}"))
+            .json(&TokenRequest {
+                token: session_token,
+            })
+            .send()
+            .await
+            .with_context(|| format!("appel du portail {portal}"))?,
+    )
+    .await?;
+
+    Ok((
+        cache::Material::Token {
+            id_token: issued.id_token,
+        },
+        parse_time(&issued.expires_at)?,
+    ))
+}
+
+/// Extrait le message d'erreur d'une réponse, ou rend le corps brut.
+async fn error_detail(response: reqwest::Response) -> String {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+
+    serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["error"].as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("le portail a refusé la demande ({status})"))
+}
+
+fn parse_time(raw: &str) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    Ok(chrono::DateTime::parse_from_rfc3339(raw)
+        .with_context(|| format!("date {raw:?} illisible"))?
+        .with_timezone(&chrono::Utc))
 }
 
 /// Lit une réponse JSON, en remontant le message du portail plutôt qu'un code nu.
@@ -252,31 +404,82 @@ fn prompt_credentials(user: &str, portal: &str) -> anyhow::Result<(String, Strin
 }
 
 fn emit(credential: &cache::CachedCredential) -> anyhow::Result<()> {
-    // Le PEM part tel quel. Contrairement aux champs `*-data` d'un kubeconfig, ceux d'un
-    // `ExecCredential` ne sont pas encodés en base64 : client-go les lit directement comme du
-    // PEM, et un base64 supplémentaire lui fait répondre « failed to find any PEM data ».
-    let exec = ExecCredential {
-        api_version: "client.authentication.k8s.io/v1",
-        kind: "ExecCredential",
-        status: ExecCredentialStatus {
-            expiration_timestamp: credential.expires_at.to_rfc3339(),
-            client_certificate_data: credential.certificate_pem.clone(),
-            client_key_data: credential.key_pem.clone(),
-        },
-    };
-
-    println!("{}", serde_json::to_string(&exec)?);
+    println!("{}", serde_json::to_string(&exec_credential(credential))?);
     Ok(())
 }
 
-fn logout(portal: &str, user: &str) -> anyhow::Result<()> {
-    let path = cache::path(portal.trim_end_matches('/'), user)?;
+/// Met le credential dans la forme que `kubectl` attend.
+///
+/// Le PEM part tel quel. Contrairement aux champs `*-data` d'un kubeconfig, ceux d'un
+/// `ExecCredential` ne sont pas encodés en base64 : client-go les lit directement comme du
+/// PEM, et un base64 supplémentaire lui fait répondre « failed to find any PEM data ».
+fn exec_credential(credential: &cache::CachedCredential) -> ExecCredential {
+    let status = match &credential.material {
+        cache::Material::Certificate {
+            certificate_pem,
+            key_pem,
+        } => ExecCredentialStatus {
+            expiration_timestamp: credential.expires_at.to_rfc3339(),
+            client_certificate_data: Some(certificate_pem.clone()),
+            client_key_data: Some(key_pem.clone()),
+            token: None,
+        },
+        cache::Material::Token { id_token } => ExecCredentialStatus {
+            expiration_timestamp: credential.expires_at.to_rfc3339(),
+            client_certificate_data: None,
+            client_key_data: None,
+            token: Some(id_token.clone()),
+        },
+    };
+
+    ExecCredential {
+        api_version: "client.authentication.k8s.io/v1",
+        kind: "ExecCredential",
+        status,
+    }
+}
+
+/// Efface le credential local et, en mode OIDC, ferme la session côté serveur.
+///
+/// Les deux comptent, et pas également : effacer le fichier empêche ce poste de s'en resservir,
+/// fermer la session empêche quiconque aurait copié le jeton de continuer. En mode certificat,
+/// il n'y a rien à fermer — c'est précisément ce que ce mode ne sait pas faire.
+async fn logout(portal: &str, user: &str) -> anyhow::Result<()> {
+    let portal = portal.trim_end_matches('/');
+    let path = cache::path(portal, user)?;
+
+    if let Some(refresh) = cache::read(&path).and_then(|c| c.refresh) {
+        match revoke(portal, user, &refresh.token).await {
+            Ok(()) => eprintln!("session fermée sur le portail"),
+            // Le cache est effacé quoi qu'il arrive : laisser un credential utilisable sur le
+            // poste parce que le portail est injoignable serait le pire des deux mondes.
+            Err(e) => eprintln!("kdt-identity : session non fermée sur le portail ({e:#})"),
+        }
+    }
+
     match std::fs::remove_file(&path) {
         Ok(()) => eprintln!("credential effacé"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!("aucun credential en cache")
         }
         Err(e) => bail!("suppression de {} : {e}", path.display()),
+    }
+    Ok(())
+}
+
+async fn revoke(portal: &str, user: &str, refresh_token: &str) -> anyhow::Result<()> {
+    let response = reqwest::Client::new()
+        .post(format!("{portal}{REVOKE_PATH}"))
+        .json(&RevokeRequest {
+            user: user.to_string(),
+            refresh_token: refresh_token.to_string(),
+        })
+        .send()
+        .await
+        .with_context(|| format!("appel du portail {portal}"))?;
+
+    if !response.status().is_success() {
+        bail!("le portail a refusé la fermeture ({})", response.status());
     }
     Ok(())
 }
@@ -349,32 +552,45 @@ mod tests {
 
     fn credential() -> cache::CachedCredential {
         cache::CachedCredential {
-            certificate_pem: "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n"
-                .to_string(),
-            key_pem: "-----BEGIN PRIVATE KEY-----\nWFla\n-----END PRIVATE KEY-----\n".to_string(),
+            material: cache::Material::Certificate {
+                certificate_pem: "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n"
+                    .to_string(),
+                key_pem: "-----BEGIN PRIVATE KEY-----\nWFla\n-----END PRIVATE KEY-----\n"
+                    .to_string(),
+            },
             expires_at: chrono::DateTime::parse_from_rfc3339("2026-08-21T20:00:00Z")
                 .unwrap()
                 .with_timezone(&chrono::Utc),
+            refresh: None,
         }
+    }
+
+    fn jeton() -> cache::CachedCredential {
+        cache::CachedCredential {
+            material: cache::Material::Token {
+                id_token: "en-tete.charge.signature".to_string(),
+            },
+            expires_at: chrono::DateTime::parse_from_rfc3339("2026-08-21T20:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            refresh: Some(cache::CachedRefresh {
+                token: "id.secret".to_string(),
+                expires_at: chrono::DateTime::parse_from_rfc3339("2026-08-28T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            }),
+        }
+    }
+
+    fn rendu(credential: &cache::CachedCredential) -> serde_json::Value {
+        serde_json::from_str(&serde_json::to_string(&exec_credential(credential)).unwrap()).unwrap()
     }
 
     /// `kubectl` refuse un ExecCredential qui ne porte pas exactement ces champs, et lit le
     /// certificat comme du PEM brut — pas comme du base64, à la différence d'un kubeconfig.
     #[test]
     fn l_exec_credential_porte_le_pem_tel_quel() {
-        let c = credential();
-        let exec = ExecCredential {
-            api_version: "client.authentication.k8s.io/v1",
-            kind: "ExecCredential",
-            status: ExecCredentialStatus {
-                expiration_timestamp: c.expires_at.to_rfc3339(),
-                client_certificate_data: c.certificate_pem.clone(),
-                client_key_data: c.key_pem.clone(),
-            },
-        };
-
-        let json: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&exec).unwrap()).unwrap();
+        let json = rendu(&credential());
 
         assert_eq!(json["apiVersion"], "client.authentication.k8s.io/v1");
         assert_eq!(json["kind"], "ExecCredential");
@@ -382,10 +598,37 @@ mod tests {
 
         let cert = json["status"]["clientCertificateData"].as_str().unwrap();
         assert!(cert.starts_with("-----BEGIN CERTIFICATE-----"), "{cert}");
-        assert_eq!(cert, c.certificate_pem);
 
         let key = json["status"]["clientKeyData"].as_str().unwrap();
         assert!(key.starts_with("-----BEGIN PRIVATE KEY-----"), "{key}");
+    }
+
+    /// En mode OIDC, `kubectl` attend un jeton et rien d'autre. Un champ de certificat présent
+    /// mais vide le fait échouer sur « failed to find any PEM data », qui ne dit pas ce qui
+    /// manque réellement.
+    #[test]
+    fn l_exec_credential_d_un_jeton_ne_porte_que_le_jeton() {
+        let json = rendu(&jeton());
+
+        assert_eq!(json["status"]["token"], "en-tete.charge.signature");
+        assert!(json["status"].get("clientCertificateData").is_none(), "{json}");
+        assert!(json["status"].get("clientKeyData").is_none(), "{json}");
+    }
+
+    /// Le jeton de rafraîchissement reste sur le poste : il ne doit jamais partir vers
+    /// `kubectl`, qui n'en a pas l'usage et l'écrirait dans ses propres journaux de débogage.
+    #[test]
+    fn le_rafraichissement_ne_sort_pas_du_plugin() {
+        let json = serde_json::to_string(&exec_credential(&jeton())).unwrap();
+        assert!(!json.contains("id.secret"), "{json}");
+    }
+
+    /// Un certificat n'a pas de jeton, et réciproquement : les deux champs ne doivent jamais
+    /// se retrouver ensemble, quelle que soit la forme du cache.
+    #[test]
+    fn les_deux_formes_s_excluent() {
+        let json = rendu(&credential());
+        assert!(json["status"].get("token").is_none(), "{json}");
     }
 
     /// Le kubeconfig produit ne doit contenir aucun secret : c'est tout l'intérêt du mode

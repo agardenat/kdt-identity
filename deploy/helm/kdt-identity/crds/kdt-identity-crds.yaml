@@ -33,14 +33,6 @@ spec:
         properties:
           spec:
             properties:
-              certTtl:
-                description: |-
-                  Durée de validité demandée pour les certificats de cet utilisateur, ex. `"8h"`.
-
-                  À défaut, la valeur globale du déploiement s'applique. L'API impose un plancher de
-                  600 s et le `--cluster-signing-duration` du kube-controller-manager un plafond.
-                nullable: true
-                type: string
               disabled:
                 default: false
                 description: |-

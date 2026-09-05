@@ -68,6 +68,9 @@ subjects:
 
   `list` est absent : le contrôleur accède toujours à un Secret par son nom. Sans ce verbe, une
   faille dans le portail ne permet pas d'énumérer les comptes du cluster.
+
+  En mode OIDC, les mêmes verbes couvrent deux objets de plus : la clé de signature, créée au
+  premier démarrage, et un Secret de sessions par compte, dont la suppression est la révocation.
 */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

@@ -31,3 +31,37 @@ Un groupe n'accorde rien tant qu'aucun binding ne le vise. Le sujet à référen
 dans le statut du groupe :
 
   kubectl get kdtgroup -o custom-columns=NOM:.metadata.name,SUJET:.status.subject
+{{ if eq .Values.credentialMode "oidc" }}
+Mode OIDC. Rien ne fonctionnera tant que l'apiserver ne connaîtra pas cet émetteur :
+
+  issuer    {{ .Values.portalUrl }}
+  audience  {{ .Values.oidc.audience }}
+  jwks      {{ .Values.portalUrl }}/.well-known/jwks.json
+
+Le préfixe des identités est déjà dans les jetons : la configuration de l'apiserver ne doit pas
+en ajouter un second — `prefix: ""`, et non l'absence de champ. Voir docs/oidc.md pour les deux
+façons de le configurer, et pour les règles CEL, à poser une par une : une expression refusée
+par le compilateur empêche l'apiserver de démarrer.
+
+{{- end }}
+
+Fermer les sessions d'un poste perdu — l'accès s'arrête sous {{ if eq .Values.credentialMode "oidc" }}{{ .Values.oidc.tokenTtl }}{{ else }}{{ .Values.certTtl }}{{ end }}, le compte
+reste utilisable ailleurs :
+
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "kdt-identity.fullname" . }}-controller -- \
+      /usr/local/bin/kdt-identity-server revoke alice
+
+Couper quelqu'un pour de bon — portail refusé, sessions fermées par le contrôleur :
+
+  kubectl patch kdtuser alice --type=merge -p '{"spec":{"disabled":true}}'
+{{- /*
+  Le téléchargement n'existe qu'en mode certificat : en mode OIDC le portail le refuse, un
+  jeton de quelques minutes dans un fichier n'ayant aucun sens. Annoncer une réserve qui ne
+  s'applique pas ferait chercher un trou qui n'existe pas.
+*/}}
+{{- if and (eq .Values.credentialMode "certificate") .Values.portal.kubeconfigDownload }}
+
+Note : un kubeconfig téléchargé depuis le portail échappe à ces deux gestes. Il vit
+{{ .Values.portal.downloadCertTtl }} quoi qu'il arrive. Pour que la révocation soit sans exception :
+portal.kubeconfigDownload=false
+{{- end }}
