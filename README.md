@@ -324,6 +324,72 @@ helm install kdt-identity deploy/helm/kdt-identity \
 `apiserverUrl` n'est pas `https://kubernetes.default.svc` : cette adresse finit dans le
 kubeconfig d'un utilisateur, qui n'est pas dans le cluster.
 
+### Depuis un fichier de valeurs
+
+Les `--set` conviennent à un essai. Pour une installation reproductible, et dès qu'une chaîne
+d'intégration s'en charge, les valeurs se rangent dans un fichier versionné :
+
+```yaml
+# helm-values.yaml
+clusterName: production
+portalUrl: https://identity.example.com
+apiserverUrl: https://k8s.example.com:6443
+
+ingress:
+  enabled: true
+  className: nginx
+  host: identity.example.com
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+
+networkPolicy:
+  enabled: true
+  # Sur un cluster sous Cilium, sans quoi le contrôleur n'atteint pas l'apiserver.
+  cilium: false
+  # Les pods autorisés à joindre le portail. Vide, seul le namespace de la release y accède,
+  # et le contrôleur d'ingress est refusé.
+  ingressFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+```
+
+```sh
+git clone --branch v0.1.1 https://github.com/agardenat/kdt-identity
+helm upgrade --install kdt-identity kdt-identity/deploy/helm/kdt-identity \
+    --namespace kdt-identity --create-namespace \
+    --values helm-values.yaml
+```
+
+`upgrade --install` est idempotent : la même commande installe la première fois et met à jour
+ensuite, ce qu'attend une chaîne d'intégration qui rejoue le même pipeline. Le clone est épinglé
+sur un tag, sans quoi la version déployée dépend de la date du pipeline.
+
+#### La clé de session, si le rendu se fait hors du cluster
+
+`sessionKey` laissée vide, le chart engendre une clé au premier déploiement et la relit ensuite
+avec `lookup`, pour qu'une montée de version ne déconnecte pas tout le monde.
+
+`lookup` ne rend quelque chose que si le rendu a accès au cluster. C'est le cas de
+`helm upgrade` et du contrôleur Helm de Flux ; ce n'est pas celui de `helm template`, ni d'un
+outil qui rend le chart avant de l'appliquer — Argo CD par défaut. Là, la clé est régénérée à
+chaque synchronisation, et toutes les sessions ouvertes tombent.
+
+Dans ce cas, fixer la clé explicitement, depuis le gestionnaire de secrets de la chaîne :
+
+```sh
+helm upgrade --install kdt-identity kdt-identity/deploy/helm/kdt-identity \
+    --namespace kdt-identity --create-namespace \
+    --values helm-values.yaml \
+    --set sessionKey="$KDT_SESSION_KEY"
+```
+
+`KDT_SESSION_KEY` vaut 32 octets en base64, `openssl rand -base64 32`. Elle n'a pas sa place
+dans le fichier de valeurs versionné.
+
 Le chart refuse de s'installer avec un ingress sans TLS. Ce n'est pas du zèle : le cookie de
 session porte l'attribut `Secure`, donc un navigateur ne le renverrait pas sur du HTTP — le
 portail serait inutilisable, et silencieusement.

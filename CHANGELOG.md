@@ -5,6 +5,16 @@ le [versionnage sémantique](https://semver.org/lang/fr/).
 
 Chaque version publiée est accompagnée de notes de version reprenant la section correspondante.
 
+## [Non publié]
+
+### Ajouté
+
+- Installation depuis un fichier de valeurs, pour une chaîne d'intégration : `helm-values.yaml`
+  d'exemple, `upgrade --install` idempotent, clone épinglé sur un tag. Avec l'avertissement qui
+  va avec — `lookup` ne rend rien quand le chart est rendu hors du cluster (`helm template`,
+  Argo CD par défaut), donc la clé de session y est régénérée à chaque synchronisation et toutes
+  les sessions tombent : la fixer explicitement dans ce cas.
+
 ## [0.1.1] - 2026-09-05
 
 ### Corrigé
