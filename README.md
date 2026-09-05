@@ -11,9 +11,17 @@ l'apiserver reconnaît — sans toucher à la configuration du control plane.
 
 Compagnon de [kdt](https://github.com/agardenat/kdt).
 
-> **État : complet et déployable.** Créer un compte, l'inviter, l'activer depuis le portail
-> avec mot de passe et TOTP, puis obtenir un accès — par téléchargement d'un kubeconfig ou par
-> le plugin `exec`. Chart Helm et image fournis.
+> **État : en service.** Créer un compte, l'inviter, l'activer depuis le portail avec mot de
+> passe et TOTP, puis obtenir un accès que le plugin renouvelle tout seul et qu'un
+> administrateur peut révoquer. Deux modes de délivrance — certificat ou OIDC — éprouvés
+> contre un apiserver réel. Chart Helm et image fournis.
+
+| Guide | Pour qui |
+| --- | --- |
+| [Les deux modes](docs/modes.md) | choisir, vérifier la compatibilité de son cluster, basculer |
+| [Le plugin](docs/plugin.md) | postes de travail : installation, cycle de vie, dépannage |
+| [Administration](docs/administration.md) | comptes, groupes, révocation, droits RBAC |
+| [Mode OIDC](docs/oidc.md) | configurer l'apiserver |
 
 ## Ce que ça fait
 
@@ -37,7 +45,7 @@ kdtuser.identity.kdt.sh/alice   alice@example.com   Pending   ["lecteurs"]
 NAME                                MEMBRES   SUJET
 kdtgroup.identity.kdt.sh/lecteurs   1         kdt:lecteurs
 
-$ kdt-identity-server issue alice --ttl 8h > alice.kubeconfig
+$ kdt-identity-server issue alice > alice.kubeconfig
 
 $ kubectl --kubeconfig=alice.kubeconfig auth whoami
 ATTRIBUTE   VALUE
@@ -139,36 +147,38 @@ Variables d'environnement du portail :
 Sans `KDT_IDENTITY_SESSION_KEY`, une clé est tirée au démarrage : les sessions ne survivent
 alors ni à un redémarrage ni à une seconde instance. Le serveur le signale au lancement.
 
-## Le plugin `exec`
+## Le plugin `kdt-identity`
 
-Le téléchargement d'un kubeconfig depuis le portail est pratique, mais il fait voyager une clé
-privée sur le réseau et il faut recommencer à chaque expiration. Le plugin fait mieux :
+Le chemin recommandé sur un poste de travail. `kubectl` appelle le plugin quand il a besoin d'un
+accès ; il l'obtient, le met en cache et le renouvelle tout seul.
 
 ```sh
 kdt-identity kubeconfig --portal https://identity.example.com --user alice \
     --cluster production --server https://k8s.example.com:6443 --ca-file ca.crt > ~/.kube/config
 ```
 
-Le kubeconfig produit ne contient **aucun secret** : il déclare simplement `kubectl` doit
-appeler `kdt-identity` quand il a besoin d'un credential.
+Le kubeconfig produit ne contient **aucun secret** : il dit seulement à `kubectl` d'appeler
+`kdt-identity`.
 
-À la première commande, le plugin demande le mot de passe et un code TOTP, engendre une paire
-de clés **sur le poste**, en envoie seulement la demande de signature, et met le certificat en
-cache jusqu'à son expiration. Les commandes suivantes ne demandent rien.
+```console
+$ kubectl get pods
+Authentification kdt-identity — alice sur https://identity.example.com
+Mot de passe :
+Code à 6 chiffres : 123456
+NAME   READY   STATUS
+…
 
-La clé privée ne traverse jamais le réseau — c'est ce que le téléchargement navigateur ne peut
-pas offrir. Le cache est écrit en 0600 dans `~/.kube/cache/kdt-identity/`.
+$ kubectl get pods        # plus aucune saisie, pendant sept jours
+```
 
-`kdt-identity logout` efface le cache et force une nouvelle authentification.
+Deux durées, qui ne mesurent pas la même chose : le credential vaut **dix minutes** et se
+renouvelle en silence, le droit de session vaut **sept jours** et borne l'intervalle entre deux
+saisies. La première rend l'accès révocable, la seconde le rend supportable.
 
-### Pourquoi deux appels HTTP
+La clé privée est engendrée sur le poste et n'en sort jamais ; seule la demande de signature
+part sur le réseau.
 
-Le sujet d'un certificat X.509 — nom d'utilisateur et groupes — est fixé dans la demande de
-signature, elle-même signée par la clé du client. Le portail ne peut donc pas compléter un
-sujet incomplet : il ne peut que l'accepter ou le refuser. Le plugin doit connaître ses groupes
-**avant** de signer, et un code TOTP ne servant qu'une fois, il ne peut pas s'authentifier deux
-fois pour les apprendre. Le premier appel authentifie et rend l'identité effective avec un
-jeton valable une minute ; le second fait signer.
+Installation, cycle de vie, déconnexion, cache et dépannage : [guide du plugin](docs/plugin.md).
 
 ### Faire vivre les groupes
 
@@ -185,26 +195,32 @@ $ kdt-identity logout --portal … --user alice && kubectl auth whoami
 Groups   [kdt:lecteurs system:authenticated]
 ```
 
-Le certificat déjà émis garde ses groupes jusqu'à expiration — c'est la contrepartie du modèle
-par certificats, détaillée dans [Révocation](#révocation). Un changement d'appartenance prend
-donc effet au renouvellement suivant, soit au plus tard huit heures.
+Le certificat déjà émis garde ses groupes jusqu'à expiration : un changement d'appartenance
+prend effet au renouvellement suivant, soit dix minutes au plus. `logout` force le passage
+immédiatement.
 
 Les opérations courantes — créer, inviter, désactiver, gérer l'appartenance, et surtout passer
 des groupes aux droits RBAC — sont rassemblées dans le [guide d'administration](docs/administration.md).
 
 ## Comment ça marche
 
-Les identités sont des certificats clients X.509 obtenus via l'API
+Par défaut, les identités sont des certificats clients X.509 obtenus via l'API
 `CertificateSigningRequest` : `CN=kdt:<utilisateur>`, un `O=kdt:<groupe>` par groupe, signés par
-la CA du cluster.
+la CA du cluster. Ils durent dix minutes et le plugin les renouvelle en silence.
 
-Ce choix a une conséquence heureuse et une conséquence gênante, toutes deux structurantes :
+Ce choix a deux conséquences structurantes :
 
-- **Ça marche partout**, y compris sur AKS, EKS, GKE et OpenShift : aucun drapeau de
-  l'apiserver à changer, aucune `AuthenticationConfiguration` à écrire, aucun IdP existant à
-  déplacer.
-- **Il n'y a pas de révocation.** Kubernetes ne consulte aucune CRL : un certificat émis reste
-  valide jusqu'à son expiration. Voir [Révocation](#révocation).
+- **Rien à changer sur le control plane.** Aucun drapeau de l'apiserver, aucune
+  `AuthenticationConfiguration`, aucun IdP à déplacer. Une installation Helm, et c'est tout.
+- **Le cluster doit honorer ce signeur**, ce qui n'est pas acquis sur un control plane managé.
+  Vérifié : k3s et AKS oui, EKS non.
+
+Un second mode, `oidc`, remplace les certificats par des jetons que l'apiserver valide. Il sert
+aux clusters qui ne signent pas, et à tracer les sessions individuellement. La révocation et
+l'identité produite sont identiques dans les deux cas.
+
+**[Guide des modes](docs/modes.md)** — tableau de décision, compatibilité par plateforme,
+comment tester son cluster en une minute, comment basculer.
 
 ### Coexistence avec un IdP déjà en place
 
@@ -248,15 +264,41 @@ deux ne doit dépendre de l'autre.
 
 ### Révocation
 
-Un certificat émis vaut jusqu'à son expiration, sans exception. Trois moyens d'agir :
+Un credential émis vaut jusqu'à son expiration, sans exception : Kubernetes ne consulte aucune
+CRL, et un jeton signé ne se rappelle pas. La révocation ne vient donc pas de l'annulation d'un
+credential — elle vient du **retrait du droit d'en obtenir un autre**, conservé dans le
+cluster, combiné à une durée assez courte pour que l'attente soit supportable.
 
-1. **Une durée courte** (8 à 24 h). Le plugin `exec` la rendra indolore une fois écrit.
-2. **`spec.disabled: true`** bloque immédiatement toute nouvelle émission.
-3. **Retirer le binding du groupe** coupe l'accès de tous ses membres sans attendre
-   l'expiration. C'est le levier le plus rapide, et la raison pour laquelle les droits doivent
-   vivre sur les groupes plutôt que sur les individus.
+D'où deux gestes, qui ne disent pas la même chose :
 
-Une révocation individuelle instantanée demanderait le mode OIDC ou un proxy d'impersonation.
+```console
+$ kubectl -n kdt-identity exec deploy/kdt-identity-controller -- \
+    /usr/local/bin/kdt-identity-server revoke alice          # poste perdu ou volé
+
+$ kubectl patch kdtuser alice --type=merge \
+    -p '{"spec":{"disabled":true}}'                          # départ, compte compromis
+```
+
+`revoke` ferme les sessions ouvertes : la personne reste habilitée et se reconnecte depuis un
+autre poste, celui qui a été perdu ne renouvelle plus rien.
+
+`disabled` va plus loin, et se suffit à lui-même : le portail refuse la connexion, le
+contrôleur ferme les sessions en cours, plus aucun renouvellement n'aboutit. C'est un champ de
+la spec, donc le geste est déclaratif — il vit dans votre dépôt GitOps, sans qu'aucun shell ne
+soit ouvert dans un pod.
+
+Dans les deux cas, le credential en circulation vit sa durée : **dix minutes au plus** en mode
+certificat, cinq en mode OIDC. C'est le seul délai irréductible, et `certTtl` en décide.
+
+Restent deux leviers qui n'ont pas changé :
+
+- **Retirer le binding d'un groupe** coupe l'accès de tous ses membres instantanément, sans
+  attendre le moindre renouvellement. C'est la raison pour laquelle les droits doivent vivre
+  sur les groupes plutôt que sur les individus.
+- **Un kubeconfig téléchargé depuis le portail** échappe à tout cela : il est autoportant,
+  personne ne le renouvelle, et il reste valable jusqu'à son expiration — huit heures par
+  défaut. C'est le prix du chemin « sans rien installer ». Quand la révocation doit être sans
+  exception, fermez-le : `portal.kubeconfigDownload: false`.
 
 ## Obtenir les binaires
 
@@ -264,8 +306,8 @@ Le projet en produit deux, qui ne s'installent pas au même endroit ni par les m
 
 | Binaire | Où | Pour qui |
 | --- | --- | --- |
-| `kdt-identity-server` | dans le cluster, fourni par l'image | contrôleur, portail, et les commandes d'administration |
-| `kdt-identity` | sur le poste de travail | le plugin `exec` de kubectl |
+| `kdt-identity-server` | dans le cluster, fourni par l'image | contrôleur, portail, commandes d'administration |
+| `kdt-identity` | sur le poste de travail | plugin d'authentification de kubectl |
 
 **Côté administration, il n'y a rien à installer.** Les commandes du serveur s'exécutent dans le
 pod déjà déployé :
@@ -277,30 +319,8 @@ kubectl -n kdt-identity exec deploy/kdt-identity-controller -- \
 
 Le chemin est absolu parce que l'image ne contient ni shell ni `PATH`.
 
-**Côté poste de travail**, il n'y a pas encore de paquets `deb`, `rpm` ni de formule Homebrew.
-En attendant, le plus simple est d'extraire le binaire de l'image : il est lié statiquement et
-ne dépend d'aucune libc.
-
-```sh
-c=$(podman create ghcr.io/agardenat/kdt-identity:0.1.1)
-podman cp $c:/usr/local/bin/kdt-identity ~/.local/bin/kdt-identity
-podman rm $c
-```
-
-Sinon, depuis les sources, avec une chaîne Rust :
-
-```sh
-cargo install --git https://github.com/agardenat/kdt-identity kdt-identity-cli
-```
-
-Dans les deux cas, le binaire doit se trouver dans le `PATH` : le kubeconfig produit par
-`kdt-identity kubeconfig` déclare `command: kdt-identity`, sans chemin, et c'est `kubectl` qui
-l'exécutera.
-
-```console
-$ kdt-identity --version
-kdt-identity 0.1.1
-```
+**Côté poste de travail**, extraire le binaire de l'image ou l'installer depuis les sources —
+voir le [guide du plugin](docs/plugin.md#installation).
 
 ## Installation
 
@@ -358,7 +378,7 @@ networkPolicy:
 ```
 
 ```sh
-git clone --branch v0.1.1 https://github.com/agardenat/kdt-identity
+git clone --branch v1.0.0 https://github.com/agardenat/kdt-identity
 helm upgrade --install kdt-identity kdt-identity/deploy/helm/kdt-identity \
     --namespace kdt-identity --create-namespace \
     --values helm-values.yaml

@@ -54,9 +54,40 @@ $ kubectl patch kdtuser alice --type=merge -p '{"spec":{"disabled":true}}'
 ```
 
 Le compte ne peut plus se connecter au portail ni obtenir de nouveau certificat. Un certificat
-déjà émis reste valide jusqu'à son expiration : Kubernetes ne consulte aucune CRL, c'est la
-contrepartie du modèle par certificats. Pour une exclusion immédiate, retirer les bindings qui
-visent ses groupes.
+déjà émis reste valide jusqu'à son expiration — au plus tard huit heures, la durée de tout ce
+qu'émet le portail : Kubernetes ne consulte aucune CRL, c'est la contrepartie du modèle par
+certificats. Pour une exclusion immédiate, retirer les bindings qui visent ses groupes.
+
+`disabled` se suffit à lui-même : le contrôleur ferme les sessions ouvertes dès qu'il le voit,
+donc plus aucun renouvellement n'aboutit. L'accès s'arrête quand le credential en cours expire,
+soit dix minutes au plus. C'est un champ de la spec : le geste vit dans un dépôt GitOps, sans
+qu'aucun shell ne soit ouvert dans un pod.
+
+### Fermer les sessions sans désactiver le compte
+
+Pour un poste perdu ou volé, la personne reste habilitée et doit continuer à travailler
+ailleurs :
+
+```console
+$ kubectl -n kdt-identity exec deploy/kdt-identity-controller -- \
+    /usr/local/bin/kdt-identity-server revoke alice
+alice : 2 sessions fermées
+L'accès s'arrête au prochain renouvellement, dans 10 min au plus.
+Le compte reste actif : il peut rouvrir une session.
+```
+
+Le poste perdu ne renouvelle plus rien ; sa propriétaire se reconnecte depuis un autre, avec
+son mot de passe et son code — que le voleur n'a pas.
+
+| Situation | Geste | Effet |
+|---|---|---|
+| Poste perdu ou volé | `revoke alice` | sessions fermées, la personne se reconnecte |
+| Départ, compte compromis | `spec.disabled: true` | portail bloqué, sessions fermées, plus aucun renouvellement |
+
+Une réserve dans les deux cas : un kubeconfig téléchargé depuis le portail échappe à tout cela.
+Il est autoportant, personne ne le renouvelle, et il reste valable jusqu'à son expiration —
+huit heures par défaut. Quand la révocation doit être sans exception, fermer ce chemin :
+`portal.kubeconfigDownload: false`.
 
 ### Supprimer
 
