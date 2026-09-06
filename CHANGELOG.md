@@ -7,6 +7,35 @@ Chaque version publiée est accompagnée de notes de version reprenant la sectio
 
 ## [Non publié]
 
+### Ajouté
+
+- **Flow d'autorisation**, pour qu'une application web puisse agir au nom de quelqu'un sans jamais
+  voir son mot de passe. `/authorize` reconnaît la session ouverte du portail, demande un accord,
+  et redirige avec un code d'une minute ; `/api/v1/authorize/token` l'échange contre un droit de
+  session, contre preuve PKCE (`S256` seul, `plain` refusé).
+
+  Ce que l'application obtient est une session ordinaire : elle compte dans les sessions du
+  compte, `revoke` la ferme et `spec.disabled` la coupe. Il n'y a pas deux façons de révoquer.
+
+  L'adresse de retour est comparée en entier, jamais par préfixe — un préfixe accepterait un
+  domaine voisin, et rediriger un code revient à le donner. Tant que le client et l'adresse ne
+  sont pas reconnus, aucune redirection n'a lieu, pas même pour signaler l'erreur. Un code ne sert
+  qu'une fois, et l'état du compte est relu à l'accord puis à l'échange : un code émis avant une
+  désactivation ne vaut plus rien.
+
+- **`webUrl`** dans les valeurs du chart : la racine publique de l'application autorisée, dont
+  l'adresse de retour découle. Vide — le défaut — les points d'accès ne sont pas montés et la page
+  du compte n'en dit rien. Renseignée, elle doit être en `https` : un code d'autorisation n'a pas
+  à voyager en clair.
+
+- **Un lien vers kdt-web sur la page du compte**, affiché seulement si `webUrl` est déclarée, sur
+  le modèle du téléchargement de kubeconfig qui n'apparaît que s'il est ouvert.
+
+### Modifié
+
+- La page de connexion accepte un retour après authentification, restreint au seul flow
+  d'autorisation : ni URL absolue, ni double barre oblique, ni caractère de contrôle.
+
 ## [1.0.0] - 2026-09-05
 
 Première version stable. Ce qui manquait à la 0.1 pour être utilisable en production tenait en

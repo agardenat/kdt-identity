@@ -108,6 +108,13 @@ pub struct ServerConfig {
     pub oidc_audience: String,
     /// Durée de vie d'un jeton d'identité.
     pub oidc_token_ttl: Duration,
+    /// Racine publique de kdt-web, si elle est déployée.
+    ///
+    /// Absente, le flow d'autorisation n'existe pas et la page du compte ne mentionne rien :
+    /// kdt-web est une installation facultative, et le portail ne suppose jamais la présence de
+    /// ce qu'on ne lui a pas déclaré. Une détection — chercher un Service, sonder une URL —
+    /// afficherait un lien mort le temps qu'un ingress se propage.
+    pub web_url: Option<String>,
 }
 
 impl ServerConfig {
@@ -170,6 +177,8 @@ impl ServerConfig {
                 DEFAULT_TOKEN_TTL,
                 TOKEN_TTL_RANGE,
             )?,
+            web_url: env("KDT_IDENTITY_WEB_URL")
+                .map(|raw| raw.trim_end_matches('/').to_string()),
         }
         .validated()
     }
@@ -191,6 +200,25 @@ impl ServerConfig {
                 ),
             ));
         }
+
+        // Un code d'autorisation voyage dans une URL, et s'échange contre un droit de session de
+        // plusieurs jours. En clair sur le réseau, il est lisible par tout ce qui se trouve entre
+        // le navigateur et l'application. La boucle locale fait exception : elle ne traverse rien,
+        // et c'est le seul chemin praticable derrière un `port-forward`.
+        if let Some(web_url) = &self.web_url {
+            let local = web_url.starts_with("http://localhost")
+                || web_url.starts_with("http://127.0.0.1");
+            if !web_url.starts_with("https://") && !local {
+                return Err(ConfigError::Invalid(
+                    "KDT_IDENTITY_WEB_URL",
+                    format!(
+                        "{web_url:?} : une racine en https est exigée, un code d'autorisation \
+                         n'a pas à voyager en clair"
+                    ),
+                ));
+            }
+        }
+
         Ok(self)
     }
 
@@ -340,6 +368,7 @@ mod tests {
             apiserver_url: None,
             cluster_ca_file: None,
             session_key: None,
+            web_url: None,
             credential_mode: CredentialMode::Certificate,
             cert_ttl: DEFAULT_CERT_TTL,
             download_cert_ttl: DEFAULT_DOWNLOAD_CERT_TTL,

@@ -151,16 +151,30 @@ pub fn activate(
     )
 }
 
-pub fn login(error: Option<&str>) -> Markup {
+/// Formulaire de connexion.
+///
+/// `next` n'est repris que s'il a été validé par l'appelant : c'est un chemin relatif visant
+/// `/authorize`, jamais une adresse arbitraire. Le porter en champ caché plutôt qu'en paramètre
+/// d'action garde l'URL du formulaire identique dans les deux cas.
+pub fn login(error: Option<&str>, next: Option<&str>) -> Markup {
     page(
         "Connexion",
         html! {
             div."card" {
                 h1 { "Connexion" }
-                p."sub" { "Portail d'accès au cluster Kubernetes." }
+                p."sub" {
+                    @if next.is_some() {
+                        "Connectez-vous pour autoriser l'accès demandé."
+                    } @else {
+                        "Portail d'accès au cluster Kubernetes."
+                    }
+                }
                 (error_box(error))
 
                 form method="post" action="/login" {
+                    @if let Some(next) = next {
+                        input type="hidden" name="next" value=(next);
+                    }
                     label for="user" { "Compte" }
                     input type="text" id="user" name="user" required autocomplete="username"
                           autocapitalize="none" spellcheck="false";
@@ -204,6 +218,11 @@ pub struct Account<'a> {
     /// Distinct du mode : il se ferme aussi en mode certificat, quand la révocation doit être
     /// sans exception. Un fichier autoportant survit à la fermeture des sessions.
     pub download: bool,
+    /// Racine de kdt-web, si elle est déclarée sur ce cluster.
+    ///
+    /// Absente, la page n'en dit rien : kdt-web est une installation facultative, et annoncer une
+    /// interface qui n'existe pas serait pire que de se taire.
+    pub web_url: Option<&'a str>,
 }
 
 pub fn account(account: Account) -> Markup {
@@ -217,6 +236,7 @@ pub fn account(account: Account) -> Markup {
         mode,
         portal_url,
         download,
+        web_url,
     } = account;
     let _ = mode;
 
@@ -243,6 +263,17 @@ pub fn account(account: Account) -> Markup {
                                 ul."groups" { @for g in groups { li { (g) } } }
                             }
                         }
+                    }
+                }
+
+                // Proposé avant le plugin, parce qu'il n'y a rien à installer pour s'en servir.
+                // Le lien ouvre le flow d'autorisation : la session déjà ouverte ici évite une
+                // seconde saisie, et l'application n'apprend ni le mot de passe ni le code.
+                @if let Some(web_url) = web_url {
+                    p { "Vous pouvez consulter ce cluster depuis votre navigateur, avec vos "
+                        "droits et sans rien installer :" }
+                    p style="margin:.2rem 0 1.4rem" {
+                        a href=(web_url) { "Ouvrir kdt-web" }
                     }
                 }
 
@@ -294,6 +325,110 @@ pub fn account(account: Account) -> Markup {
     )
 }
 
+/// Ce qu'il faut pour demander un accord d'autorisation.
+pub struct Consent<'a> {
+    pub user: &'a str,
+    pub subject: &'a str,
+    pub groups: &'a [String],
+    pub cluster: &'a str,
+    /// L'application qui demande, telle qu'elle est déclarée sur ce cluster.
+    pub application: &'a str,
+    /// L'adresse de retour retenue, montrée pour qu'elle soit vérifiable à l'œil.
+    pub redirect_uri: &'a str,
+    pub csrf: &'a str,
+    pub state: &'a str,
+    pub code_challenge: &'a str,
+    pub code_challenge_method: &'a str,
+    /// Durée du droit de session accordé, écrite comme le chart la déclare.
+    pub refresh_ttl: &'a str,
+    pub error: Option<&'a str>,
+}
+
+/// Demande l'accord avant d'ouvrir une session pour une application.
+///
+/// La page dit trois choses, parce que ce sont les trois qui engagent : sous quelle identité
+/// l'application agira, pour combien de temps, et comment couper. Un écran d'autorisation qui se
+/// contente d'un bouton « Autoriser » ne laisse rien à décider.
+pub fn consent(consent: Consent) -> Markup {
+    let Consent {
+        user,
+        subject,
+        groups,
+        cluster,
+        application,
+        redirect_uri,
+        csrf,
+        state,
+        code_challenge,
+        code_challenge_method,
+        refresh_ttl,
+        error,
+    } = consent;
+
+    page(
+        "Autoriser l'accès",
+        html! {
+            div."card" {
+                h1 { "Autoriser l'accès" }
+                p."sub" {
+                    strong { (application) } " demande à agir en votre nom sur le cluster "
+                    strong { (cluster) } "."
+                }
+                (error_box(error))
+
+                dl style="margin:0 0 1.2rem" {
+                    div."row" { dt { "Compte" } dd { (user) } }
+                    div."row" {
+                        dt { "Identité utilisée" }
+                        dd style="font-family:ui-monospace,monospace" { (subject) }
+                    }
+                    div."row" {
+                        dt { "Groupes" }
+                        dd {
+                            @if groups.is_empty() {
+                                span style="font-weight:400;opacity:.7" { "aucun" }
+                            } @else {
+                                ul."groups" { @for g in groups { li { (g) } } }
+                            }
+                        }
+                    }
+                    div."row" {
+                        dt { "Adresse de retour" }
+                        dd style="font-family:ui-monospace,monospace;font-size:.82rem;\
+                                  word-break:break-all;font-weight:400" { (redirect_uri) }
+                    }
+                    div."row" { dt { "Durée de l'accès" } dd { (refresh_ttl) } }
+                }
+
+                p."sub" {
+                    "L'application n'obtient ni votre mot de passe ni votre code : elle recevra un "
+                    "droit de session, avec vos droits et rien de plus. Vous pouvez le couper à "
+                    "tout moment en demandant la fermeture de vos sessions."
+                }
+
+                form method="post" action="/authorize" {
+                    input type="hidden" name="csrf" value=(csrf);
+                    input type="hidden" name="client_id" value=(application);
+                    input type="hidden" name="redirect_uri" value=(redirect_uri);
+                    input type="hidden" name="state" value=(state);
+                    input type="hidden" name="code_challenge" value=(code_challenge);
+                    input type="hidden" name="code_challenge_method" value=(code_challenge_method);
+                    button type="submit" { "Autoriser " (application) }
+                }
+            }
+
+            form method="post" action="/logout" style="margin-top:1rem" {
+                input type="hidden" name="csrf" value=(csrf);
+                button type="submit"
+                       style="background:transparent;color:var(--muted);border:1px solid var(--line)" {
+                    "Refuser et se déconnecter"
+                }
+            }
+            footer { "kdt-identity" }
+        },
+    )
+}
+
 /// Page de confirmation, sans détail sur ce qui a échoué ni sur ce qui existe.
 pub fn message(title: &str, heading: &str, body: &str) -> Markup {
     page(
@@ -320,10 +455,11 @@ mod tests {
     #[test]
     fn toute_variable_css_employee_est_definie() {
         let rendus = [
-            login(None).into_string(),
+            login(None, None).into_string(),
             account(demo(CredentialMode::Certificate)).into_string(),
             account(Account {
                 download: false,
+                web_url: None,
                 ..demo(CredentialMode::Oidc)
             })
             .into_string(),
@@ -362,7 +498,7 @@ mod tests {
         let hostile = "<script>alert(1)</script>";
         let rendus = [
             activate(hostile, hostile, "<svg></svg>", hostile, 12, Some(hostile)).into_string(),
-            login(Some(hostile)).into_string(),
+            login(Some(hostile), None).into_string(),
             account(Account {
                 user: hostile,
                 subject: hostile,
@@ -373,6 +509,7 @@ mod tests {
                 mode: CredentialMode::Certificate,
                 portal_url: hostile,
                 download: true,
+                web_url: None,
             })
             .into_string(),
             account(Account {
@@ -385,6 +522,7 @@ mod tests {
                 mode: CredentialMode::Oidc,
                 portal_url: hostile,
                 download: false,
+                web_url: None,
             })
             .into_string(),
             message(hostile, hostile, hostile).into_string(),
@@ -419,6 +557,7 @@ mod tests {
             mode,
             portal_url: "https://identity.example.com",
             download: true,
+            web_url: None,
         }
     }
 
@@ -455,7 +594,7 @@ mod tests {
         for rendu in [
             activate("alice", "t", "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>", "JBSW", 12, None)
                 .into_string(),
-            login(None).into_string(),
+            login(None, None).into_string(),
             account(demo(CredentialMode::Certificate)).into_string(),
             account(demo(CredentialMode::Oidc)).into_string(),
         ] {
@@ -476,14 +615,14 @@ mod tests {
         let a = activate("alice", "t", "", "JBSW", 12, None).into_string();
         assert!(a.contains(r#"autocomplete="new-password""#), "{a}");
 
-        let l = login(None).into_string();
+        let l = login(None, None).into_string();
         assert!(l.contains(r#"autocomplete="current-password""#), "{l}");
         assert!(l.contains(r#"autocomplete="one-time-code""#), "{l}");
     }
 
     #[test]
     fn le_message_d_erreur_n_apparait_que_s_il_existe() {
-        assert!(!login(None).into_string().contains("class=\"error\""));
-        assert!(login(Some("raté")).into_string().contains("raté"));
+        assert!(!login(None, None).into_string().contains("class=\"error\""));
+        assert!(login(Some("raté"), None).into_string().contains("raté"));
     }
 }

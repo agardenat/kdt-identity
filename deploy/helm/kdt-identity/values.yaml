@@ -11,6 +11,27 @@ portalUrl: ""
 # utilisateur, qui n'est pas dans le cluster.
 apiserverUrl: ""
 
+# Racine publique de kdt-web, si elle est déployée. Vide, il ne se passe rien : le flow
+# d'autorisation n'est pas monté, et la page du compte n'en dit pas un mot.
+#
+# kdt-web est une installation séparée et facultative — son propre chart, sa propre image. Ce
+# champ ne fait que déclarer au portail qu'elle existe et qu'elle a le droit de demander des
+# identités. Rien n'est détecté : un lien affiché parce qu'un Service existe serait mort le temps
+# qu'un ingress se propage.
+#
+# Deux conséquences à connaître avant de la renseigner :
+#
+#   - https est exigé. Le code d'autorisation voyage dans une URL et s'échange contre un droit de
+#     session ; en clair, il est lisible par tout ce qui se trouve sur le trajet.
+#   - Servez kdt-web sous le **même domaine enregistrable** que le portail —
+#     `kdt.example.com` et `identity.example.com`. Le cookie de session est `SameSite=Strict` :
+#     depuis un autre domaine, le navigateur ne l'enverra pas, et chaque autorisation repassera
+#     par une connexion complète.
+#
+# L'adresse de retour en découle et n'a pas à être déclarée : c'est <webUrl>/auth/callback, la
+# seule que le portail acceptera.
+webUrl: ""
+
 image:
   repository: ghcr.io/agardenat/kdt-identity
   pullPolicy: IfNotPresent

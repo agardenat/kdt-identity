@@ -25,6 +25,10 @@ pub const CREDENTIAL_PATH: &str = "/api/v1/credentials";
 pub const TOKEN_PATH: &str = "/api/v1/token";
 /// Chemin de la fermeture d'une session OIDC.
 pub const REVOKE_PATH: &str = "/api/v1/revoke";
+/// Chemin d'entrée du flow d'autorisation, où le navigateur est envoyé.
+pub const AUTHORIZE_PATH: &str = "/authorize";
+/// Chemin de l'échange d'un code d'autorisation contre un droit de session.
+pub const AUTHORIZE_TOKEN_PATH: &str = "/api/v1/authorize/token";
 
 /// Ce que le déploiement remet aux clients : un certificat, ou un jeton.
 ///
@@ -223,6 +227,33 @@ pub struct CredentialResponse {
     pub certificate: String,
     /// Expiration au format RFC 3339.
     pub expires_at: String,
+}
+
+/// Ce qu'une application présente pour échanger un code d'autorisation.
+///
+/// Le `code_verifier` est ce qui prouve que celle qui échange le code est celle qui l'a demandé :
+/// le défi public qui a voyagé dans l'URL en est le condensé, et lui seul ne suffit pas à le
+/// reconstituer. Le `redirect_uri` est répété pour être confronté à celui qu'enferme le code —
+/// un code obtenu pour une adresse ne s'échange pas depuis une autre.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthorizeTokenRequest {
+    pub code: String,
+    pub code_verifier: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+}
+
+/// `Debug` manuscrit : le vérificateur est un secret d'un seul usage, mais un secret.
+impl std::fmt::Debug for AuthorizeTokenRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizeTokenRequest")
+            .field("code", &"<omis>")
+            .field("code_verifier", &"<omis>")
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
 }
 
 /// Corps d'erreur, commun à tous les refus de l'API.

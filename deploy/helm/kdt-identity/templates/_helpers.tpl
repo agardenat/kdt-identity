@@ -46,6 +46,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 - name: RUST_LOG
   value: {{ .Values.logLevel | quote }}
 {{- /*
+  kdt-web est facultative. Sans cette valeur, le flow d'autorisation n'est pas monté et la page
+  du compte n'en dit rien : le portail n'annonce pas ce qui n'a pas été déclaré.
+*/}}
+{{- if .Values.webUrl }}
+- name: KDT_IDENTITY_WEB_URL
+  value: {{ .Values.webUrl | quote }}
+{{- end }}
+{{- /*
   Le mode est commun aux deux déploiements : les commandes d'administration s'exécutent dans le
   pod du contrôleur, et « revoke » doit savoir s'il y a des sessions à fermer.
 */}}
@@ -84,6 +92,11 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- if not .Values.ingress.enabled -}}
 {{- fail "credentialMode=oidc exige que l'apiserver puisse joindre le portail : activez l'ingress, ou exposez-le autrement et retirez ce garde-fou" -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.webUrl -}}
+{{- if and (not (hasPrefix "https://" .Values.webUrl)) (not (hasPrefix "http://localhost" .Values.webUrl)) (not (hasPrefix "http://127.0.0.1" .Values.webUrl)) -}}
+{{- fail "webUrl doit être en https : un code d'autorisation s'échange contre un droit de session, il n'a pas à voyager en clair" -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

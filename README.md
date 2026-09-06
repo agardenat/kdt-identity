@@ -202,6 +202,42 @@ immédiatement.
 Les opérations courantes — créer, inviter, désactiver, gérer l'appartenance, et surtout passer
 des groupes aux droits RBAC — sont rassemblées dans le [guide d'administration](docs/administration.md).
 
+## Autoriser une application
+
+Le plugin présente le mot de passe et le code TOTP directement, ce qui est correct sur un poste :
+il tourne pour la personne qui les tape. Une application web ne peut pas faire cela — les relayer
+ferait d'elle un second endroit par où passent les mots de passe du cluster.
+
+D'où un chemin séparé, celui d'OAuth 2.0 réduit à ce qui est nécessaire. L'application envoie le
+navigateur sur `/authorize`, le portail reconnaît la session ouverte, montre sous quelle identité
+l'accès sera utilisé et attend un accord ; il redirige alors vers l'application avec un code
+valable une minute, que celle-ci échange contre un droit de session en prouvant qu'elle est bien
+celle qui l'a demandé (PKCE, `S256`).
+
+```yaml
+# helm-values.yaml
+webUrl: https://kdt.example.com
+```
+
+Une seule valeur : l'adresse de retour en découle — `https://kdt.example.com/auth/callback`, et
+c'est la seule que le portail acceptera. Il n'y a pas de registre d'applications, et rien ne
+s'enregistre à chaud : approuver une application qui parle à ce portail revient à lui confier des
+identités du cluster, c'est un geste de déploiement qui se relit dans un dépôt GitOps.
+
+Laissée vide, `webUrl` ne fait rien du tout : les points d'accès ne sont pas montés et la page du
+compte n'en dit pas un mot. Rien n'est détecté — un lien affiché parce qu'un Service existe serait
+mort le temps qu'un ingress se propage.
+
+Ce que l'application obtient est **un droit de session ordinaire** : il compte dans les sessions
+du compte, `revoke` le ferme, `spec.disabled` le coupe. Il n'y a pas deux façons de révoquer.
+
+> **Servez l'application sous le même domaine enregistrable que le portail.** Le cookie de session
+> est `SameSite=Strict` : `kdt.example.com` et `identity.example.com` le partagent, un domaine
+> étranger ne le recevra pas et chaque autorisation repassera par une connexion complète.
+
+Le premier client de ce chemin est [kdt-web](https://github.com/agardenat/kdt), l'interface web de
+kdt. Elle s'installe séparément, et rien ici ne la suppose.
+
 ## Comment ça marche
 
 Par défaut, les identités sont des certificats clients X.509 obtenus via l'API

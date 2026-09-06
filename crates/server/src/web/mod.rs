@@ -14,6 +14,7 @@
 //! conséquence : il est destiné à cette personne, et le cookie qui le porte est signé pour
 //! empêcher qu'on lui en substitue un autre.
 
+pub mod authorize;
 pub mod signer;
 pub mod views;
 
@@ -35,8 +36,8 @@ use crate::oidc::key::JwkSet;
 use crate::oidc::{jwt, SigningMaterial};
 use crate::sessions::SessionStore;
 use kdt_identity_api::portal::{
-    CredentialMode, CredentialRequest, CredentialResponse, RevokeRequest, SessionGrant,
-    SessionRequest, SessionResponse, TokenRequest, TokenResponse,
+    AuthorizeTokenRequest, CredentialMode, CredentialRequest, CredentialResponse, RevokeRequest,
+    SessionGrant, SessionRequest, SessionResponse, TokenRequest, TokenResponse,
 };
 use kdt_identity_api::{KdtGroup, KdtUser};
 use kube::api::{Api, ListParams};
@@ -52,6 +53,8 @@ mod purpose {
     pub const CSRF: &str = "csrf";
     /// Jeton remis au plugier `exec` entre l'authentification et la demande de certificat.
     pub const API_CREDENTIAL: &str = "api-credential";
+    /// Code d'autorisation, remis au navigateur puis échangé par l'application.
+    pub const AUTHORIZE_CODE: &str = "authorize-code";
 }
 
 const SESSION_COOKIE: &str = "kdt_identity_session";
@@ -88,6 +91,14 @@ pub struct AppState {
     endpoint: ClusterEndpoint,
     config: ServerConfig,
     oidc: Option<OidcState>,
+    /// L'application autorisée à demander des identités, si elle est déclarée.
+    ///
+    /// Absente — `webUrl` non renseignée — le flow d'autorisation n'est pas monté du tout. kdt-web
+    /// est facultatif : un portail qui servirait `/authorize` sans connaître personne ne pourrait
+    /// que refuser, et donnerait à croire qu'il manque une permission plutôt qu'une déclaration.
+    client: Option<authorize::Client>,
+    /// Les codes déjà échangés, pour qu'un code ne serve qu'une fois.
+    used_codes: authorize::UsedCodes,
 }
 
 type Shared = Arc<AppState>;
@@ -117,6 +128,21 @@ pub fn router(state: Shared) -> Router {
             .route(kdt_identity_api::portal::TOKEN_PATH, post(api_token)),
     };
 
+    // Le flow d'autorisation n'existe que si une application est déclarée, pour la même raison :
+    // monté sans client, il ne saurait que refuser.
+    let router = match state.client {
+        None => router,
+        Some(_) => router
+            .route(
+                kdt_identity_api::portal::AUTHORIZE_PATH,
+                get(authorize_page).post(authorize_submit),
+            )
+            .route(
+                kdt_identity_api::portal::AUTHORIZE_TOKEN_PATH,
+                post(api_authorize_token),
+            ),
+    };
+
     router.with_state(state)
 }
 
@@ -127,6 +153,8 @@ pub fn state(
     signer: Signer,
     oidc: Option<OidcState>,
 ) -> Shared {
+    let authorized = config.web_url.as_deref().map(authorize::Client::from_web_url);
+
     Arc::new(AppState {
         users: Api::all(client.clone()),
         groups: Api::all(client.clone()),
@@ -137,6 +165,8 @@ pub fn state(
         endpoint,
         config,
         oidc,
+        client: authorized,
+        used_codes: authorize::UsedCodes::new(),
     })
 }
 
@@ -320,11 +350,24 @@ fn render_activation(
 
 // ---------------------------------------------------------------- connexion
 
-async fn login_page(headers: HeaderMap, State(state): State<Shared>) -> Response {
+#[derive(Deserialize)]
+pub struct LoginQuery {
+    /// Où reprendre après la connexion. Seul `/authorize?…` est accepté ; voir [`safe_next`].
+    #[serde(default)]
+    next: String,
+}
+
+async fn login_page(
+    headers: HeaderMap,
+    State(state): State<Shared>,
+    Query(query): Query<LoginQuery>,
+) -> Response {
+    let next = safe_next(&query.next);
     if current_user(&state, &headers).is_some() {
-        return Redirect::to("/").into_response();
+        // Déjà connecté : on ne redemande rien, on reprend là où la demande allait.
+        return Redirect::to(next.as_deref().unwrap_or("/")).into_response();
     }
-    Html(views::login(None).into_string()).into_response()
+    Html(views::login(None, next.as_deref()).into_string()).into_response()
 }
 
 #[derive(Deserialize)]
@@ -332,9 +375,12 @@ pub struct LoginForm {
     user: String,
     password: String,
     totp: String,
+    #[serde(default)]
+    next: String,
 }
 
 async fn login_submit(State(state): State<Shared>, Form(form): Form<LoginForm>) -> Response {
+    let next = safe_next(&form.next);
     match authenticate(&state, &form.user, &form.password, &form.totp).await {
         Ok(_) => {
             info!(user = %form.user, "connexion réussie");
@@ -345,7 +391,7 @@ async fn login_submit(State(state): State<Shared>, Form(form): Form<LoginForm>) 
             );
             (
                 [(header::SET_COOKIE, session_cookie(&token, SESSION_TTL.num_seconds()))],
-                Redirect::to("/"),
+                Redirect::to(next.as_deref().unwrap_or("/")),
             )
                 .into_response()
         }
@@ -353,7 +399,7 @@ async fn login_submit(State(state): State<Shared>, Form(form): Form<LoginForm>) 
             warn!(user = %form.user, raison = reason, "connexion refusée");
             (
                 StatusCode::UNAUTHORIZED,
-                Html(views::login(Some(GENERIC_AUTH_FAILURE)).into_string()),
+                Html(views::login(Some(GENERIC_AUTH_FAILURE), next.as_deref()).into_string()),
             )
                 .into_response()
         }
@@ -607,6 +653,7 @@ async fn render_account(state: &AppState, user: &str, error: Option<&str>) -> Re
             portal_url: &state.config.portal_url,
             download: state.config.kubeconfig_download
                 && state.config.credential_mode == CredentialMode::Certificate,
+            web_url: state.config.web_url.as_deref(),
         })
         .into_string(),
     )
@@ -633,6 +680,370 @@ async fn subjects(state: &AppState, user: &str) -> Result<(Subject, Vec<Subject>
         .map_err(|e| e.to_string())?;
 
     Ok((subject, group_subjects))
+}
+
+// ---------------------------------------------------------------- autorisation
+
+/// Ouvre le flow : reconnaît la demande, puis demande l'accord de la personne.
+///
+/// L'ordre des contrôles n'est pas indifférent. Le client et l'adresse de retour sont validés
+/// **avant** tout le reste, y compris avant de regarder s'il y a une session : tant qu'ils ne
+/// sont pas reconnus, aucune redirection ne doit avoir lieu — pas même pour signaler l'erreur,
+/// puisque rediriger vers une adresse non validée est précisément ce qu'il faut empêcher.
+async fn authorize_page(
+    headers: HeaderMap,
+    State(state): State<Shared>,
+    Query(query): Query<authorize::AuthorizeQuery>,
+) -> Response {
+    let redirect_uri = match authorize::check(&query, state.client.as_ref()) {
+        Ok(uri) => uri,
+        Err(e) => {
+            warn!(client = %query.client_id, raison = %e, "demande d'autorisation refusée");
+            return authorize_refused();
+        }
+    };
+
+    let Some(user) = current_user(&state, &headers) else {
+        // La personne n'est pas connectée : on l'y envoie, en gardant la demande pour reprendre
+        // le flow après. Le chemin de retour est relatif et vérifié à l'arrivée.
+        return Redirect::to(&login_with_next(&query, &redirect_uri)).into_response();
+    };
+
+    render_consent(&state, &user, &query, &redirect_uri, None).await
+}
+
+#[derive(Deserialize)]
+pub struct ConsentForm {
+    csrf: String,
+    client_id: String,
+    redirect_uri: String,
+    state: String,
+    code_challenge: String,
+    code_challenge_method: String,
+}
+
+/// Émet le code et renvoie le navigateur vers l'application.
+///
+/// Les paramètres reviennent du formulaire, donc du navigateur : ils sont revalidés intégralement
+/// plutôt que crus sur parole. Un formulaire est un aller-retour par le client, et ce qui en
+/// revient n'a pas plus de valeur que ce qui arrive dans une URL.
+async fn authorize_submit(
+    headers: HeaderMap,
+    State(state): State<Shared>,
+    Form(form): Form<ConsentForm>,
+) -> Response {
+    let query = authorize::AuthorizeQuery {
+        client_id: form.client_id,
+        redirect_uri: form.redirect_uri,
+        state: form.state,
+        code_challenge: form.code_challenge,
+        code_challenge_method: form.code_challenge_method,
+    };
+
+    let redirect_uri = match authorize::check(&query, state.client.as_ref()) {
+        Ok(uri) => uri,
+        Err(e) => {
+            warn!(client = %query.client_id, raison = %e, "accord refusé");
+            return authorize_refused();
+        }
+    };
+
+    let Some(user) = current_user(&state, &headers) else {
+        return Redirect::to(&login_with_next(&query, &redirect_uri)).into_response();
+    };
+
+    let now = Utc::now();
+    if state
+        .signer
+        .verify(purpose::CSRF, &form.csrf, now.timestamp())
+        .ok()
+        .as_deref()
+        != Some(user.as_str())
+    {
+        warn!(user = %user, "jeton anti-CSRF absent ou invalide");
+        return (StatusCode::FORBIDDEN, "requête refusée").into_response();
+    }
+
+    // L'état du compte est relu ici, et le sera de nouveau à l'échange. Ce n'est pas redondant :
+    // entre les deux, quelqu'un a pu poser `spec.disabled`, et un code déjà émis ne doit pas
+    // valoir autorisation.
+    match account_may_issue(&state, &user).await {
+        Ok(()) => {}
+        Err(message) => {
+            warn!(user = %user, raison = %message, "autorisation refusée");
+            return render_consent(&state, &user, &query, &redirect_uri, Some(&message)).await;
+        }
+    }
+
+    let payload = authorize::CodePayload {
+        u: user.clone(),
+        c: query.client_id.clone(),
+        r: redirect_uri.clone(),
+        d: query.code_challenge.clone(),
+        j: authorize::new_jti(),
+    };
+    let Ok(encoded) = serde_json::to_string(&payload) else {
+        return internal_error();
+    };
+    let code = state.signer.sign(
+        purpose::AUTHORIZE_CODE,
+        &encoded,
+        (now + authorize::CODE_TTL).timestamp(),
+    );
+
+    info!(user = %user, client = %query.client_id, "autorisation accordée");
+    Redirect::to(&authorize::redirect_with_code(
+        &redirect_uri,
+        &code,
+        &query.state,
+    ))
+    .into_response()
+}
+
+/// Échange un code d'autorisation contre un droit de session.
+///
+/// Appelé par l'application, pas par le navigateur : c'est ici que le code cesse d'être un
+/// laissez-passer public — il faut le vérificateur, que seule l'application détient.
+///
+/// La session ouverte est une session ordinaire : elle apparaît dans le compte des sessions,
+/// `revoke` la ferme, et `spec.disabled` la coupe. Rien ne la distingue de celle d'un poste, ce
+/// qui est le point : il n'y a pas deux façons de révoquer.
+async fn api_authorize_token(
+    State(state): State<Shared>,
+    axum::Json(request): axum::Json<AuthorizeTokenRequest>,
+) -> Response {
+    let now = Utc::now();
+
+    let Ok(encoded) = state
+        .signer
+        .verify(purpose::AUTHORIZE_CODE, &request.code, now.timestamp())
+    else {
+        warn!("code d'autorisation absent, invalide ou expiré");
+        return unauthorized_json();
+    };
+    let Ok(payload) = serde_json::from_str::<authorize::CodePayload>(&encoded) else {
+        warn!("code d'autorisation illisible");
+        return unauthorized_json();
+    };
+
+    // Le code enferme l'application et l'adresse de retour pour lesquelles il a été émis : un
+    // code obtenu ailleurs ne s'échange pas ici.
+    if payload.c != request.client_id || payload.r != request.redirect_uri {
+        warn!(user = %payload.u, "code présenté pour une autre application ou une autre adresse");
+        return unauthorized_json();
+    }
+
+    if let Err(e) = authorize::verify_pkce(&request.code_verifier, &payload.d) {
+        warn!(user = %payload.u, raison = %e, "vérificateur refusé");
+        return unauthorized_json();
+    }
+
+    // Consommé en dernier, une fois tout le reste vérifié : un code refusé pour une autre raison
+    // n'a pas à être brûlé, sinon une requête malformée suffirait à couper une autorisation en
+    // cours.
+    if let Err(e) = state.used_codes.consume(
+        &payload.j,
+        (now + authorize::CODE_TTL).timestamp(),
+        now.timestamp(),
+    ) {
+        warn!(user = %payload.u, raison = %e, "code rejoué");
+        return unauthorized_json();
+    }
+
+    if let Err(message) = account_may_issue(&state, &payload.u).await {
+        warn!(user = %payload.u, raison = %message, "échange refusé");
+        return unauthorized_json();
+    }
+
+    let (subject, groups) = match subjects(&state, &payload.u).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(user = %payload.u, erreur = %e, "groupes illisibles");
+            return internal_error_json();
+        }
+    };
+
+    let Ok(user) = state.users.get(&payload.u).await else {
+        return unauthorized_json();
+    };
+    let validity = chrono::Duration::from_std(state.config.refresh_ttl)
+        .expect("durée bornée à la lecture de la configuration");
+    let refresh = match state
+        .sessions
+        .update(&user, |sessions| {
+            let issued = sessions.open(now, validity);
+            (issued.token.to_string(), issued.session.expires_at)
+        })
+        .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(user = %payload.u, erreur = %e, "ouverture de session impossible");
+            return internal_error_json();
+        }
+    };
+
+    info!(user = %payload.u, client = %payload.c, "session ouverte par autorisation");
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        axum::Json(SessionResponse {
+            token: state.signer.sign(
+                purpose::API_CREDENTIAL,
+                &payload.u,
+                (now + API_TOKEN_TTL).timestamp(),
+            ),
+            subject: subject.as_str().to_string(),
+            groups: groups.iter().map(|g| g.as_str().to_string()).collect(),
+            mode: state.config.credential_mode,
+            refresh_token: Some(refresh.0),
+            refresh_expires_at: Some(refresh.1.to_rfc3339()),
+        }),
+    )
+        .into_response()
+}
+
+/// Le compte est-il en état d'obtenir une identité ?
+///
+/// Même contrôle qu'à l'ouverture d'une session par mot de passe, et pour la même raison : ce qui
+/// décide est l'état courant du cluster, jamais ce qu'une étape précédente avait constaté.
+async fn account_may_issue(state: &AppState, name: &str) -> Result<(), String> {
+    let user = state
+        .users
+        .get(name)
+        .await
+        .map_err(|_| "compte introuvable".to_string())?;
+    let credentials = state
+        .store
+        .get(name)
+        .await
+        .map_err(|_| "credentials illisibles".to_string())?
+        .ok_or_else(|| "compte non activé".to_string())?;
+
+    let phase = logic::phase(&user, credentials.is_activated());
+    if !logic::may_request_own_credential(phase) {
+        return Err(format!("phase {phase:?}"));
+    }
+    Ok(())
+}
+
+async fn render_consent(
+    state: &AppState,
+    user: &str,
+    query: &authorize::AuthorizeQuery,
+    redirect_uri: &str,
+    error: Option<&str>,
+) -> Response {
+    let (subject, groups) = match subjects(state, user).await {
+        Ok((subject, groups)) => (
+            subject.as_str().to_string(),
+            groups.iter().map(|g| g.as_str().to_string()).collect(),
+        ),
+        Err(_) => (String::new(), Vec::new()),
+    };
+
+    let csrf = state
+        .signer
+        .sign(purpose::CSRF, user, (Utc::now() + SESSION_TTL).timestamp());
+
+    Html(
+        views::consent(views::Consent {
+            user,
+            subject: &subject,
+            groups: &groups,
+            cluster: &state.config.cluster_name,
+            application: &query.client_id,
+            redirect_uri,
+            csrf: &csrf,
+            state: &query.state,
+            code_challenge: &query.code_challenge,
+            code_challenge_method: &query.code_challenge_method,
+            refresh_ttl: &humanize(state.config.refresh_ttl),
+            error,
+        })
+        .into_string(),
+    )
+    .into_response()
+}
+
+/// Refus d'une demande d'autorisation, rendu **sur le portail**.
+///
+/// Jamais par redirection : si l'adresse de retour n'a pas été reconnue, l'envoyer une erreur
+/// reviendrait à s'en servir, ce que le refus vient justement d'interdire.
+fn authorize_refused() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Html(
+            views::message(
+                "Demande refusée",
+                "Cette demande d'accès n'est pas reconnue",
+                "L'application qui vous a envoyé ici n'est pas celle déclarée sur ce cluster, ou \
+                 son adresse de retour ne correspond pas. Prévenez votre administrateur plutôt \
+                 que de réessayer.",
+            )
+            .into_string(),
+        ),
+    )
+        .into_response()
+}
+
+/// Adresse de connexion qui ramène ensuite au flow.
+///
+/// Le chemin de retour est **reconstruit** à partir des paramètres validés, jamais recopié depuis
+/// l'URL reçue : c'est ce qui garantit qu'il ne peut désigner que `/authorize`, avec des valeurs
+/// déjà passées par `authorize::check`.
+fn login_with_next(query: &authorize::AuthorizeQuery, redirect_uri: &str) -> String {
+    let next = format!(
+        "{}?client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method={}",
+        kdt_identity_api::portal::AUTHORIZE_PATH,
+        urlencode(&query.client_id),
+        urlencode(redirect_uri),
+        urlencode(&query.state),
+        urlencode(&query.code_challenge),
+        urlencode(&query.code_challenge_method),
+    );
+    format!("/login?next={}", urlencode(&next))
+}
+
+/// Le chemin de retour, s'il est acceptable.
+///
+/// Une seule forme est admise : un chemin relatif visant `/authorize`. Ni URL absolue, ni double
+/// barre oblique — qui serait lue comme un hôte —, ni caractère de contrôle, qui permettrait
+/// d'injecter une seconde en-tête dans la réponse. Tout le reste ramène à la racine, sans
+/// message : ce n'est pas à l'utilisateur de comprendre ce qui a été refusé.
+fn safe_next(raw: &str) -> Option<String> {
+    let prefix = format!("{}?", kdt_identity_api::portal::AUTHORIZE_PATH);
+    if !raw.starts_with(&prefix) {
+        return None;
+    }
+    if raw.contains(['\r', '\n']) || raw.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// Écrit une durée comme le chart la déclare : `7d`, `12h`, `30m`.
+fn humanize(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds.is_multiple_of(86_400) {
+        format!("{}d", seconds / 86_400)
+    } else if seconds.is_multiple_of(3_600) {
+        format!("{}h", seconds / 3_600)
+    } else if seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn urlencode(raw: &str) -> String {
+    raw.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------- API plugin
@@ -1099,6 +1510,69 @@ mod tests {
         assert!(svg.starts_with("<svg"), "{svg}");
         assert!(!svg.contains("<?xml"), "{svg}");
         assert!(svg.ends_with("</svg>"), "{}", &svg[svg.len() - 40..]);
+    }
+
+    /// Le chemin de retour après connexion est la porte d'entrée d'une redirection ouverte : ce
+    /// qui n'est pas exactement `/authorize?…` ne doit jamais sortir d'ici.
+    #[test]
+    fn le_retour_apres_connexion_n_accepte_que_l_autorisation() {
+        assert_eq!(
+            safe_next("/authorize?client_id=kdt-web&state=x"),
+            Some("/authorize?client_id=kdt-web&state=x".to_string())
+        );
+
+        for hostile in [
+            "https://evil.test/",
+            "//evil.test/",
+            "/authorize",
+            "/authorizeevil?x=1",
+            "/",
+            "",
+            "javascript:alert(1)",
+            "/logout",
+            "\\/evil.test",
+            // Injection d'en-tête : un saut de ligne dans un `Location` ajouterait une seconde
+            // en-tête à la réponse.
+            "/authorize?a=1\r\nSet-Cookie: x=y",
+            "/authorize?a=1\nLocation: https://evil.test",
+        ] {
+            assert_eq!(safe_next(hostile), None, "{hostile:?} accepté à tort");
+        }
+    }
+
+    /// Le chemin de retour est reconstruit à partir de valeurs déjà validées, jamais recopié :
+    /// c'est ce qui garantit qu'il ne peut désigner que `/authorize`.
+    #[test]
+    fn le_retour_se_reconstruit_encode() {
+        let query = authorize::AuthorizeQuery {
+            client_id: "kdt-web".to_string(),
+            redirect_uri: "https://kdt.example.com/auth/callback".to_string(),
+            state: "a&b=c".to_string(),
+            code_challenge: "abc".to_string(),
+            code_challenge_method: "S256".to_string(),
+        };
+        let url = login_with_next(&query, &query.redirect_uri);
+
+        assert!(url.starts_with("/login?next=%2Fauthorize%3F"), "{url}");
+        assert!(!url.contains("a&b=c"), "l'état doit être encodé : {url}");
+
+        // Et ce qui en sort doit repasser le contrôle d'entrée.
+        let next = url.strip_prefix("/login?next=").unwrap();
+        let decoded = next
+            .replace("%2F", "/")
+            .replace("%3F", "?")
+            .replace("%3D", "=")
+            .replace("%26", "&");
+        assert!(safe_next(&decoded).is_some(), "{decoded}");
+    }
+
+    #[test]
+    fn une_duree_s_ecrit_comme_le_chart_la_declare() {
+        use std::time::Duration;
+        assert_eq!(humanize(Duration::from_secs(7 * 86_400)), "7d");
+        assert_eq!(humanize(Duration::from_secs(12 * 3_600)), "12h");
+        assert_eq!(humanize(Duration::from_secs(30 * 60)), "30m");
+        assert_eq!(humanize(Duration::from_secs(90)), "90s");
     }
 
     /// Les deux messages génériques ne doivent rien apprendre sur l'existence d'un compte.
