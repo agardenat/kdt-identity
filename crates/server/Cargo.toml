@@ -28,7 +28,7 @@ signature = "3"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 sha2 = { version = "0.11.0", features = ["oid"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
 futures = "=0.3.31"
 argon2 = { version = "0.5", features = ["std"] }
 totp-rs = { version = "6", features = ["gen_secret", "otpauth", "zeroize"] }
