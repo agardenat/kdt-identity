@@ -21,8 +21,36 @@ use std::time::Duration;
     about = "Utilisateurs et groupes locaux pour Kubernetes"
 )]
 struct Cli {
+    /// Contexte du kubeconfig à viser.
+    ///
+    /// À donner systématiquement hors du cluster : le contexte courant n'est presque jamais
+    /// celui qu'on vise, et rien ne le signale — une commande qui écrit partirait sur le mauvais
+    /// cluster sans que rien ne le rattrape.
+    ///
+    /// Sans effet dans un pod, où l'identité vient du compte de service.
+    #[arg(long, global = true, env = "KDT_IDENTITY_CONTEXT")]
+    context: Option<String>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Le client du cluster, sur le contexte demandé.
+async fn cluster_client(context: Option<&str>) -> anyhow::Result<kube::Client> {
+    let Some(context) = context else {
+        return kube::Client::try_default()
+            .await
+            .context("connexion au cluster");
+    };
+
+    let options = kube::config::KubeConfigOptions {
+        context: Some(context.to_string()),
+        ..Default::default()
+    };
+    let config = kube::Config::from_kubeconfig(&options)
+        .await
+        .with_context(|| format!("contexte {context:?} du kubeconfig"))?;
+    kube::Client::try_from(config).with_context(|| format!("connexion au cluster {context:?}"))
 }
 
 #[derive(Subcommand)]
@@ -95,32 +123,31 @@ async fn main() -> anyhow::Result<()> {
         .init();
     kdt_identity_server::install_crypto_provider();
 
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let context = cli.context.as_deref();
+
+    match cli.command {
         Command::Crd => print!("{}", kdt_identity_server::manifests::all()?),
         Command::Controller => {
             let config = ServerConfig::from_env().context("configuration")?;
-            let client = kube::Client::try_default()
-                .await
-                .context("connexion au cluster")?;
+            let client = cluster_client(context).await?;
             kdt_identity_server::controller::run(client, config).await;
         }
-        Command::Serve => serve().await?,
+        Command::Serve => serve(context).await?,
         Command::Invite {
             user,
             validity,
             send_mail,
-        } => invite(&user, validity, send_mail).await?,
-        Command::Issue { user, ttl } => issue(&user, ttl).await?,
-        Command::Revoke { user } => revoke(&user).await?,
+        } => invite(&user, validity, send_mail, context).await?,
+        Command::Issue { user, ttl } => issue(&user, ttl, context).await?,
+        Command::Revoke { user } => revoke(&user, context).await?,
     }
     Ok(())
 }
 
-async fn serve() -> anyhow::Result<()> {
+async fn serve(context: Option<&str>) -> anyhow::Result<()> {
     let config = ServerConfig::from_env().context("configuration")?;
-    let client = kube::Client::try_default()
-        .await
-        .context("connexion au cluster")?;
+    let client = cluster_client(context).await?;
 
     let endpoint = endpoint::resolve(
         config.apiserver_url.as_deref(),
@@ -200,11 +227,14 @@ async fn serve() -> anyhow::Result<()> {
 /// Le lien et le code ne sont affichés qu'ici, et une seule fois : ils ne sont ni journalisés,
 /// ni écrits dans le statut du `KdtUser` — un statut est lisible par quiconque peut lister les
 /// utilisateurs, ce qui reviendrait à publier l'invitation.
-async fn invite(name: &str, validity: Duration, send_mail: bool) -> anyhow::Result<()> {
+async fn invite(
+    name: &str,
+    validity: Duration,
+    send_mail: bool,
+    context: Option<&str>,
+) -> anyhow::Result<()> {
     let config = ServerConfig::from_env().context("configuration")?;
-    let client = kube::Client::try_default()
-        .await
-        .context("connexion au cluster")?;
+    let client = cluster_client(context).await?;
 
     let users: Api<KdtUser> = Api::all(client.clone());
     let user = users
@@ -277,10 +307,8 @@ async fn invite(name: &str, validity: Duration, send_mail: bool) -> anyhow::Resu
     Ok(())
 }
 
-async fn issue(name: &str, ttl: Duration) -> anyhow::Result<()> {
-    let client = kube::Client::try_default()
-        .await
-        .context("connexion au cluster")?;
+async fn issue(name: &str, ttl: Duration, context: Option<&str>) -> anyhow::Result<()> {
+    let client = cluster_client(context).await?;
 
     let users: Api<KdtUser> = Api::all(client.clone());
     let user = users
@@ -328,11 +356,9 @@ async fn issue(name: &str, ttl: Duration) -> anyhow::Result<()> {
 /// Ne touche ni au mot de passe ni au TOTP : la personne peut se reconnecter aussitôt. Pour
 /// l'empêcher, c'est `spec.disabled` qu'il faut poser — les deux gestes vont souvent ensemble,
 /// mais ils ne disent pas la même chose.
-async fn revoke(name: &str) -> anyhow::Result<()> {
+async fn revoke(name: &str, context: Option<&str>) -> anyhow::Result<()> {
     let config = ServerConfig::from_env().context("configuration")?;
-    let client = kube::Client::try_default()
-        .await
-        .context("connexion au cluster")?;
+    let client = cluster_client(context).await?;
     let users: Api<KdtUser> = Api::all(client.clone());
     let user = users
         .get(name)
