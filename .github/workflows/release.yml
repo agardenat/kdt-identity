@@ -1,0 +1,112 @@
+# .github/workflows/release.yml
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # L'image porte le serveur et le contrôleur. Elle était construite à la main jusqu'ici, donc
+  # sans garantie que ce qui tourne corresponde au tag.
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags de l'image
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          tags="ghcr.io/${{ github.repository }}:$version"
+          # `latest` ne suit que les versions finales : une pré-version le ferait pointer sur une
+          # alpha pour tous ceux qui ne pinnent pas.
+          case "$version" in
+            *-*) ;;
+            *) tags="$tags,ghcr.io/${{ github.repository }}:latest" ;;
+          esac
+          echo "TAGS=$tags" >> $GITHUB_ENV
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.TAGS }}
+
+  # Le plugin s'installe sur des postes : il lui faut des binaires, pas une image.
+  build-linux:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Statique : le plugin atterrit sur des postes dont on ne connaît ni la distribution ni la
+      # version de la libc.
+      - run: cargo build --release --locked --bin kdt-identity --target x86_64-unknown-linux-musl
+
+      - run: |
+          cp target/x86_64-unknown-linux-musl/release/kdt-identity .
+          tar czf kdt-identity-linux-x86_64.tar.gz kdt-identity
+
+      - name: Notes de version depuis le CHANGELOG
+        run: packaging/changelog-section.sh "$GITHUB_REF_NAME" > RELEASE_NOTES.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          # `prerelease` vaut false par défaut, sans aucune détection SemVer : sans cette ligne,
+          # une v1.1.0-alpha.1 serait publiée comme la dernière version stable.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body_path: RELEASE_NOTES.md
+          files: kdt-identity-linux-x86_64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - run: cargo build --release --locked --bin kdt-identity --target aarch64-apple-darwin
+      - run: cargo build --release --locked --bin kdt-identity --target x86_64-apple-darwin
+
+      - run: |
+          lipo -create -output kdt-identity \
+            target/aarch64-apple-darwin/release/kdt-identity \
+            target/x86_64-apple-darwin/release/kdt-identity
+          tar czf kdt-identity-macos-universal.tar.gz kdt-identity
+
+      - name: Notes de version depuis le CHANGELOG
+        run: packaging/changelog-section.sh "$GITHUB_REF_NAME" > RELEASE_NOTES.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body_path: RELEASE_NOTES.md
+          files: kdt-identity-macos-universal.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
