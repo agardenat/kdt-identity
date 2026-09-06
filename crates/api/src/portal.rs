@@ -30,6 +30,19 @@ pub const AUTHORIZE_PATH: &str = "/authorize";
 /// Chemin de l'échange d'un code d'autorisation contre un droit de session.
 pub const AUTHORIZE_TOKEN_PATH: &str = "/api/v1/authorize/token";
 
+/// Identifiant de l'application autorisée à demander des identités.
+///
+/// Il n'y en a qu'un : approuver une application qui parle à ce portail revient à lui confier des
+/// identités du cluster, ce qui est un geste de déploiement, pas un enregistrement à chaud.
+pub const WEB_CLIENT_ID: &str = "kdt-web";
+
+/// Chemin de retour, **côté application**, où le code d'autorisation est redirigé.
+///
+/// Défini ici plutôt que d'un seul côté : le portail n'accepte que cette adresse, et
+/// l'application doit servir exactement celle-là. Les voir diverger produirait un refus dont ni
+/// l'un ni l'autre ne pourrait dire d'où il vient.
+pub const AUTHORIZE_CALLBACK_PATH: &str = "/auth/callback";
+
 /// Ce que le déploiement remet aux clients : un certificat, ou un jeton.
 ///
 /// Le client ne choisit pas — c'est une propriété du cluster, qui dépend de la façon dont son

@@ -125,11 +125,13 @@ impl Client {
     }
 }
 
-/// Identifiant de l'unique application déclarée.
-pub const DEFAULT_CLIENT_ID: &str = "kdt-web";
-
-/// Chemin de retour, côté application.
-pub const CALLBACK_PATH: &str = "/auth/callback";
+/// Identifiant de l'unique application déclarée, et son chemin de retour.
+///
+/// Repris du contrat plutôt que redéclarés : l'application doit servir exactement l'adresse que le
+/// portail accepte, et deux constantes séparées finiraient par diverger.
+pub use kdt_identity_api::portal::{
+    AUTHORIZE_CALLBACK_PATH as CALLBACK_PATH, WEB_CLIENT_ID as DEFAULT_CLIENT_ID,
+};
 
 /// Vérifie qu'une demande vise bien l'application déclarée, et rend l'adresse de retour retenue.
 ///
