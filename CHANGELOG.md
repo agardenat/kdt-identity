@@ -8,7 +8,7 @@ tag `v<version>` qui a déclenché sa publication.
 Les notes de version publiées avec un tag sont la section correspondante de ce fichier, extraite
 par `packaging/changelog-section.sh` : ce fichier est la source, pas une copie.
 
-## [1.1.0] — non publiée
+## [1.1.0] — 2026-09-07
 
 - **feat(portal)** — **flow d'autorisation**, pour qu'une application web puisse agir au nom de
   quelqu'un sans jamais voir son mot de passe. `/authorize` reconnaît la session ouverte du
