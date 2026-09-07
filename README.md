@@ -355,8 +355,9 @@ kubectl -n kdt-identity exec deploy/kdt-identity-controller -- \
 
 Le chemin est absolu parce que l'image ne contient ni shell ni `PATH`.
 
-**Côté poste de travail**, extraire le binaire de l'image ou l'installer depuis les sources —
-voir le [guide du plugin](docs/plugin.md#installation).
+**Côté poste de travail**, installer le paquet `.deb` ou `.rpm` de la release, extraire le binaire
+de l'image, ou compiler depuis les sources — voir le
+[guide du plugin](docs/plugin.md#installation).
 
 ## Installation
 

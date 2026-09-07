@@ -15,7 +15,18 @@ d'un kubeconfig depuis le portail :
 
 ## Installation
 
-Il n'y a pas encore de paquets `deb`, `rpm` ni de formule Homebrew. Deux façons de l'obtenir.
+Trois façons de l'obtenir. Il n'y a pas de formule Homebrew.
+
+Depuis un paquet, à partir de la 1.2.0 — publiés avec chaque release, ils posent le binaire dans
+`/usr/bin/kdt-identity`, donc dans le `PATH` sans rien faire de plus :
+
+```sh
+sudo dpkg -i kdt-identity_<version>_amd64.deb        # Debian, Ubuntu
+sudo rpm -i kdt-identity-<version>-1.x86_64.rpm      # Fedora, RHEL, openSUSE
+```
+
+Le binaire qu'ils contiennent est le même que celui de l'image : lié statiquement, sans
+dépendance à une libc, donc installable sur une distribution que le paquet ne connaît pas.
 
 Depuis l'image, où il est lié statiquement et ne dépend d'aucune libc :
 

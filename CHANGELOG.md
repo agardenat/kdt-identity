@@ -8,6 +8,23 @@ tag `v<version>` qui a déclenché sa publication.
 Les notes de version publiées avec un tag sont la section correspondante de ce fichier, extraite
 par `packaging/changelog-section.sh` : ce fichier est la source, pas une copie.
 
+## [1.2.0] — non publiée
+
+- **feat(packaging)** — le plugin se distribue en `.deb` et en `.rpm`, publiés avec chaque
+  release à côté du tarball. Jusqu'ici il fallait le sortir de l'image avec `podman cp` ou le
+  compiler : deux gestes que personne ne fait sur un poste qu'il n'administre pas. Le binaire
+  reste le même, lié statiquement, donc installable sur une distribution que le paquet ne connaît
+  pas.
+
+  Une pré-version s'épelle comme il faut de chaque côté : `1.2.0-beta.1` devient `1.2.0~beta.1`
+  pour dpkg — `~` trie sous tout, la chaîne vide comprise — et `Version: 1.2.0` + `Release:
+  0.beta.1` pour rpm, qui refuse un tiret. Les deux trient sous la version finale, ce qui est
+  tout l'intérêt de couper une bêta.
+
+- **change(ci)** — l'image n'est plus construite qu'en `linux/amd64`. La jambe arm64 était émulée
+  par QEMU et prenait à elle seule plus d'une heure sur les quatre-vingts minutes du job, pour une
+  architecture qu'aucun cluster visé n'utilise. Qui en a besoin construit l'image depuis le dépôt.
+
 ## [1.1.0] — 2026-09-07
 
 - **feat(portal)** — **flow d'autorisation**, pour qu'une application web puisse agir au nom de

@@ -1,1 +1,9 @@
 /target
+
+# Sortie du packaging
+/dist
+
+# Artefacts de release, écrits à la racine par le workflow comme par un build local
+*.tar.gz
+*.deb
+*.rpm
