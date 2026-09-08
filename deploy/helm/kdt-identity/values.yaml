@@ -131,8 +131,90 @@ oidc:
 # serait pas reconnue par l'autre.
 sessionKey: ""
 
+# Qui reconnaît les personnes.
+#
+#   local — les comptes vivent dans le cluster : mot de passe Argon2id et TOTP dans un Secret,
+#           créés par `kdt-identity-server invite` puis activés depuis le portail.
+#   ldap  — les comptes vivent dans un annuaire. Le mot de passe y est vérifié par un bind, le
+#           KdtUser est créé à la première connexion réussie, et l'appartenance est reportée
+#           depuis les groupes de l'annuaire.
+#
+# Orthogonal à credentialMode : celui-ci dit ce qu'on remet, celui-là qui on reconnaît. Les
+# quatre combinaisons sont valides.
+#
+# En mode ldap, le second facteur relève de l'annuaire : kdt-identity n'enrôle plus de TOTP, ne
+# sert plus la page d'activation, et `invite` refuse de s'exécuter.
+authMode: local
+
+ldap:
+  # activedirectory | freeipa — préremplit les noms d'attributs du schéma.
+  profile: activedirectory
+
+  # Racine de l'annuaire. ldaps:// est attendu ; ldap:// n'est accepté qu'avec startTls, parce
+  # qu'un bind présente le mot de passe en clair dans la requête.
+  url: ""
+  startTls: false
+
+  # Autorité qui a émis le certificat de l'annuaire, en PEM.
+  #
+  # Presque toujours nécessaire : FreeIPA émet depuis sa propre CA, Active Directory aussi dans
+  # la quasi-totalité des cas, et le magasin de l'image ne contient que les autorités publiques.
+  # Le serveur assemble au démarrage un magasin réunissant les deux — la bibliothèque LDAP
+  # n'ayant aucun moyen de recevoir une autorité pour la seule connexion à l'annuaire.
+  caCert: ""
+  # À poser si, et seulement si, l'annuaire présente un certificat d'une autorité publique.
+  # Lève le garde-fou qui exige caCert ; ne désactive aucune vérification.
+  skipCaCheck: false
+
+  # Nom du Secret portant KDT_IDENTITY_LDAP_BIND_DN et KDT_IDENTITY_LDAP_BIND_PASSWORD.
+  #
+  # Le compte de service ne sert qu'à chercher l'entrée avant de la faire binder. Laissé vide,
+  # la recherche est anonyme : FreeIPA l'autorise souvent, Active Directory pratiquement jamais.
+  existingSecret: ""
+
+  # Racine sous laquelle chercher les personnes.
+  userSearchBase: ""
+
+  # Attributs du schéma. Laissés vides, ils viennent du profil :
+  #   activedirectory — sAMAccountName, mail, displayName, memberOf, user
+  #   freeipa         — uid,            mail, cn,          memberOf, person
+  userLoginAttribute: ""
+  userEmailAttribute: ""
+  userDisplayAttribute: ""
+  groupMemberAttribute: ""
+  userObjectClass: ""
+
+  # Correspondance entre les groupes de l'annuaire et les KdtGroup.
+  #
+  # Rien n'est déduit d'un DN : dériver un nom kdt demanderait de le normaliser, et deux groupes
+  # distincts de l'annuaire pourraient alors aboutir au même nom, donc aux mêmes droits. Ce qui
+  # ne figure pas ici n'existe pas côté cluster.
+  #
+  # Le nom du groupe doit être un nom de ressource valide — minuscules, chiffres, - et . — et
+  # c'est lui qui donne le sujet RBAC `kdt:<groupe>` à référencer dans vos bindings.
+  #
+  #   groupMappings:
+  #     - dn: "cn=k8s-admins,ou=groups,dc=example,dc=com"
+  #       group: admins
+  #     - dn: "cn=k8s-devs,ou=groups,dc=example,dc=com"
+  #       group: devs
+  groupMappings: []
+
+  # Délai au-delà duquel l'annuaire est tenu pour injoignable.
+  timeout: 10s
+
+  # Intervalle de relecture de l'annuaire par le contrôleur.
+  #
+  # Une connexion ne renseigne que la personne qui se connecte. Sans cette relecture, un retrait
+  # de groupe côté annuaire n'aurait d'effet qu'à sa prochaine saisie de mot de passe — le
+  # renouvellement silencieux ne rebindant jamais, cela peut vouloir dire jusqu'à refreshTtl.
+  #
+  # Un compte dont l'entrée a disparu de l'annuaire passe en spec.disabled, jamais supprimé.
+  resync: 15m
+
 # SMTP est facultatif : l'invitation s'obtient par `kdt-identity-server invite`, qui affiche le
 # lien et le code à transmettre. `--send-mail` n'a besoin de ceci que pour envoyer le lien.
+# Sans objet en authMode=ldap, où il n'y a pas d'invitation.
 smtp:
   enabled: false
   host: ""

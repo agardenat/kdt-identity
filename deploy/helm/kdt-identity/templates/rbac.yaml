@@ -25,6 +25,23 @@ rules:
   - apiGroups: ["identity.kdt.sh"]
     resources: ["kdtusers", "kdtgroups"]
     verbs: ["get", "list", "watch"]
+{{- if eq .Values.authMode "ldap" }}
+
+  # En authMode=ldap, l'administrateur des comptes est l'annuaire : le portail crée le KdtUser à
+  # la première connexion réussie, et reporte l'appartenance dans KdtGroup.spec.members.
+  #
+  # Ce n'est pas l'élargissement qu'on croit. Ce ServiceAccount approuve déjà des CSR
+  # « kube-apiserver-client » — il peut donc se forger n'importe quelle identité du cluster, y
+  # compris sans passer par un KdtUser. Créer un compte n'ajoute aucune classe de pouvoir à
+  # celui-là, et la ValidatingAdmissionPolicy continue de contraindre les noms.
+  #
+  # `delete` reste absent, en revanche : un compte disparu de l'annuaire est désactivé, jamais
+  # supprimé, parce qu'une suppression emporterait ses Secrets par cascade et qu'une panne de
+  # lecture prise pour une disparition ferait perdre des comptes.
+  - apiGroups: ["identity.kdt.sh"]
+    resources: ["kdtusers", "kdtgroups"]
+    verbs: ["create", "update", "patch"]
+{{- end }}
   - apiGroups: ["identity.kdt.sh"]
     resources: ["kdtusers/status", "kdtgroups/status"]
     verbs: ["get", "update", "patch"]

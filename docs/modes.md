@@ -1,7 +1,24 @@
-# Les deux modes
+# Les modes
 
-kdt-identity délivre les accès de deux façons. Le mode se choisit au déploiement,
-`credentialMode` dans les valeurs du chart, et vaut pour tout le cluster.
+kdt-identity a **deux modes indépendants**, et il faut les distinguer avant de lire la suite :
+
+| Axe | Valeur | Répond à | Valeurs |
+|---|---|---|---|
+| Mode de délivrance | `credentialMode` | ce que le portail **remet** | `certificate`, `oidc` |
+| Mode d'authentification | `authMode` | qui il **reconnaît** | `local`, `ldap` |
+
+Ils se combinent librement : les quatre couples sont valides. Un annuaire d'entreprise peut
+aussi bien aboutir à un certificat qu'à un jeton, et changer l'un n'oblige jamais à toucher
+l'autre.
+
+Ce document traite du mode de délivrance. Pour le mode d'authentification, voir
+[ldap.md](ldap.md) — en `local`, le défaut, les comptes vivent dans le cluster et il n'y a rien
+à configurer.
+
+## Les deux modes de délivrance
+
+Le mode se choisit au déploiement, `credentialMode` dans les valeurs du chart, et vaut pour tout
+le cluster.
 
 | | `certificate` (défaut) | `oidc` |
 |---|---|---|
@@ -90,6 +107,8 @@ La marche à suivre est dans [oidc.md](oidc.md).
   l'ouverture de session et s'y conforme.
 - **La révocation.** `kdt-identity-server revoke` et `spec.disabled` agissent de la même façon.
 - **Le préfixe.** Posé à l'émission, jamais par la configuration de l'apiserver.
+- **La provenance des comptes.** `authMode` est un axe séparé : passer de `certificate` à `oidc`
+  ne change rien à la façon dont les personnes s'authentifient, et réciproquement.
 
 ## Changer de mode
 

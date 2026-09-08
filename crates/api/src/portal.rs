@@ -29,6 +29,8 @@ pub const REVOKE_PATH: &str = "/api/v1/revoke";
 pub const AUTHORIZE_PATH: &str = "/authorize";
 /// Chemin de l'échange d'un code d'autorisation contre un droit de session.
 pub const AUTHORIZE_TOKEN_PATH: &str = "/api/v1/authorize/token";
+/// Chemin du descripteur du portail, lisible sans s'authentifier.
+pub const PORTAL_PATH: &str = "/api/v1/portal";
 
 /// Identifiant de l'application autorisée à demander des identités.
 ///
@@ -86,6 +88,76 @@ impl std::str::FromStr for CredentialMode {
     }
 }
 
+/// D'où vient l'identité, et qui vérifie le mot de passe.
+///
+/// Orthogonal à [`CredentialMode`], et pour une raison de fond : celui-ci décrit ce que le portail
+/// **remet**, celui-là qui il **reconnaît**. Les deux se combinent librement — un annuaire peut
+/// aussi bien aboutir à un certificat qu'à un jeton — et les confondre en une seule énumération
+/// obligerait à écrire les quatre combinaisons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    /// Comptes portés par le cluster : mot de passe Argon2id et TOTP dans un `Secret`.
+    #[default]
+    Local,
+    /// Comptes portés par un annuaire LDAP(S). Le mot de passe y est vérifié par un bind, le
+    /// `KdtUser` est créé à la première connexion réussie, et le second facteur relève de
+    /// l'annuaire.
+    Ldap,
+}
+
+impl AuthMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Ldap => "ldap",
+        }
+    }
+
+    /// Vrai si le portail attend un code TOTP en plus du mot de passe.
+    ///
+    /// Seul le mode local en gère un : en mode ldap, le second facteur — s'il existe — est celui
+    /// de l'annuaire, et kdt-identity n'a rien à en savoir.
+    pub fn totp_required(&self) -> bool {
+        matches!(self, Self::Local)
+    }
+}
+
+impl std::fmt::Display for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AuthMode {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "local" => Ok(Self::Local),
+            "ldap" => Ok(Self::Ldap),
+            other => Err(format!("mode {other:?} inconnu, attendu local ou ldap")),
+        }
+    }
+}
+
+/// Ce que le portail dit de lui-même avant toute authentification.
+///
+/// Rendu sans credential parce qu'il sert précisément à savoir quoi demander : sans lui, le
+/// plugin ne peut pas décider s'il doit réclamer un code TOTP, et le découvrir après coup
+/// obligerait à redemander le mot de passe. Rien de sensible n'y transite — ce sont des
+/// propriétés du déploiement, que la page de connexion affiche déjà.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortalDescriptor {
+    pub credential_mode: CredentialMode,
+    pub auth_mode: AuthMode,
+    /// Redondant avec `auth_mode`, et volontairement : c'est la seule question que le client se
+    /// pose, et la lui faire déduire d'un mode le rendrait solidaire d'une règle qui appartient
+    /// au serveur.
+    pub totp_required: bool,
+}
+
 /// Ce que le client présente pour ouvrir une session.
 ///
 /// Deux jeux de champs mutuellement exclusifs, plutôt qu'un discriminant explicite : une
@@ -116,7 +188,15 @@ pub struct SessionRequest {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SessionGrant<'a> {
     /// Authentification complète. Ouvre un droit de renouveler.
-    Password { password: &'a str, totp: &'a str },
+    ///
+    /// Le code est absent quand le déploiement n'en gère pas — c'est le cas dès que l'annuaire
+    /// porte l'identité. Le rendre optionnel ici plutôt que d'accepter une chaîne vide évite
+    /// qu'un client qui envoie `""` sur un portail à TOTP soit traité comme un client qui n'en
+    /// a pas.
+    Password {
+        password: &'a str,
+        totp: Option<&'a str>,
+    },
     /// Renouvellement silencieux. N'en ouvre pas un second.
     Refresh { refresh_token: &'a str },
 }
@@ -127,6 +207,16 @@ impl SessionRequest {
             user: user.to_string(),
             password: Some(password.to_string()),
             totp: Some(totp.to_string()),
+            refresh_token: None,
+        }
+    }
+
+    /// Demande sans code, pour un portail dont l'annuaire porte le second facteur.
+    pub fn password_only(user: &str, password: &str) -> Self {
+        Self {
+            user: user.to_string(),
+            password: Some(password.to_string()),
+            totp: None,
             refresh_token: None,
         }
     }
@@ -145,12 +235,22 @@ impl SessionRequest {
     /// Les deux jeux ensemble sont refusés plutôt qu'arbitrés : accepter les deux laisserait
     /// le serveur choisir lequel vérifier, et un client qui joint un mot de passe vide à un
     /// jeton valide ne doit pas découvrir laquelle des deux vérifications a compté.
+    ///
+    /// Un code sans mot de passe reste irrecevable : ce n'est pas la moitié d'une
+    /// authentification qu'un portail sans TOTP accepterait, c'est une demande malformée.
+    /// L'inverse — un mot de passe sans code — est désormais recevable, et c'est au serveur de
+    /// dire si son mode s'en contente : lui seul connaît son annuaire.
     pub fn grant(&self) -> Result<SessionGrant<'_>, &'static str> {
         match (&self.password, &self.totp, &self.refresh_token) {
-            (Some(password), Some(totp), None) => Ok(SessionGrant::Password { password, totp }),
+            (Some(password), totp, None) => Ok(SessionGrant::Password {
+                password,
+                totp: totp.as_deref(),
+            }),
             (None, None, Some(refresh_token)) => Ok(SessionGrant::Refresh { refresh_token }),
-            (_, _, Some(_)) => Err("un jeton de renouvellement ne se présente pas avec un mot de passe"),
-            _ => Err("mot de passe et code sont attendus ensemble"),
+            (_, _, Some(_)) => {
+                Err("un jeton de renouvellement ne se présente pas avec un mot de passe")
+            }
+            _ => Err("un mot de passe est attendu"),
         }
     }
 }
@@ -368,7 +468,25 @@ mod tests {
             relu.grant(),
             Ok(SessionGrant::Password {
                 password: "secret",
-                totp: "123456"
+                totp: Some("123456")
+            })
+        );
+    }
+
+    /// Un portail dont l'annuaire porte le second facteur ne reçoit pas de code. La demande
+    /// doit rester recevable : c'est le serveur qui sait si son mode s'en contente, et refuser
+    /// ici interdirait le mode ldap avant même de l'avoir consulté.
+    #[test]
+    fn une_demande_sans_code_reste_recevable() {
+        let request = SessionRequest::password_only("alice", "secret");
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json.get("totp").is_none(), "{json}");
+
+        assert_eq!(
+            request.grant(),
+            Ok(SessionGrant::Password {
+                password: "secret",
+                totp: None
             })
         );
     }
@@ -396,9 +514,15 @@ mod tests {
         request.refresh_token = Some("id.secret".into());
         assert!(request.grant().is_err());
 
-        let mut incomplete = SessionRequest::password("alice", "secret", "123456");
-        incomplete.totp = None;
-        assert!(incomplete.grant().is_err());
+        // Un code sans mot de passe n'est pas la moitié d'une authentification qu'un portail
+        // sans TOTP accepterait : c'est une demande malformée, et elle le reste.
+        let sans_mot_de_passe = SessionRequest {
+            user: "alice".into(),
+            password: None,
+            totp: Some("123456".into()),
+            refresh_token: None,
+        };
+        assert!(sans_mot_de_passe.grant().is_err());
 
         let vide = SessionRequest {
             user: "alice".into(),
@@ -435,5 +559,42 @@ mod tests {
         assert!(!rendu.contains("Correct-Horse"), "{rendu}");
         assert!(!rendu.contains("123456"), "{rendu}");
         assert!(rendu.contains("alice"), "{rendu}");
+    }
+
+    /// Un déploiement qui ne dit rien garde ses comptes locaux. Basculer sur un annuaire
+    /// demande de le configurer : ce ne peut pas être un effet de bord d'une montée de version.
+    #[test]
+    fn le_mode_d_authentification_par_defaut_est_local() {
+        use std::str::FromStr;
+
+        assert_eq!(AuthMode::default(), AuthMode::Local);
+        assert_eq!(AuthMode::from_str("ldap"), Ok(AuthMode::Ldap));
+        assert_eq!(AuthMode::from_str("local"), Ok(AuthMode::Local));
+        assert!(AuthMode::from_str("LDAP").is_err());
+        assert!(AuthMode::from_str("ldaps").is_err());
+    }
+
+    /// Le second facteur n'existe que pour les comptes locaux. Si cette règle s'inversait, le
+    /// plugin réclamerait un code que personne ne peut produire.
+    #[test]
+    fn seul_le_mode_local_reclame_un_code() {
+        assert!(AuthMode::Local.totp_required());
+        assert!(!AuthMode::Ldap.totp_required());
+    }
+
+    /// Le descripteur est ce que le plugin lit avant de poser ses questions : ses champs sont
+    /// sur le fil, en camelCase comme le reste du contrat.
+    #[test]
+    fn le_descripteur_annonce_les_deux_modes() {
+        let json = serde_json::to_value(PortalDescriptor {
+            credential_mode: CredentialMode::Oidc,
+            auth_mode: AuthMode::Ldap,
+            totp_required: false,
+        })
+        .unwrap();
+
+        assert_eq!(json["credentialMode"], "oidc");
+        assert_eq!(json["authMode"], "ldap");
+        assert_eq!(json["totpRequired"], false);
     }
 }

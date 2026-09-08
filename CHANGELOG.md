@@ -10,6 +10,51 @@ par `packaging/changelog-section.sh` : ce fichier est la source, pas une copie.
 
 ## [1.2.0] — non publiée
 
+- **feat(server)** — **fédération d'identité sur un annuaire LDAP(S)**, Active Directory ou
+  FreeIPA. `authMode: ldap` fait de l'annuaire la source des identités : le mot de passe y est
+  vérifié par un bind, le `KdtUser` est créé à la première connexion réussie, et l'appartenance
+  aux groupes kdt est reportée depuis les groupes de l'annuaire.
+
+  C'est un **second axe**, indépendant du mode de délivrance. `credentialMode` dit ce que le
+  portail remet, `authMode` qui il reconnaît : les quatre combinaisons sont valides, et changer
+  l'un n'oblige jamais à toucher l'autre.
+
+  La correspondance entre groupes d'annuaire et `KdtGroup` est **déclarée**, dans
+  `ldap.groupMappings`. Rien n'est déduit d'un DN : le dériver demanderait de le normaliser, et
+  deux groupes distincts de l'annuaire pourraient alors aboutir au même nom, donc aux mêmes
+  droits. Ce qui n'est pas déclaré n'existe pas côté cluster.
+
+  L'identifiant de connexion, lui, doit bien être normalisé pour donner un nom de ressource — et
+  cette normalisation est ambiguë, `Jean_Dupont` et `jean-dupont` aboutissant au même nom. D'où
+  le DN épinglé en annotation à la création du compte et revérifié à chaque connexion : une
+  divergence est refusée, jamais arbitrée. Un compte local qui porte le nom visé n'est pas
+  absorbé non plus.
+
+  Le second facteur est délégué à l'annuaire : plus de TOTP enrôlé côté kdt, plus de page
+  `/activate` montée, et `invite` refuse de s'exécuter. Le nouveau point d'accès
+  `GET /api/v1/portal` annonce ce que le portail attend, pour que le plugin sache s'il doit
+  demander un code avant de le demander — un portail plus ancien répond 404, et le plugin retombe
+  sur son comportement d'avant.
+
+  Le contrôleur relit l'annuaire toutes les quinze minutes, sans quoi un retrait de groupe
+  n'aurait d'effet qu'à la prochaine saisie de mot de passe — soit jusqu'à sept jours, le
+  renouvellement silencieux ne rebindant jamais. Un compte dont l'entrée a disparu passe en
+  `spec.disabled`, jamais supprimé. Une panne d'annuaire, elle, n'a aucun effet : une absence de
+  réponse ne dit rien, et la prendre pour une disparition désactiverait tous les comptes du
+  cluster à la première coupure réseau. Pour la même raison, elle n'incrémente pas le compteur
+  d'échecs.
+
+  Deux refus au démarrage, et au rendu du chart. Un annuaire en clair : un bind simple présente
+  le mot de passe dans la requête, c'est le protocole, et `ldaps://` ou StartTLS est donc exigé.
+  Une table de correspondance vide : les comptes se connecteraient sans obtenir le moindre droit.
+
+  Le chart monte l'autorité de l'annuaire — FreeIPA émet toujours depuis la sienne, AD presque
+  toujours — et le serveur assemble au démarrage un magasin qui la réunit à celui de l'image :
+  `ldap3` n'offre aucun moyen de recevoir une autorité pour la seule connexion à l'annuaire, et
+  la variable qui reste, `SSL_CERT_FILE`, remplace le magasin natif au lieu de s'y ajouter.
+
+  Voir [docs/ldap.md](docs/ldap.md). En `local`, le défaut, rien ne change.
+
 - **feat(packaging)** — le plugin se distribue en `.deb` et en `.rpm`, publiés avec chaque
   release à côté du tarball. Jusqu'ici il fallait le sortir de l'image avec `podman cp` ou le
   compiler : deux gestes que personne ne fait sur un poste qu'il n'administre pas. Le binaire

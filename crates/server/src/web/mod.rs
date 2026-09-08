@@ -35,9 +35,11 @@ use crate::oidc::discovery::{self, DISCOVERY_PATH, JWKS_PATH};
 use crate::oidc::key::JwkSet;
 use crate::oidc::{jwt, SigningMaterial};
 use crate::sessions::SessionStore;
+use crate::ldap::{provision, Directory, LdapError};
 use kdt_identity_api::portal::{
-    AuthorizeTokenRequest, CredentialMode, CredentialRequest, CredentialResponse, RevokeRequest,
-    SessionGrant, SessionRequest, SessionResponse, TokenRequest, TokenResponse,
+    AuthMode, AuthorizeTokenRequest, CredentialMode, CredentialRequest, CredentialResponse,
+    PortalDescriptor, RevokeRequest, SessionGrant, SessionRequest, SessionResponse, TokenRequest,
+    TokenResponse,
 };
 use kdt_identity_api::{KdtGroup, KdtUser};
 use kube::api::{Api, ListParams};
@@ -91,6 +93,11 @@ pub struct AppState {
     endpoint: ClusterEndpoint,
     config: ServerConfig,
     oidc: Option<OidcState>,
+    /// L'annuaire, si le mode d'authentification est `ldap`.
+    ///
+    /// Même raison que pour `oidc` : absent, les chemins qui en dépendent n'existent pas, plutôt
+    /// que d'exister et de refuser.
+    directory: Option<Directory>,
     /// L'application autorisée à demander des identités, si elle est déclarée.
     ///
     /// Absente — `webUrl` non renseignée — le flow d'autorisation n'est pas monté du tout. kdt-web
@@ -106,8 +113,11 @@ type Shared = Arc<AppState>;
 pub fn router(state: Shared) -> Router {
     let router = Router::new()
         .route("/", get(account_page))
-        .route("/activate", get(activate_page).post(activate_submit))
         .route("/login", get(login_page).post(login_submit))
+        // Le descripteur est monté dans tous les modes et sans authentification : c'est ce que
+        // le plugin lit pour savoir quoi demander, donc avant d'avoir quoi que ce soit à
+        // présenter.
+        .route(kdt_identity_api::portal::PORTAL_PATH, get(portal_descriptor))
         .route("/logout", post(logout))
         .route("/kubeconfig", post(download_kubeconfig))
         .route(kdt_identity_api::portal::SESSION_PATH, post(api_session))
@@ -116,6 +126,14 @@ pub fn router(state: Shared) -> Router {
         // renouvellement qu'elle coupe, pas la façon dont l'identité est ensuite matérialisée.
         .route(kdt_identity_api::portal::REVOKE_PATH, post(api_revoke))
         .route("/healthz", get(|| async { "ok" }));
+
+    // L'activation n'existe que pour les comptes que le cluster porte. En mode ldap il n'y a ni
+    // invitation, ni mot de passe à poser, ni TOTP à enrôler : servir la page inviterait à
+    // définir un mot de passe que rien ne vérifierait jamais.
+    let router = match state.config.auth_mode {
+        AuthMode::Local => router.route("/activate", get(activate_page).post(activate_submit)),
+        AuthMode::Ldap => router,
+    };
 
     // Les points d'accès OIDC n'existent qu'en mode OIDC. Le document de découverte est
     // public et non authentifié : le servir sans pouvoir émettre de jeton inviterait un
@@ -154,8 +172,10 @@ pub fn state(
     oidc: Option<OidcState>,
 ) -> Shared {
     let authorized = config.web_url.as_deref().map(authorize::Client::from_web_url);
+    let directory = config.ldap.clone().map(Directory::new);
 
     Arc::new(AppState {
+        directory,
         users: Api::all(client.clone()),
         groups: Api::all(client.clone()),
         store: CredentialStore::new(client.clone(), &config.namespace),
@@ -381,12 +401,19 @@ pub struct LoginForm {
 
 async fn login_submit(State(state): State<Shared>, Form(form): Form<LoginForm>) -> Response {
     let next = safe_next(&form.next);
-    match authenticate(&state, &form.user, &form.password, &form.totp).await {
-        Ok(_) => {
-            info!(user = %form.user, "connexion réussie");
+    let totp = (!form.totp.trim().is_empty()).then_some(form.totp.as_str());
+
+    match authenticate(&state, &form.user, &form.password, totp).await {
+        Ok(user) => {
+            // Le cookie est signé pour le compte tel que le cluster le nomme, jamais tel qu'il
+            // a été tapé : en mode ldap, l'identifiant saisi peut différer du nom du `KdtUser`
+            // par sa casse, et une session signée pour un nom qui ne résout pas serait rejetée
+            // à chaque page.
+            let name = user.metadata.name.clone().unwrap_or_else(|| form.user.clone());
+            info!(user = %name, "connexion réussie");
             let token = state.signer.sign(
                 purpose::SESSION,
-                &form.user,
+                &name,
                 (Utc::now() + SESSION_TTL).timestamp(),
             );
             (
@@ -406,12 +433,48 @@ async fn login_submit(State(state): State<Shared>, Form(form): Form<LoginForm>) 
     }
 }
 
-/// Authentifie un compte par mot de passe et code TOTP.
+/// Ce que le portail dit de lui-même, sans rien demander.
+///
+/// Non authentifié, et ce n'est pas un oubli : le client a besoin de ces valeurs *avant* d'avoir
+/// quoi que ce soit à présenter. Rien de sensible n'y figure — ce sont les deux modes du
+/// déploiement, que la page de connexion expose déjà par sa seule forme.
+async fn portal_descriptor(State(state): State<Shared>) -> Response {
+    axum::Json(PortalDescriptor {
+        credential_mode: state.config.credential_mode,
+        auth_mode: state.config.auth_mode,
+        totp_required: state.config.auth_mode.totp_required(),
+    })
+    .into_response()
+}
+
+/// Authentifie un compte, quelle que soit la source qui porte son identité.
 ///
 /// Chemin unique pour le formulaire du portail et pour l'API du plugin `exec` : verrouillage,
 /// anti-rejeu TOTP et remise à zéro du compteur ne doivent pas dépendre de la porte d'entrée.
 /// La raison de l'échec est rendue à l'appelant pour le journal, jamais pour le visiteur.
+///
+/// C'est aussi le seul endroit où le mode d'authentification se lit. Tout ce qui suit —
+/// sessions, émission, sujets RBAC — ne sait pas comment l'identité a été prouvée, et n'a pas
+/// à le savoir.
 async fn authenticate(
+    state: &AppState,
+    name: &str,
+    password: &str,
+    totp_code: Option<&str>,
+) -> Result<KdtUser, &'static str> {
+    match state.config.auth_mode {
+        AuthMode::Local => {
+            // Un portail local sans code ne peut rien vérifier : le refuser ici évite qu'un
+            // client mal configuré croie s'authentifier à un facteur.
+            let totp_code = totp_code.ok_or("code attendu")?;
+            authenticate_local(state, name, password, totp_code).await
+        }
+        AuthMode::Ldap => authenticate_ldap(state, name, password).await,
+    }
+}
+
+/// Authentifie un compte porté par le cluster, par mot de passe et code TOTP.
+async fn authenticate_local(
     state: &AppState,
     name: &str,
     password: &str,
@@ -474,6 +537,121 @@ async fn authenticate(
         .put(&user, &ok)
         .await
         .map_err(|_| "enregistrement du pas TOTP")?;
+
+    Ok(user)
+}
+
+/// Authentifie un compte porté par un annuaire, et l'aligne sur ce que celui-ci déclare.
+///
+/// L'ordre des étapes n'est pas indifférent :
+///
+/// 1. le nom est normalisé d'abord, parce que c'est lui qui désigne le compteur d'échecs ;
+/// 2. le verrou et `spec.disabled` sont lus **avant** de joindre l'annuaire — un compte coupé
+///    ici ne doit pas produire de trafic vers l'annuaire, ni compter dans *sa* politique de
+///    verrouillage ;
+/// 3. le bind vient ensuite, et lui seul décide ;
+/// 4. le compte et ses groupes ne sont écrits qu'après.
+///
+/// Une panne d'annuaire n'incrémente jamais le compteur d'échecs. Compter une indisponibilité
+/// comme un mot de passe faux verrouillerait tous les comptes du cluster en quelques minutes,
+/// et la panne survivrait alors à sa propre résolution.
+async fn authenticate_ldap(
+    state: &AppState,
+    login: &str,
+    password: &str,
+) -> Result<KdtUser, &'static str> {
+    let now = Utc::now();
+    let Some(directory) = &state.directory else {
+        return Err("annuaire non configuré");
+    };
+
+    let name = provision::normalize_login(login).map_err(|_| "identifiant hors du jeu accepté")?;
+
+    let credentials = state
+        .store
+        .get(&name)
+        .await
+        .map_err(|_| "credentials illisibles")?
+        .unwrap_or_default();
+
+    if credentials.lockout.is_locked(now) {
+        return Err("verrouillé");
+    }
+
+    // Le compte n'existe pas encore à la première connexion : c'est le cas nominal, pas une
+    // erreur. Seul un compte déjà connu peut être désactivé.
+    let existant = state
+        .users
+        .get_opt(&name)
+        .await
+        .map_err(|_| "lecture du compte")?;
+    if existant.as_ref().is_some_and(|u| u.spec.disabled) {
+        return Err("compte désactivé");
+    }
+
+    let directory_user = match directory.authenticate(login, password).await {
+        Ok(user) => user,
+        Err(LdapError::InvalidCredentials) => {
+            // Le compteur ne peut s'écrire que sur un compte existant : le `Secret` est
+            // rattaché au `KdtUser` par une `ownerReference`. Avant la première connexion
+            // réussie, c'est donc la politique de l'annuaire qui protège, pas la nôtre.
+            if let Some(user) = &existant {
+                record_failure(state, user, &credentials, now).await;
+            }
+            return Err("identifiants refusés par l'annuaire");
+        }
+        Err(e @ LdapError::Unavailable(_)) => {
+            warn!(erreur = %e, "annuaire injoignable");
+            return Err("annuaire injoignable");
+        }
+        Err(e) => {
+            warn!(login = %login, erreur = %e, "entrée d'annuaire inutilisable");
+            return Err("entrée d'annuaire inutilisable");
+        }
+    };
+
+    let user = provision::ensure_user(&state.users, &directory_user)
+        .await
+        .map_err(|e| {
+            warn!(login = %login, erreur = %e, "compte non provisionné");
+            "compte non provisionné"
+        })?;
+
+    // Un compte peut avoir été désactivé entre la lecture ci-dessus et maintenant, ou exister
+    // déjà désactivé sans que la normalisation l'ait désigné — on revérifie sur l'objet réel.
+    if user.spec.disabled {
+        return Err("compte désactivé");
+    }
+
+    let mappings = &directory.config().group_mappings;
+    let wanted = mappings.resolve(&directory_user.member_of);
+    if let Err(e) = provision::sync_groups(
+        &state.groups,
+        &name,
+        &wanted,
+        &mappings.managed_groups(),
+    )
+    .await
+    {
+        // L'appartenance n'a pas pu être écrite, mais le mot de passe était bon. Refuser la
+        // connexion sur cet échec donnerait des droits périmés à qui se connecte ensuite ;
+        // l'accepter en silence donnerait des droits périmés tout court. On refuse : entre les
+        // deux, seul le refus est visible.
+        warn!(compte = %name, erreur = %e, "appartenance non synchronisée");
+        return Err("appartenance non synchronisée");
+    }
+
+    // Le compteur d'échecs se remet à zéro comme en mode local. Rien d'autre n'est écrit : un
+    // compte fédéré n'a ni empreinte de mot de passe ni secret TOTP à conserver.
+    if credentials.lockout != Lockout::default() {
+        let remis = Credentials {
+            lockout: Lockout::default(),
+            ..credentials
+        };
+        if let Err(e) = state.store.put(&user, &remis).await {
+            warn!(erreur = %e, "compteur d'échecs non remis à zéro");
+        }
+    }
 
     Ok(user)
 }
@@ -1077,18 +1255,35 @@ async fn api_session(
     };
     let now = Utc::now();
 
+    // Le compte tel que le cluster le nomme. En mode local c'est ce qui a été envoyé ; en mode
+    // ldap l'identifiant saisi peut en différer, et tout ce qui suit — sessions, credentials,
+    // groupes — se lit sous le nom du `KdtUser`, jamais sous celui qui a été tapé.
+    let mut name = match state.config.auth_mode {
+        AuthMode::Local => request.user.clone(),
+        AuthMode::Ldap => {
+            provision::normalize_login(&request.user).unwrap_or_else(|_| request.user.clone())
+        }
+    };
+
     // Une ouverture par mot de passe rend un droit de renouveler ; un renouvellement n'en rend
     // pas un second. Sans cela, une session volée se prolongerait indéfiniment d'elle-même.
     let ouvre_un_droit = match grant {
         SessionGrant::Password { password, totp } => {
-            if let Err(reason) = authenticate(&state, &request.user, password, totp).await {
-                warn!(user = %request.user, raison = reason, "session API refusée");
-                return unauthorized_json();
+            match authenticate(&state, &request.user, password, totp).await {
+                Ok(user) => {
+                    if let Some(canonique) = user.metadata.name {
+                        name = canonique;
+                    }
+                }
+                Err(reason) => {
+                    warn!(user = %request.user, raison = reason, "session API refusée");
+                    return unauthorized_json();
+                }
             }
             true
         }
         SessionGrant::Refresh { refresh_token } => {
-            let sessions = match state.sessions.get(&request.user).await {
+            let sessions = match state.sessions.get(&name).await {
                 Ok(sessions) => sessions,
                 Err(e) => {
                     warn!(user = %request.user, erreur = %e, "sessions illisibles");
@@ -1106,23 +1301,28 @@ async fn api_session(
     };
 
     // L'état courant fait foi, quelle que soit la porte d'entrée.
-    let Ok(user) = state.users.get(&request.user).await else {
-        warn!(user = %request.user, "compte introuvable");
+    let Ok(user) = state.users.get(&name).await else {
+        warn!(user = %name, "compte introuvable");
         return unauthorized_json();
     };
-    let phase = match state.store.get(&request.user).await {
-        Ok(Some(credentials)) => logic::phase(&user, credentials.is_activated()),
-        _ => return unauthorized_json(),
+    // Un compte fédéré n'a pas de credentials locaux : l'absence de `Secret` est son état
+    // normal, pas un compte à moitié créé.
+    let phase = match state.store.get(&name).await {
+        Ok(credentials) => logic::phase(
+            &user,
+            credentials.map(|c| c.is_activated()).unwrap_or(false),
+        ),
+        Err(_) => return unauthorized_json(),
     };
     if !logic::may_request_own_credential(phase) {
-        warn!(user = %request.user, ?phase, "session API refusée");
+        warn!(user = %name, ?phase, "session API refusée");
         return unauthorized_json();
     }
 
-    let (subject, groups) = match subjects(&state, &request.user).await {
+    let (subject, groups) = match subjects(&state, &name).await {
         Ok(pair) => pair,
         Err(e) => {
-            warn!(user = %request.user, erreur = %e, "groupes illisibles");
+            warn!(user = %name, erreur = %e, "groupes illisibles");
             return internal_error_json();
         }
     };
@@ -1148,13 +1348,16 @@ async fn api_session(
         None
     };
 
-    info!(user = %request.user, renouvellement = !ouvre_un_droit, "session API ouverte");
+    info!(user = %name, renouvellement = !ouvre_un_droit, "session API ouverte");
     (
         [(header::CACHE_CONTROL, "no-store")],
         axum::Json(SessionResponse {
+            // Signé pour le nom du compte, pas pour celui qui a été envoyé : c'est ce jeton que
+            // l'émission reverifiera, et il doit désigner la même identité que le sujet
+            // ci-dessous.
             token: state.signer.sign(
                 purpose::API_CREDENTIAL,
-                &request.user,
+                &name,
                 (now + API_TOKEN_TTL).timestamp(),
             ),
             subject: subject.as_str().to_string(),

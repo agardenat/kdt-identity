@@ -16,9 +16,9 @@ use clap::{Parser, Subcommand};
 use kdt_identity_api::csr;
 use kdt_identity_api::naming::Subject;
 use kdt_identity_api::portal::{
-    CredentialMode, CredentialRequest, CredentialResponse, RevokeRequest, SessionRequest,
-    SessionResponse, TokenRequest, TokenResponse, CREDENTIAL_PATH, REVOKE_PATH, SESSION_PATH,
-    TOKEN_PATH,
+    CredentialMode, CredentialRequest, CredentialResponse, PortalDescriptor, RevokeRequest,
+    SessionRequest, SessionResponse, TokenRequest, TokenResponse, CREDENTIAL_PATH, PORTAL_PATH,
+    REVOKE_PATH, SESSION_PATH, TOKEN_PATH,
 };
 use serde::Serialize;
 use std::io::Write;
@@ -149,12 +149,21 @@ async fn credential(portal: &str, user: &str) -> anyhow::Result<()> {
         }
     }
 
-    let (password, totp) = prompt_credentials(user, portal)?;
-    let fresh = obtain(
-        portal,
-        SessionRequest::password(user, &password, &totp),
-        None,
-    )
+    // Ce que le portail attend se demande avant de le demander à la personne. Un portail dont
+    // l'annuaire porte le second facteur n'a pas de code à recevoir, et réclamer six chiffres
+    // que rien ne vérifiera n'aurait pas seulement l'air inutile : ça donnerait à croire à une
+    // authentification à deux facteurs qui n'a pas lieu.
+    let totp_required = fetch_descriptor(portal)
+        .await
+        .is_none_or(|d| d.totp_required);
+
+    let (password, totp) = prompt_credentials(user, portal, totp_required)?;
+    let request = match &totp {
+        Some(totp) => SessionRequest::password(user, &password, totp),
+        None => SessionRequest::password_only(user, &password),
+    };
+
+    let fresh = obtain(portal, request, None)
     .await
     .map_err(|e| match e {
         Attempt::Refused(raison) => anyhow::anyhow!("{raison}"),
@@ -367,12 +376,34 @@ async fn read_json<T: serde::de::DeserializeOwned>(response: reqwest::Response) 
     serde_json::from_str(&body).context("réponse du portail illisible")
 }
 
-/// Demande mot de passe et code TOTP sur le terminal de contrôle.
+/// Lit le descripteur du portail, ou rien s'il n'en sert pas.
+///
+/// Un portail antérieur à ce point d'accès répond 404, et ce n'est pas une panne : l'appelant
+/// retombe alors sur le comportement historique — demander un code. Échouer ici rendrait le
+/// plugin inutilisable contre un serveur plus ancien, pour une information de confort.
+async fn fetch_descriptor(portal: &str) -> Option<PortalDescriptor> {
+    let response = reqwest::Client::new()
+        .get(format!("{portal}{PORTAL_PATH}"))
+        .send()
+        .await
+        .ok()?;
+
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json().await.ok()
+}
+
+/// Demande mot de passe et, si le portail en attend un, code TOTP.
 ///
 /// Les deux saisies passent par `/dev/tty`, jamais par l'entrée standard : `kubectl` invoque ce
 /// plugin avec ses propres tubes, et lire sur stdin capterait ce qui était destiné à la
 /// commande — ou bloquerait indéfiniment sur un tube que personne n'alimente.
-fn prompt_credentials(user: &str, portal: &str) -> anyhow::Result<(String, String)> {
+fn prompt_credentials(
+    user: &str,
+    portal: &str,
+    totp_required: bool,
+) -> anyhow::Result<(String, Option<String>)> {
     use std::io::{BufRead, BufReader};
 
     let mut tty = std::fs::OpenOptions::new()
@@ -392,6 +423,10 @@ fn prompt_credentials(user: &str, portal: &str) -> anyhow::Result<(String, Strin
     let password = rpassword::prompt_password("Mot de passe : ")
         .context("lecture du mot de passe")?;
 
+    if !totp_required {
+        return Ok((password, None));
+    }
+
     write!(tty, "Code à 6 chiffres : ")?;
     tty.flush()?;
 
@@ -400,7 +435,7 @@ fn prompt_credentials(user: &str, portal: &str) -> anyhow::Result<(String, Strin
         .read_line(&mut totp)
         .context("lecture du code")?;
 
-    Ok((password, totp.trim().to_string()))
+    Ok((password, Some(totp.trim().to_string())))
 }
 
 fn emit(credential: &cache::CachedCredential) -> anyhow::Result<()> {

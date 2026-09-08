@@ -4,8 +4,10 @@
 //! injectées depuis un `Secret` monté par le chart, sans jamais transiter par un ConfigMap ni
 //! par un argument de ligne de commande, où `ps` les exposerait à tout le nœud.
 
+use crate::ldap::mapping::GroupMappings;
+use crate::ldap::profile::{LdapAttributes, LdapProfile};
 use crate::mail::{Encryption, SmtpConfig};
-use kdt_identity_api::portal::CredentialMode;
+use kdt_identity_api::portal::{AuthMode, CredentialMode};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -57,7 +59,33 @@ pub const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
 /// portail et l'apiserver fait refuser des jetons valides.
 const TOKEN_TTL_RANGE: (Duration, Duration) = (Duration::from_secs(60), Duration::from_secs(3600));
 
+/// Délai au-delà duquel l'annuaire est tenu pour injoignable.
+///
+/// Dix secondes : au-delà, c'est la page de connexion qui reste suspendue, et une panne
+/// d'annuaire se lit alors comme un portail en panne.
+pub const DEFAULT_LDAP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bornes acceptées pour ce délai.
+const LDAP_TIMEOUT_RANGE: (Duration, Duration) =
+    (Duration::from_secs(1), Duration::from_secs(60));
+
+/// Intervalle par défaut entre deux relectures de l'annuaire.
+///
+/// Quinze minutes : c'est le délai maximal entre un retrait de groupe côté annuaire et sa prise
+/// d'effet sur le cluster, pour un coût d'une recherche par compte fédéré et par quart d'heure.
+pub const DEFAULT_LDAP_RESYNC: Duration = Duration::from_secs(15 * 60);
+
+/// Bornes acceptées pour cet intervalle.
+///
+/// Le plancher protège l'annuaire : sous la minute, un parc de quelques centaines de comptes
+/// produirait une charge continue pour une fraîcheur que personne ne mesure.
+const LDAP_RESYNC_RANGE: (Duration, Duration) =
+    (Duration::from_secs(60), Duration::from_secs(24 * 3600));
+
+/// Emplacement du magasin d'autorités de l'image.
+///
+/// Le bundle servi à tout le TLS sortant en dérive : voir [`LdapConfig::ca_file`].
+pub const IMAGE_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -65,6 +93,44 @@ pub enum ConfigError {
     Missing(&'static str),
     #[error("variable {0} invalide : {1}")]
     Invalid(&'static str, String),
+}
+
+/// Tout ce qu'il faut pour interroger un annuaire.
+///
+/// Absente du [`ServerConfig`] tant que le mode d'authentification est `local` : une
+/// configuration LDAP à moitié posée n'a aucune raison d'exister, et la laisser traîner
+/// obligerait chaque lecteur à se demander si elle sert.
+#[derive(Debug, Clone)]
+pub struct LdapConfig {
+    /// `ldaps://hôte:636`, ou `ldap://hôte:389` accompagné de StartTLS.
+    pub url: String,
+    pub start_tls: bool,
+    /// Compte de service qui cherche l'entrée de la personne avant de la faire binder.
+    ///
+    /// Absent, la recherche est anonyme : FreeIPA l'autorise souvent, Active Directory
+    /// pratiquement jamais.
+    pub bind_dn: Option<String>,
+    pub bind_password: Option<Zeroizing<String>>,
+    /// Racine sous laquelle chercher les personnes.
+    pub user_search_base: String,
+    /// Noms d'attributs, issus du profil et surchargeables un à un.
+    pub attributes: LdapAttributes,
+    /// Correspondance entre les groupes de l'annuaire et les `KdtGroup`.
+    pub group_mappings: GroupMappings,
+    /// CA de l'annuaire, en PEM, montée par le chart.
+    ///
+    /// Elle n'est pas passée à la bibliothèque LDAP, qui n'a pas de quoi la recevoir :
+    /// `ldap3` s'en remet à `rustls-native-certs`, dont le seul point d'entrée est la variable
+    /// `SSL_CERT_FILE`. Le serveur assemble donc au démarrage un magasin qui réunit celui de
+    /// l'image et celle-ci — voir `crate::ldap::trust`.
+    pub ca_file: Option<String>,
+    pub timeout: Duration,
+    /// Intervalle entre deux relectures de l'annuaire par le contrôleur.
+    ///
+    /// La connexion ne renseigne que la personne qui se connecte. Sans cette relecture, un
+    /// retrait de groupe ne prendrait effet qu'à sa prochaine saisie de mot de passe — soit
+    /// jusqu'à `refresh_ttl` plus tard, le renouvellement silencieux ne rebindant jamais.
+    pub resync: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +158,13 @@ pub struct ServerConfig {
     pub session_key: Option<Zeroizing<String>>,
     /// Ce que le portail remet aux clients : un certificat, ou un jeton OIDC.
     pub credential_mode: CredentialMode,
+    /// Qui reconnaît les personnes : le cluster, ou un annuaire.
+    ///
+    /// Orthogonal au mode de délivrance, et lu séparément : les quatre combinaisons sont
+    /// valides.
+    pub auth_mode: AuthMode,
+    /// Présente si et seulement si `auth_mode` vaut `ldap`.
+    pub ldap: Option<LdapConfig>,
     /// Durée de validité des certificats remis au plugin.
     pub cert_ttl: Duration,
     /// Durée de validité des certificats téléchargés depuis le portail.
@@ -145,6 +218,8 @@ impl ServerConfig {
             cluster_ca_file: env("KDT_IDENTITY_CLUSTER_CA_FILE"),
             session_key: env("KDT_IDENTITY_SESSION_KEY").map(Zeroizing::new),
             credential_mode: mode_from_env()?,
+            auth_mode: auth_mode_from_env()?,
+            ldap: ldap_from_env()?,
             cert_ttl: duration_from_env(
                 "KDT_IDENTITY_CERT_TTL",
                 DEFAULT_CERT_TTL,
@@ -219,6 +294,44 @@ impl ServerConfig {
             }
         }
 
+        if let Some(ldap) = &self.ldap {
+            // Un bind simple présente le mot de passe **en clair** dans la requête : c'est le
+            // protocole, pas un défaut de configuration. Sans TLS, tout ce qui se trouve entre
+            // le portail et l'annuaire lit chaque mot de passe d'entreprise qui passe. Refusé
+            // au démarrage, donc, et non signalé par un avertissement que personne ne lit.
+            let chiffre = ldap.url.starts_with("ldaps://") || ldap.start_tls;
+            if !chiffre {
+                return Err(ConfigError::Invalid(
+                    "KDT_IDENTITY_LDAP_URL",
+                    format!(
+                        "{:?} : un bind présente le mot de passe en clair, une racine ldaps:// \
+                         ou StartTLS est exigée",
+                        ldap.url
+                    ),
+                ));
+            }
+
+            if ldap.url.starts_with("ldaps://") && ldap.start_tls {
+                return Err(ConfigError::Invalid(
+                    "KDT_IDENTITY_LDAP_START_TLS",
+                    "StartTLS négocie le chiffrement sur une connexion en clair : il n'a pas de \
+                     sens sur une racine ldaps://, déjà chiffrée"
+                        .to_string(),
+                ));
+            }
+
+            // Une table vide décrit un déploiement où personne n'obtient de groupe, donc où
+            // personne n'obtient de droit : c'est presque sûrement un oubli, et le découvrir
+            // demanderait de comparer un `kubectl auth can-i` à ce qu'on attendait.
+            if ldap.group_mappings.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "KDT_IDENTITY_LDAP_GROUP_MAPPINGS",
+                    "aucune correspondance de groupe : les comptes fédérés n'auraient aucun droit"
+                        .to_string(),
+                ));
+            }
+        }
+
         Ok(self)
     }
 
@@ -243,6 +356,94 @@ fn mode_from_env() -> Result<CredentialMode, ConfigError> {
             .parse()
             .map_err(|e: String| ConfigError::Invalid("KDT_IDENTITY_CREDENTIAL_MODE", e)),
     }
+}
+
+fn auth_mode_from_env() -> Result<AuthMode, ConfigError> {
+    match env("KDT_IDENTITY_AUTH_MODE") {
+        None => Ok(AuthMode::default()),
+        Some(raw) => raw
+            .parse()
+            .map_err(|e: String| ConfigError::Invalid("KDT_IDENTITY_AUTH_MODE", e)),
+    }
+}
+
+/// Lit la configuration de l'annuaire, ou rien si le mode ne l'est pas.
+///
+/// Le mode commande, et non la présence d'une URL : un déploiement qui garde ses variables LDAP
+/// en repassant en `local` ne doit pas continuer à joindre l'annuaire, et l'inverse — un mode
+/// `ldap` sans URL — doit refuser de démarrer plutôt que d'accepter toutes les connexions.
+fn ldap_from_env() -> Result<Option<LdapConfig>, ConfigError> {
+    if auth_mode_from_env()? != AuthMode::Ldap {
+        return Ok(None);
+    }
+
+    let profile: LdapProfile = match env("KDT_IDENTITY_LDAP_PROFILE") {
+        None => return Err(ConfigError::Missing("KDT_IDENTITY_LDAP_PROFILE")),
+        Some(raw) => raw
+            .parse()
+            .map_err(|e: String| ConfigError::Invalid("KDT_IDENTITY_LDAP_PROFILE", e))?,
+    };
+
+    // Les défauts du profil, surchargeables un à un : un schéma peut être celui d'Active
+    // Directory à un attribut près, et devoir alors tout redéclarer serait une invitation à se
+    // tromper sur les autres.
+    let defaults = profile.attributes();
+    let attributes = LdapAttributes {
+        login: env("KDT_IDENTITY_LDAP_LOGIN_ATTR").unwrap_or(defaults.login),
+        email: env("KDT_IDENTITY_LDAP_EMAIL_ATTR").unwrap_or(defaults.email),
+        display: env("KDT_IDENTITY_LDAP_DISPLAY_ATTR").unwrap_or(defaults.display),
+        member_of: env("KDT_IDENTITY_LDAP_MEMBER_ATTR").unwrap_or(defaults.member_of),
+        object_class: env("KDT_IDENTITY_LDAP_OBJECT_CLASS").unwrap_or(defaults.object_class),
+    };
+
+    let bind_dn = env("KDT_IDENTITY_LDAP_BIND_DN");
+    let bind_password = env("KDT_IDENTITY_LDAP_BIND_PASSWORD").map(Zeroizing::new);
+
+    // Même règle que pour SMTP : un DN sans mot de passe produit un bind qui échoue à la
+    // première connexion, l'inverse ignore silencieusement le mot de passe fourni.
+    if bind_dn.is_some() != bind_password.is_some() {
+        return Err(ConfigError::Invalid(
+            "KDT_IDENTITY_LDAP_BIND_DN",
+            "DN de service et mot de passe vont ensemble".to_string(),
+        ));
+    }
+
+    let group_mappings = match env("KDT_IDENTITY_LDAP_GROUP_MAPPINGS") {
+        None => GroupMappings::default(),
+        Some(raw) => GroupMappings::parse(&raw)
+            .map_err(|e| ConfigError::Invalid("KDT_IDENTITY_LDAP_GROUP_MAPPINGS", e))?,
+    };
+
+    Ok(Some(LdapConfig {
+        url: env("KDT_IDENTITY_LDAP_URL").ok_or(ConfigError::Missing("KDT_IDENTITY_LDAP_URL"))?,
+        start_tls: match env("KDT_IDENTITY_LDAP_START_TLS").as_deref() {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(other) => {
+                return Err(ConfigError::Invalid(
+                    "KDT_IDENTITY_LDAP_START_TLS",
+                    format!("{other:?} inconnu, attendu true ou false"),
+                ))
+            }
+        },
+        bind_dn,
+        bind_password,
+        user_search_base: env("KDT_IDENTITY_LDAP_USER_SEARCH_BASE")
+            .ok_or(ConfigError::Missing("KDT_IDENTITY_LDAP_USER_SEARCH_BASE"))?,
+        attributes,
+        group_mappings,
+        ca_file: env("KDT_IDENTITY_LDAP_CA_FILE"),
+        timeout: duration_from_env(
+            "KDT_IDENTITY_LDAP_TIMEOUT",
+            DEFAULT_LDAP_TIMEOUT,
+            LDAP_TIMEOUT_RANGE,
+        )?,
+        resync: duration_from_env(
+            "KDT_IDENTITY_LDAP_RESYNC",
+            DEFAULT_LDAP_RESYNC,
+            LDAP_RESYNC_RANGE,
+        )?,
+    }))
 }
 
 /// Lit une durée bornée, avec les suffixes `s`, `m`, `h` et `d`.
@@ -370,6 +571,8 @@ mod tests {
             session_key: None,
             web_url: None,
             credential_mode: CredentialMode::Certificate,
+            auth_mode: AuthMode::Local,
+            ldap: None,
             cert_ttl: DEFAULT_CERT_TTL,
             download_cert_ttl: DEFAULT_DOWNLOAD_CERT_TTL,
             kubeconfig_download: true,
@@ -381,9 +584,9 @@ mod tests {
 
     fn with_env<T>(vars: &[(&str, &str)], body: impl FnOnce() -> T) -> T {
         // Les variables d'environnement sont globales au processus : les tests qui y touchent
-        // se sérialisent entre eux.
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // se sérialisent entre eux, et le verrou vaut pour tout le binaire de test — pas
+        // seulement pour ce module, `ldap::trust` posant lui aussi une variable.
+        let _guard = crate::env_lock();
 
         for (k, v) in vars {
             unsafe { std::env::set_var(k, v) };
@@ -442,7 +645,9 @@ mod tests {
     #[test]
     fn le_mode_par_defaut_est_le_certificat() {
         assert_eq!(config().credential_mode, CredentialMode::Certificate);
-        assert_eq!(mode_from_env().unwrap(), CredentialMode::Certificate);
+        with_env(&[], || {
+            assert_eq!(mode_from_env().unwrap(), CredentialMode::Certificate);
+        });
     }
 
     #[test]
@@ -464,6 +669,167 @@ mod tests {
         let mut c = config();
         c.credential_mode = CredentialMode::Oidc;
         assert!(c.validated().is_ok());
+    }
+
+    fn ldap() -> LdapConfig {
+        LdapConfig {
+            url: "ldaps://dc01.example.com:636".to_string(),
+            start_tls: false,
+            bind_dn: None,
+            bind_password: None,
+            user_search_base: "ou=users,dc=example,dc=com".to_string(),
+            attributes: LdapProfile::ActiveDirectory.attributes(),
+            group_mappings: GroupMappings::parse(
+                r#"[{"dn": "cn=k8s-admins,dc=example,dc=com", "group": "admins"}]"#,
+            )
+            .unwrap(),
+            ca_file: None,
+            timeout: DEFAULT_LDAP_TIMEOUT,
+            resync: DEFAULT_LDAP_RESYNC,
+        }
+    }
+
+    /// Un déploiement qui ne dit rien garde ses comptes locaux : basculer sur un annuaire est
+    /// un geste d'exploitation, jamais un effet de bord d'une montée de version.
+    #[test]
+    fn le_mode_d_authentification_par_defaut_est_local() {
+        assert_eq!(config().auth_mode, AuthMode::Local);
+
+        // Sous le verrou, sans rien poser : lire l'environnement hors verrou reviendrait à le
+        // lire pendant qu'un autre test y écrit son propre mode.
+        with_env(&[], || {
+            assert_eq!(auth_mode_from_env().unwrap(), AuthMode::Local);
+        });
+    }
+
+    /// Le test le plus important du module. Un bind simple présente le mot de passe en clair :
+    /// démarrer sans TLS publierait chaque mot de passe d'entreprise sur le réseau.
+    #[test]
+    fn un_annuaire_en_clair_empeche_le_demarrage() {
+        let mut c = config();
+        c.auth_mode = AuthMode::Ldap;
+        c.ldap = Some(LdapConfig {
+            url: "ldap://dc01.example.com:389".to_string(),
+            ..ldap()
+        });
+        assert!(c.validated().is_err());
+
+        // Le même annuaire en clair, mais avec StartTLS : le chiffrement est négocié après
+        // l'ouverture, avant le bind. C'est légitime.
+        let mut c = config();
+        c.auth_mode = AuthMode::Ldap;
+        c.ldap = Some(LdapConfig {
+            url: "ldap://dc01.example.com:389".to_string(),
+            start_tls: true,
+            ..ldap()
+        });
+        assert!(c.validated().is_ok());
+    }
+
+    /// StartTLS négocie le chiffrement sur une connexion en clair. Le demander sur une racine
+    /// déjà chiffrée décrit une intention contradictoire, et l'accepter laisserait croire à une
+    /// double protection qui n'existe pas.
+    #[test]
+    fn starttls_sur_ldaps_est_contradictoire() {
+        let mut c = config();
+        c.auth_mode = AuthMode::Ldap;
+        c.ldap = Some(LdapConfig {
+            start_tls: true,
+            ..ldap()
+        });
+        assert!(c.validated().is_err());
+    }
+
+    /// Sans correspondance de groupe, un compte fédéré se connecte et n'obtient rien. C'est
+    /// presque toujours un oubli, et il ne se voit qu'au premier `kubectl` refusé.
+    #[test]
+    fn un_annuaire_sans_correspondance_empeche_le_demarrage() {
+        let mut c = config();
+        c.auth_mode = AuthMode::Ldap;
+        c.ldap = Some(LdapConfig {
+            group_mappings: GroupMappings::default(),
+            ..ldap()
+        });
+        assert!(c.validated().is_err());
+    }
+
+    /// Le mode commande, pas la présence des variables : un déploiement repassé en local ne
+    /// doit plus joindre l'annuaire, même si ses variables sont restées en place.
+    #[test]
+    fn le_mode_local_ignore_une_configuration_ldap_residuelle() {
+        with_env(
+            &[
+                ("KDT_IDENTITY_LDAP_URL", "ldaps://dc01.example.com:636"),
+                ("KDT_IDENTITY_LDAP_PROFILE", "activedirectory"),
+            ],
+            || {
+                assert!(ldap_from_env().unwrap().is_none());
+            },
+        );
+    }
+
+    /// Un mode ldap sans URL ne doit pas démarrer : le portail répondrait à des connexions
+    /// qu'il n'a aucun moyen de vérifier.
+    #[test]
+    fn le_mode_ldap_exige_de_quoi_joindre_l_annuaire() {
+        with_env(&[("KDT_IDENTITY_AUTH_MODE", "ldap")], || {
+            assert!(ldap_from_env().is_err());
+        });
+
+        with_env(
+            &[
+                ("KDT_IDENTITY_AUTH_MODE", "ldap"),
+                ("KDT_IDENTITY_LDAP_PROFILE", "freeipa"),
+                ("KDT_IDENTITY_LDAP_URL", "ldaps://ipa.example.com:636"),
+            ],
+            || {
+                // La racine de recherche manque encore.
+                assert!(ldap_from_env().is_err());
+            },
+        );
+    }
+
+    /// Un schéma peut être celui d'Active Directory à un attribut près. Devoir alors tout
+    /// redéclarer serait une invitation à se tromper sur les autres.
+    #[test]
+    fn un_attribut_se_surcharge_sans_toucher_aux_autres() {
+        with_env(
+            &[
+                ("KDT_IDENTITY_AUTH_MODE", "ldap"),
+                ("KDT_IDENTITY_LDAP_PROFILE", "activedirectory"),
+                ("KDT_IDENTITY_LDAP_URL", "ldaps://dc01.example.com:636"),
+                ("KDT_IDENTITY_LDAP_USER_SEARCH_BASE", "dc=example,dc=com"),
+                ("KDT_IDENTITY_LDAP_LOGIN_ATTR", "userPrincipalName"),
+                (
+                    "KDT_IDENTITY_LDAP_GROUP_MAPPINGS",
+                    r#"[{"dn":"cn=a,dc=x","group":"admins"}]"#,
+                ),
+            ],
+            || {
+                let ldap = ldap_from_env().unwrap().unwrap();
+                assert_eq!(ldap.attributes.login, "userPrincipalName");
+                assert_eq!(ldap.attributes.member_of, "memberOf");
+                assert_eq!(ldap.attributes.display, "displayName");
+            },
+        );
+    }
+
+    /// Un DN de service sans mot de passe produit un bind qui échoue à la première connexion,
+    /// et l'inverse ignore silencieusement le mot de passe fourni.
+    #[test]
+    fn un_compte_de_service_incomplet_empeche_le_demarrage() {
+        with_env(
+            &[
+                ("KDT_IDENTITY_AUTH_MODE", "ldap"),
+                ("KDT_IDENTITY_LDAP_PROFILE", "activedirectory"),
+                ("KDT_IDENTITY_LDAP_URL", "ldaps://dc01.example.com:636"),
+                ("KDT_IDENTITY_LDAP_USER_SEARCH_BASE", "dc=example,dc=com"),
+                ("KDT_IDENTITY_LDAP_BIND_DN", "cn=svc,dc=example,dc=com"),
+            ],
+            || {
+                assert!(ldap_from_env().is_err());
+            },
+        );
     }
 
     /// En mode certificat, l'émetteur ne sert qu'aux liens d'activation : rien n'impose HTTPS

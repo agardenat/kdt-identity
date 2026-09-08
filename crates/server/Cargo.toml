@@ -36,6 +36,10 @@ getrandom = "0.4.3"
 subtle = "2.6.1"
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "pool", "rustls-native-certs", "rustls-tls", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
 hmac = "0.13"
+# `default-features = false` écarte `sync` et surtout `tls`, qui tirerait native-tls et donc
+# openssl. `tls-rustls-ring` reprend la pile déjà en place — rustls 0.23 sur ring — et laisse
+# l'application installer le provider, ce que fait `install_crypto_provider()`.
+ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 axum = "0.8"
 maud = "0.27"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }

@@ -49,13 +49,22 @@ pub fn resolve_members(group: &KdtGroup, users: &[KdtUser]) -> (Vec<String>, Vec
 /// `has_credentials` traduit la présence d'un mot de passe défini. Tant que la gestion des
 /// credentials n'est pas en place, il vaut toujours `false` et l'utilisateur reste `Pending` :
 /// c'est correct, il n'a effectivement pas encore de moyen de se connecter au portail.
+///
+/// Un compte fédéré, lui, n'aura **jamais** de credentials locaux : son mot de passe vit dans
+/// l'annuaire. Le laisser suivre la règle générale le figerait en `Pending`, où
+/// [`may_request_own_credential`] refuse toute émission — c'est-à-dire un compte qui se connecte
+/// au portail et n'obtient jamais rien.
+///
+/// La distinction se lit sur le label, non sur le mode du déploiement : un cluster peut porter
+/// les deux populations, et une bascule de mode ne doit pas rendre `Active` d'anciens comptes
+/// locaux jamais activés.
 pub fn phase(user: &KdtUser, has_credentials: bool) -> UserPhase {
     // `disabled` prime sur tout le reste : c'est le geste d'un admin qui coupe un accès, il ne
     // doit jamais être masqué par un autre état.
     if user.spec.disabled {
         return UserPhase::Disabled;
     }
-    if has_credentials {
+    if has_credentials || crate::ldap::provision::is_federated(user) {
         UserPhase::Active
     } else {
         UserPhase::Pending

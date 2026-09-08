@@ -57,4 +57,13 @@ spec:
         - port: {{ .Values.smtp.port }}
           protocol: TCP
     {{- end }}
+    {{- if eq .Values.authMode "ldap" }}
+    {{- /*
+      L'annuaire. Le port est tiré de l'URL : 636 pour ldaps://, 389 sinon — StartTLS négociant
+      le chiffrement sur le port en clair. Un port explicite dans l'URL prime sur les deux.
+    */}}
+    - ports:
+        - port: {{ regexFind ":[0-9]+$" .Values.ldap.url | trimPrefix ":" | default (ternary "636" "389" (hasPrefix "ldaps://" .Values.ldap.url)) }}
+          protocol: TCP
+    {{- end }}
 {{- end }}

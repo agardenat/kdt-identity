@@ -75,6 +75,73 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 - name: KDT_IDENTITY_OIDC_TOKEN_TTL
   value: {{ .Values.oidc.tokenTtl | quote }}
 {{- end }}
+{{- /*
+  Le mode d'authentification est orthogonal au mode de délivrance : le premier dit qui reconnaît
+  la personne, le second ce qu'on lui remet. Les quatre combinaisons sont valides.
+*/}}
+- name: KDT_IDENTITY_AUTH_MODE
+  value: {{ .Values.authMode | quote }}
+{{- if eq .Values.authMode "ldap" }}
+- name: KDT_IDENTITY_LDAP_PROFILE
+  value: {{ .Values.ldap.profile | quote }}
+- name: KDT_IDENTITY_LDAP_URL
+  value: {{ required "ldap.url est obligatoire en authMode=ldap" .Values.ldap.url | quote }}
+- name: KDT_IDENTITY_LDAP_START_TLS
+  value: {{ .Values.ldap.startTls | quote }}
+- name: KDT_IDENTITY_LDAP_USER_SEARCH_BASE
+  value: {{ required "ldap.userSearchBase est obligatoire en authMode=ldap" .Values.ldap.userSearchBase | quote }}
+- name: KDT_IDENTITY_LDAP_TIMEOUT
+  value: {{ .Values.ldap.timeout | quote }}
+- name: KDT_IDENTITY_LDAP_RESYNC
+  value: {{ .Values.ldap.resync | quote }}
+{{- /*
+  La table de correspondance voyage en JSON : c'est la seule forme qu'une variable
+  d'environnement puisse porter sans ambiguïté, et `toJson` échappe pour nous ce que des DN
+  pleins de virgules et d'égals mettraient à mal.
+*/}}
+- name: KDT_IDENTITY_LDAP_GROUP_MAPPINGS
+  value: {{ .Values.ldap.groupMappings | toJson | quote }}
+{{- /*
+  Les attributs ne sont posés que s'ils sont surchargés : une variable vide vaut une variable
+  absente côté serveur, qui reprend alors le défaut du profil.
+*/}}
+{{- range $var, $value := dict "LOGIN_ATTR" .Values.ldap.userLoginAttribute "EMAIL_ATTR" .Values.ldap.userEmailAttribute "DISPLAY_ATTR" .Values.ldap.userDisplayAttribute "MEMBER_ATTR" .Values.ldap.groupMemberAttribute "OBJECT_CLASS" .Values.ldap.userObjectClass }}
+{{- if $value }}
+- name: KDT_IDENTITY_LDAP_{{ $var }}
+  value: {{ $value | quote }}
+{{- end }}
+{{- end }}
+{{- if $.Values.ldap.caCert }}
+- name: KDT_IDENTITY_LDAP_CA_FILE
+  value: /etc/kdt-identity/ldap/ca.crt
+- name: KDT_IDENTITY_RUNTIME_DIR
+  value: /run/kdt-identity
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+  Volumes de la CA de l'annuaire. Les deux seuls du chart, et ils n'existent qu'en authMode=ldap.
+
+  Deux volumes et non un : la CA arrive en lecture seule depuis un ConfigMap, mais le magasin
+  assemblé — celui de l'image plus celle-ci — doit être écrit au démarrage, et la racine du
+  conteneur est en lecture seule.
+*/}}
+{{- define "kdt-identity.ldapVolumes" -}}
+- name: ldap-ca
+  configMap:
+    name: {{ include "kdt-identity.fullname" . }}-ldap-ca
+- name: runtime
+  emptyDir:
+    medium: Memory
+{{- end -}}
+
+{{- define "kdt-identity.ldapVolumeMounts" -}}
+- name: ldap-ca
+  mountPath: /etc/kdt-identity/ldap
+  readOnly: true
+- name: runtime
+  mountPath: /run/kdt-identity
 {{- end -}}
 
 {{/*
@@ -97,6 +164,53 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if .Values.webUrl -}}
 {{- if and (not (hasPrefix "https://" .Values.webUrl)) (not (hasPrefix "http://localhost" .Values.webUrl)) (not (hasPrefix "http://127.0.0.1" .Values.webUrl)) -}}
 {{- fail "webUrl doit être en https : un code d'autorisation s'échange contre un droit de session, il n'a pas à voyager en clair" -}}
+{{- end -}}
+{{- end -}}
+{{- if not (has .Values.authMode (list "local" "ldap")) -}}
+{{- fail (printf "authMode vaut %q : attendu local ou ldap" .Values.authMode) -}}
+{{- end -}}
+{{- if eq .Values.authMode "ldap" -}}
+{{- if not (has .Values.ldap.profile (list "activedirectory" "freeipa")) -}}
+{{- fail (printf "ldap.profile vaut %q : attendu activedirectory ou freeipa" .Values.ldap.profile) -}}
+{{- end -}}
+{{- /*
+  Un bind simple présente le mot de passe en clair dans la requête : c'est le protocole. Sans
+  TLS, tout ce qui se trouve entre le portail et l'annuaire lit chaque mot de passe d'entreprise
+  qui passe. Refusé au rendu, et pas seulement au démarrage : mieux vaut que `helm upgrade`
+  échoue que de devoir lire les journaux d'un pod en CrashLoop.
+*/}}
+{{- if and (not (hasPrefix "ldaps://" .Values.ldap.url)) (not .Values.ldap.startTls) -}}
+{{- fail (printf "ldap.url vaut %q sans startTls : un bind présente le mot de passe en clair, exigez ldaps:// ou activez StartTLS" .Values.ldap.url) -}}
+{{- end -}}
+{{- if and (hasPrefix "ldaps://" .Values.ldap.url) .Values.ldap.startTls -}}
+{{- fail "ldap.startTls sur une racine ldaps:// : StartTLS négocie le chiffrement sur une connexion en clair, il n'a pas de sens sur une connexion déjà chiffrée" -}}
+{{- end -}}
+{{- if not .Values.ldap.groupMappings -}}
+{{- fail "ldap.groupMappings est vide : les comptes fédérés se connecteraient sans obtenir le moindre groupe, donc le moindre droit" -}}
+{{- end -}}
+{{- /*
+  Le nom de groupe doit satisfaire le même langage que la ValidatingAdmissionPolicy, sinon le
+  KdtGroup est refusé par l'apiserver — à la première connexion, du côté de la personne qui se
+  connecte plutôt que de celle qui a écrit la table.
+*/}}
+{{- range .Values.ldap.groupMappings -}}
+{{- if not .dn -}}
+{{- fail "chaque entrée de ldap.groupMappings doit porter un dn" -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$" (.group | default "")) -}}
+{{- fail (printf "ldap.groupMappings : le groupe %q n'est pas un nom de ressource valide (minuscules, chiffres, - et ., 60 caractères au plus)" (.group | default "")) -}}
+{{- end -}}
+{{- if gt (len .group) 60 -}}
+{{- fail (printf "ldap.groupMappings : le groupe %q dépasse 60 caractères" .group) -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+  FreeIPA émet toujours depuis sa propre CA, Active Directory presque toujours. Sans CA
+  déclarée, le magasin de l'image est le seul en vigueur et le handshake échouera — ce qui se
+  lit comme une panne réseau plutôt que comme une configuration incomplète.
+*/}}
+{{- if and (not .Values.ldap.caCert) (not (eq .Values.ldap.skipCaCheck true)) -}}
+{{- fail "ldap.caCert est vide : un annuaire d'entreprise émet presque toujours depuis sa propre autorité, et le magasin de l'image ne la contient pas. Renseignez-la, ou posez ldap.skipCaCheck=true si votre annuaire présente un certificat issu d'une autorité publique" -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

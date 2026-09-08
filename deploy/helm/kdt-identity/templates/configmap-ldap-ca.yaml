@@ -1,0 +1,23 @@
+{{- if and (eq .Values.authMode "ldap") .Values.ldap.caCert }}
+{{/*
+  L'autorité qui a émis le certificat de l'annuaire.
+
+  Dans un ConfigMap et non un Secret : une CA est publique par construction, c'est ce qu'on
+  distribue pour être vérifié. La ranger dans un Secret suggérerait le contraire à qui lit le
+  chart.
+
+  Elle est montée seule, et le serveur assemble au démarrage un magasin qui la réunit à celui de
+  l'image. La bibliothèque LDAP n'offre en effet aucun moyen de recevoir une autorité pour la
+  seule connexion à l'annuaire : elle s'en remet à SSL_CERT_FILE, qui vaut pour le processus
+  entier et *remplace* le magasin natif au lieu de s'y ajouter.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kdt-identity.fullname" . }}-ldap-ca
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "kdt-identity.labels" . | nindent 4 }}
+data:
+  ca.crt: |
+{{ .Values.ldap.caCert | indent 4 }}
+{{- end }}

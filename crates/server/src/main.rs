@@ -1,7 +1,7 @@
 use anyhow::{bail, Context as _};
 use clap::{Parser, Subcommand};
 use kdt_identity_api::naming::Subject;
-use kdt_identity_api::portal::CredentialMode;
+use kdt_identity_api::portal::{AuthMode, CredentialMode};
 use kdt_identity_api::{KdtGroup, KdtUser};
 use kdt_identity_server::auth;
 use kdt_identity_server::config::{parse_duration, ServerConfig};
@@ -122,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     kdt_identity_server::install_crypto_provider();
+    install_directory_trust()?;
 
     let cli = Cli::parse();
     let context = cli.context.as_deref();
@@ -142,6 +143,46 @@ async fn main() -> anyhow::Result<()> {
         Command::Issue { user, ttl } => issue(&user, ttl, context).await?,
         Command::Revoke { user } => revoke(&user, context).await?,
     }
+    Ok(())
+}
+
+/// Ajoute la CA de l'annuaire au magasin de confiance, avant toute connexion.
+///
+/// Lue directement dans l'environnement plutôt que depuis [`ServerConfig`] : la configuration
+/// n'est construite que dans les sous-commandes, alors que la variable `SSL_CERT_FILE` doit être
+/// posée avant que quoi que ce soit n'ouvre une connexion TLS — y compris le client Kubernetes.
+///
+/// Sans CA déclarée, rien n'est touché : le magasin de la plateforme reste celui qui sert.
+fn install_directory_trust() -> anyhow::Result<()> {
+    let Ok(ca_file) = std::env::var("KDT_IDENTITY_LDAP_CA_FILE") else {
+        return Ok(());
+    };
+    if ca_file.trim().is_empty() {
+        return Ok(());
+    }
+
+    let runtime_dir = std::env::var("KDT_IDENTITY_RUNTIME_DIR")
+        .unwrap_or_else(|_| kdt_identity_server::ldap::trust::RUNTIME_DIR.to_string());
+
+    // Avertir, et non échouer : un magasin réduit à la seule CA de l'annuaire reste utilisable
+    // pour l'annuaire, et refuser de démarrer punirait un déploiement qui n'envoie aucun
+    // courriel. Mais le silence, lui, serait un piège — le premier envoi échouerait sans que
+    // rien ne rattache la panne à ce choix.
+    if !kdt_identity_server::ldap::trust::image_store_present() {
+        tracing::warn!(
+            magasin = kdt_identity_server::config::IMAGE_CA_BUNDLE,
+            "magasin d'autorités de l'image absent : le magasin assemblé ne portera que la CA \
+             de l'annuaire, et le TLS sortant vers d'autres services échouera"
+        );
+    }
+
+    let bundle = kdt_identity_server::ldap::trust::install(
+        std::path::Path::new(&ca_file),
+        std::path::Path::new(&runtime_dir),
+    )
+    .context("magasin de confiance de l'annuaire")?;
+
+    tracing::info!(magasin = %bundle.display(), "CA de l'annuaire ajoutée au magasin");
     Ok(())
 }
 
@@ -212,8 +253,18 @@ async fn serve(context: Option<&str>) -> anyhow::Result<()> {
         cluster = %config.cluster_name,
         apiserver = %endpoint.server,
         mode = %config.credential_mode,
+        authentification = %config.auth_mode,
         "portail démarré"
     );
+
+    if let Some(ldap) = &config.ldap {
+        tracing::info!(
+            annuaire = %ldap.url,
+            racine = %ldap.user_search_base,
+            groupes = ldap.group_mappings.managed_groups().len(),
+            "fédération d'identité active"
+        );
+    }
 
     let state = web::state(client, config, endpoint, signer, oidc);
     axum::serve(listener, web::router(state))
@@ -234,6 +285,17 @@ async fn invite(
     context: Option<&str>,
 ) -> anyhow::Result<()> {
     let config = ServerConfig::from_env().context("configuration")?;
+
+    // En mode ldap, l'invitation n'a plus d'objet : il n'y a ni mot de passe à poser ni TOTP à
+    // enrôler, et le portail ne sert même pas la page d'activation. Écrire l'invitation quand
+    // même produirait un lien qui mène à un 404.
+    if config.auth_mode == AuthMode::Ldap {
+        bail!(
+            "le mode d'authentification est ldap : les comptes sont créés à la première \
+             connexion réussie contre l'annuaire, il n'y a pas d'invitation à envoyer"
+        );
+    }
+
     let client = cluster_client(context).await?;
 
     let users: Api<KdtUser> = Api::all(client.clone());

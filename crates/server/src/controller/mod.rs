@@ -6,6 +6,7 @@
 //! déclenche un nouvel évènement et le contrôleur tourne en boucle sur lui-même.
 
 pub mod logic;
+pub mod resync;
 
 use crate::auth::store::{self, CredentialStore};
 use crate::config::ServerConfig;
@@ -85,6 +86,16 @@ pub async fn run(client: Client, config: ServerConfig) {
     // déjà en attente, en empiler un second ne changerait rien puisque la réconciliation qui
     // suivra lira l'état courant de toute façon. Les rafales se fondent ainsi en un seul
     // passage.
+    // La relecture de l'annuaire vit à côté des deux contrôleurs, pas dedans : elle est
+    // périodique et non événementielle, et la placer dans `reconcile_user` la ferait partir à
+    // chaque écriture de statut — donc bien plus souvent que nécessaire, et sur l'annuaire.
+    if let Some(ldap) = config.ldap.clone() {
+        let directory = Arc::new(crate::ldap::Directory::new(ldap));
+        let users = ctx.users.clone();
+        let groups = ctx.groups.clone();
+        tokio::spawn(async move { resync::run(users, groups, directory).await });
+    }
+
     let (mut tx, on_user_change) = futures::channel::mpsc::channel::<()>(1);
     let watched_users = ctx.users.clone();
     tokio::spawn(async move {

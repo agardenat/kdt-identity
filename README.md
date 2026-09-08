@@ -15,13 +15,18 @@ Compagnon de [kdt](https://github.com/agardenat/kdt).
 > passe et TOTP, puis obtenir un accès que le plugin renouvelle tout seul et qu'un
 > administrateur peut révoquer. Deux modes de délivrance — certificat ou OIDC — éprouvés
 > contre un apiserver réel. Chart Helm et image fournis.
+>
+> Les comptes peuvent aussi venir d'un annuaire Active Directory ou FreeIPA
+> (`authMode: ldap`) : le `KdtUser` est alors créé à la première connexion réussie et
+> l'appartenance reportée depuis les groupes de l'annuaire.
 
 | Guide | Pour qui |
 | --- | --- |
-| [Les deux modes](docs/modes.md) | choisir, vérifier la compatibilité de son cluster, basculer |
+| [Les modes](docs/modes.md) | choisir, vérifier la compatibilité de son cluster, basculer |
 | [Le plugin](docs/plugin.md) | postes de travail : installation, cycle de vie, dépannage |
 | [Administration](docs/administration.md) | comptes, groupes, révocation, droits RBAC |
 | [Mode OIDC](docs/oidc.md) | configurer l'apiserver |
+| [Mode LDAP](docs/ldap.md) | fédérer les comptes sur un annuaire Active Directory ou FreeIPA |
 
 ## Ce que ça fait
 
@@ -265,8 +270,11 @@ accepte. kdt-identity **ne modifie rien de l'existant** : ni drapeaux de l'apise
 configuration d'authentification, ni webhook. Il ajoute des CRDs dans son propre groupe d'API,
 un contrôleur, et des CSR éphémères supprimées après émission.
 
-Rancher, Entra ID, Keycloak, authentik continuent de fonctionner à l'identique. Deux précautions
-sont prises pour que la cohabitation reste lisible :
+Rancher, Entra ID, Keycloak, authentik continuent de fonctionner à l'identique. Cela vaut aussi
+en `authMode: ldap` : kdt-identity **lit** l'annuaire, ne lui écrit jamais rien, et n'intervient
+pas dans la façon dont un autre composant s'y authentifie.
+
+Deux précautions sont prises pour que la cohabitation reste lisible :
 
 | Risque | Ce qui est fait |
 |---|---|
