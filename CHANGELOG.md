@@ -8,7 +8,7 @@ tag `v<version>` qui a déclenché sa publication.
 Les notes de version publiées avec un tag sont la section correspondante de ce fichier, extraite
 par `packaging/changelog-section.sh` : ce fichier est la source, pas une copie.
 
-## [1.2.0] — non publiée
+## [1.2.0] — 2026-09-08
 
 - **feat(server)** — **fédération d'identité sur un annuaire LDAP(S)**, Active Directory ou
   FreeIPA. `authMode: ldap` fait de l'annuaire la source des identités : le mot de passe y est
