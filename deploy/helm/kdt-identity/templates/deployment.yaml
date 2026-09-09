@@ -9,6 +9,15 @@
 */}}
 {{- $ldapSecret := and (eq .Values.authMode "ldap") .Values.ldap.existingSecret -}}
 {{- $ldapCa := and (eq .Values.authMode "ldap") .Values.ldap.caCert -}}
+{{- /*
+  Le fournisseur d'identité suit la même règle, et pour les mêmes raisons : le secret
+  d'application sert au portail — pour l'échange du code — comme au contrôleur, qui relit
+  l'appartenance sans que personne ne se connecte.
+*/}}
+{{- $oidcSecret := and (eq .Values.authMode "oidc") .Values.oidcAuth.existingSecret -}}
+{{- $oidcCa := and (eq .Values.authMode "oidc") .Values.oidcAuth.caCert -}}
+{{- $secretRef := or $ldapSecret $oidcSecret -}}
+{{- $caMount := or $ldapCa $oidcCa -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,17 +45,21 @@ spec:
           args: ["controller"]
           securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
           env: {{- include "kdt-identity.env" . | nindent 12 }}
-          {{- if $ldapSecret }}
+          {{- if $secretRef }}
           envFrom:
             - secretRef:
-                name: {{ .Values.ldap.existingSecret }}
+                name: {{ $secretRef }}
           {{- end }}
-          {{- if $ldapCa }}
-          volumeMounts: {{- include "kdt-identity.ldapVolumeMounts" . | nindent 12 }}
+          {{- if $caMount }}
+          volumeMounts:
+            {{- if $ldapCa }}{{- include "kdt-identity.ldapVolumeMounts" . | nindent 12 }}{{- end }}
+            {{- if $oidcCa }}{{- include "kdt-identity.oidcVolumeMounts" . | nindent 12 }}{{- end }}
           {{- end }}
           resources: {{- toYaml .Values.controller.resources | nindent 12 }}
-      {{- if $ldapCa }}
-      volumes: {{- include "kdt-identity.ldapVolumes" . | nindent 8 }}
+      {{- if $caMount }}
+      volumes:
+        {{- if $ldapCa }}{{- include "kdt-identity.ldapVolumes" . | nindent 8 }}{{- end }}
+        {{- if $oidcCa }}{{- include "kdt-identity.oidcVolumes" . | nindent 8 }}{{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
@@ -107,19 +120,21 @@ spec:
               value: {{ .Values.smtp.encryption | quote }}
             {{- end }}
           {{- $smtpSecret := and .Values.smtp.enabled .Values.smtp.existingSecret }}
-          {{- if or $smtpSecret $ldapSecret }}
+          {{- if or $smtpSecret $secretRef }}
           envFrom:
             {{- if $smtpSecret }}
             - secretRef:
                 name: {{ .Values.smtp.existingSecret }}
             {{- end }}
-            {{- if $ldapSecret }}
+            {{- if $secretRef }}
             - secretRef:
-                name: {{ .Values.ldap.existingSecret }}
+                name: {{ $secretRef }}
             {{- end }}
           {{- end }}
-          {{- if $ldapCa }}
-          volumeMounts: {{- include "kdt-identity.ldapVolumeMounts" . | nindent 12 }}
+          {{- if $caMount }}
+          volumeMounts:
+            {{- if $ldapCa }}{{- include "kdt-identity.ldapVolumeMounts" . | nindent 12 }}{{- end }}
+            {{- if $oidcCa }}{{- include "kdt-identity.oidcVolumeMounts" . | nindent 12 }}{{- end }}
           {{- end }}
           # `/healthz` ne touche ni au cluster ni aux Secrets : une sonde qui authentifierait
           # ferait échouer le pod dès que l'apiserver hoquette.
@@ -130,8 +145,10 @@ spec:
             httpGet: {path: /healthz, port: http}
             periodSeconds: 10
           resources: {{- toYaml .Values.portal.resources | nindent 12 }}
-      {{- if $ldapCa }}
-      volumes: {{- include "kdt-identity.ldapVolumes" . | nindent 8 }}
+      {{- if $caMount }}
+      volumes:
+        {{- if $ldapCa }}{{- include "kdt-identity.ldapVolumes" . | nindent 8 }}{{- end }}
+        {{- if $oidcCa }}{{- include "kdt-identity.oidcVolumes" . | nindent 8 }}{{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}

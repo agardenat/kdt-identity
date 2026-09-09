@@ -1,96 +1,116 @@
-//! Relecture périodique de l'annuaire.
+//! Relecture périodique de la source d'identité.
 //!
 //! Une connexion ne renseigne que la personne qui se connecte. Sans cette boucle, un retrait de
-//! groupe côté annuaire n'aurait d'effet qu'à sa prochaine saisie de mot de passe — et comme le
-//! renouvellement silencieux ne rebinde jamais, cela peut vouloir dire une semaine entière avec
-//! des droits qu'elle n'a plus.
+//! groupe fait chez la source n'aurait d'effet qu'à sa prochaine connexion interactive — et comme
+//! le renouvellement silencieux ne rebinde ni ne repasse jamais par le fournisseur, cela peut
+//! vouloir dire une semaine entière avec des droits qu'elle n'a plus.
 //!
 //! # La règle qui gouverne tout ce module
 //!
-//! Une panne d'annuaire n'est pas une disparition de comptes. Un `Ok(None)` sur une entrée dit
-//! qu'elle a été supprimée ; une erreur ne dit rien du tout. Confondre les deux désactiverait
+//! Une panne de la source n'est pas une disparition de comptes. Un `Ok(None)` sur une personne dit
+//! qu'elle n'a plus d'accès ; une erreur ne dit rien du tout. Confondre les deux désactiverait
 //! tous les comptes du cluster à la première coupure réseau, et la coupure survivrait alors très
 //! largement à sa propre résolution.
+//!
+//! # Une seule boucle pour les deux sources
+//!
+//! Ce qui change d'un annuaire à un fournisseur — comment on interroge, par quoi on désigne une
+//! personne — vit derrière [`Federated`]. Ce qui ne change pas est ici : la règle ci-dessus, le
+//! refus de réactiver ce qu'un administrateur a désactivé, et l'abandon du tour dès que la source
+//! se dérobe.
 
-use crate::ldap::{provision, Directory, LdapError};
+use crate::federation::{provision, Error, Federated};
 use kdt_identity_api::{KdtGroup, KdtUser};
 use kube::api::{Api, ListParams};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Sélecteur des comptes que l'annuaire gouverne.
-fn federated() -> ListParams {
-    ListParams::default().labels(&format!(
-        "{}={}",
-        provision::SOURCE_LABEL,
-        provision::SOURCE_LDAP
-    ))
-}
-
 /// Boucle jusqu'à l'arrêt du processus.
-pub async fn run(users: Api<KdtUser>, groups: Api<KdtGroup>, directory: Arc<Directory>) {
-    let interval = directory.config().resync;
-    info!(intervalle = ?interval, "relecture périodique de l'annuaire");
+pub async fn run<F: Federated + 'static>(
+    users: Api<KdtUser>,
+    groups: Api<KdtGroup>,
+    source: Arc<F>,
+) {
+    let interval = source.interval();
+    info!(
+        source = %source.source(),
+        intervalle = ?interval,
+        "relecture périodique de la source d'identité"
+    );
 
     loop {
         tokio::time::sleep(interval).await;
-        if let Err(e) = pass(&users, &groups, &directory).await {
-            warn!(erreur = %e, "relecture de l'annuaire abandonnée pour ce tour");
+        if let Err(e) = pass(&users, &groups, source.as_ref()).await {
+            warn!(
+                source = %source.source(),
+                erreur = %e,
+                "relecture abandonnée pour ce tour"
+            );
         }
     }
 }
 
 /// Un tour complet.
 ///
-/// Rend une erreur dès que l'annuaire se dérobe, sans traiter les comptes suivants : après une
-/// panne, la seule chose qu'on sache est qu'on ne sait rien, et poursuivre reviendrait à
-/// prendre cette ignorance pour de l'information.
-async fn pass(
+/// Rend une erreur dès que la source se dérobe, sans traiter les comptes suivants : après une
+/// panne, la seule chose qu'on sache est qu'on ne sait rien, et poursuivre reviendrait à prendre
+/// cette ignorance pour de l'information.
+async fn pass<F: Federated>(
     users: &Api<KdtUser>,
     groups: &Api<KdtGroup>,
-    directory: &Directory,
-) -> Result<(), LdapError> {
-    let comptes = users
-        .list(&federated())
-        .await
-        .map_err(|e| LdapError::Cluster(format!("liste des comptes fédérés : {e}")))?;
+    source: &F,
+) -> Result<(), Error> {
+    let kind = source.source();
+    let selector = ListParams::default().labels(&format!(
+        "{}={}",
+        provision::SOURCE_LABEL,
+        kind.label()
+    ));
 
-    let mappings = &directory.config().group_mappings;
+    let comptes = users
+        .list(&selector)
+        .await
+        .map_err(|e| Error::Cluster(format!("liste des comptes fédérés : {e}")))?;
+
+    let mappings = source.mappings();
     let managed = mappings.managed_groups();
 
     for user in comptes {
-        let (Some(name), Some(dn)) = (user.metadata.name.clone(), provision::recorded_dn(&user))
-        else {
-            // Un compte marqué comme fédéré mais sans DN épinglé n'est rattachable à rien. Le
-            // signaler suffit : c'est une anomalie d'exploitation, pas un état à corriger
+        let (Some(name), Some(pin)) = (
+            user.metadata.name.clone(),
+            provision::recorded_pin(&user, kind),
+        ) else {
+            // Un compte marqué comme fédéré mais sans valeur épinglée n'est rattachable à rien.
+            // Le signaler suffit : c'est une anomalie d'exploitation, pas un état à corriger
             // d'office.
             warn!(
                 compte = ?user.metadata.name,
-                "compte fédéré sans DN épinglé, laissé tel quel"
+                source = %kind,
+                "compte fédéré sans identité épinglée, laissé tel quel"
             );
             continue;
         };
 
-        match directory.lookup_dn(dn).await {
-            Ok(Some(directory_user)) => {
+        match source.lookup_groups(pin).await {
+            Ok(Some(member_of)) => {
                 if user.spec.disabled {
                     // Réactiver serait défaire le geste d'un administrateur : `spec.disabled`
-                    // peut avoir été posé à la main pour couper un accès, et l'annuaire n'a pas
+                    // peut avoir été posé à la main pour couper un accès, et la source n'a pas
                     // à en décider.
                     continue;
                 }
-                let wanted = mappings.resolve(&directory_user.member_of);
-                provision::sync_groups(groups, &name, &wanted, &managed).await?;
+                let wanted = mappings.resolve(&member_of);
+                provision::sync_groups(groups, &name, &wanted, &managed, kind).await?;
             }
             Ok(None) => {
                 if !user.spec.disabled {
-                    provision::disable(users, &name).await?;
+                    provision::disable(users, &name, kind).await?;
                 }
             }
-            // Une entrée devenue illisible ne justifie pas d'abandonner le tour : c'est un
-            // problème propre à ce compte, pas à l'annuaire.
-            Err(e @ LdapError::Unusable(_)) => {
-                warn!(compte = %name, erreur = %e, "entrée illisible, compte ignoré");
+            // Une identité devenue illisible ne justifie pas d'abandonner le tour : c'est un
+            // problème propre à ce compte, pas à la source.
+            Err(e @ Error::Unusable(_)) => {
+                warn!(compte = %name, erreur = %e, "identité illisible, compte ignoré");
             }
             Err(e) => return Err(e),
         }

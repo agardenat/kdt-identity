@@ -9,6 +9,7 @@
 //! redemanderait un mot de passe et un code TOTP, ce qui pousserait à allonger les durées de
 //! vie — c'est-à-dire à défaire ce que leur brièveté protège.
 
+mod browser;
 mod cache;
 
 use anyhow::{bail, Context};
@@ -45,6 +46,13 @@ enum Command {
         /// Nom du compte, sans le préfixe.
         #[arg(long)]
         user: String,
+
+        /// Ouvre la session dans le navigateur plutôt que de demander un mot de passe.
+        ///
+        /// Inutile face à un portail qui délègue à un fournisseur d'identité : il n'accepte
+        /// aucun mot de passe, et ce chemin est alors le seul, donc pris d'office.
+        #[arg(long)]
+        browser: bool,
     },
 
     /// Force une nouvelle authentification en effaçant le cache.
@@ -106,7 +114,11 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     match Cli::parse().command {
-        Command::Credential { portal, user } => credential(&portal, &user).await,
+        Command::Credential {
+            portal,
+            user,
+            browser,
+        } => credential(&portal, &user, browser).await,
         Command::Logout { portal, user } => logout(&portal, &user).await,
         Command::Kubeconfig {
             portal,
@@ -118,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn credential(portal: &str, user: &str) -> anyhow::Result<()> {
+async fn credential(portal: &str, user: &str, browser: bool) -> anyhow::Result<()> {
     let portal = portal.trim_end_matches('/');
     let path = cache::path(portal, user)?;
     let now = chrono::Utc::now();
@@ -152,19 +164,28 @@ async fn credential(portal: &str, user: &str) -> anyhow::Result<()> {
     // Ce que le portail attend se demande avant de le demander à la personne. Un portail dont
     // l'annuaire porte le second facteur n'a pas de code à recevoir, et réclamer six chiffres
     // que rien ne vérifiera n'aurait pas seulement l'air inutile : ça donnerait à croire à une
-    // authentification à deux facteurs qui n'a pas lieu.
-    let totp_required = fetch_descriptor(portal)
-        .await
-        .is_none_or(|d| d.totp_required);
+    // authentification à deux facteurs qui n'a pas lieu. Un portail qui délègue à un
+    // fournisseur, lui, n'a pas même de mot de passe à recevoir.
+    let descriptor = fetch_descriptor(portal).await;
+    let totp_required = descriptor.as_ref().is_none_or(|d| d.totp_required);
 
-    let (password, totp) = prompt_credentials(user, portal, totp_required)?;
-    let request = match &totp {
-        Some(totp) => SessionRequest::password(user, &password, totp),
-        None => SessionRequest::password_only(user, &password),
-    };
+    // Le navigateur s'impose quand le portail n'accepte plus de mot de passe, et se demande
+    // sinon. Un portail antérieur au descripteur — qui ne rend rien — garde le mot de passe :
+    // c'est le seul chemin qu'il connaisse.
+    let via_navigateur =
+        browser || descriptor.is_some_and(|d| !d.auth_mode.accepts_password());
 
-    let fresh = obtain(portal, request, None)
-    .await
+    let fresh = if via_navigateur {
+        let session = browser::open_session(portal).await?;
+        use_session(&reqwest::Client::new(), portal, user, session, None).await
+    } else {
+        let (password, totp) = prompt_credentials(user, portal, totp_required)?;
+        let request = match &totp {
+            Some(totp) => SessionRequest::password(user, &password, totp),
+            None => SessionRequest::password_only(user, &password),
+        };
+        obtain(portal, request, None).await
+    }
     .map_err(|e| match e {
         Attempt::Refused(raison) => anyhow::anyhow!("{raison}"),
         Attempt::Unreachable(e) => e,
@@ -231,8 +252,22 @@ async fn obtain(
     }
 
     let session: SessionResponse = read_json(response).await.map_err(Attempt::Unreachable)?;
+    use_session(&http, portal, &user, session, kept_refresh).await
+}
 
-    let subject = Subject::user(&user)
+/// Tire un credential utilisable d'une session déjà ouverte.
+///
+/// Commun aux deux façons d'en ouvrir une — le mot de passe présenté au portail, et l'accord
+/// donné dans le navigateur. Ce qui suit ne dépend pas de la porte d'entrée : le portail a
+/// répondu qui l'on est, et il reste à matérialiser cette identité.
+async fn use_session(
+    http: &reqwest::Client,
+    portal: &str,
+    user: &str,
+    session: SessionResponse,
+    kept_refresh: Option<&cache::CachedRefresh>,
+) -> Result<cache::CachedCredential, Attempt> {
+    let subject = Subject::user(user)
         .context("nom de compte invalide")
         .map_err(Attempt::Unreachable)?;
     if session.subject != subject.as_str() {
@@ -267,9 +302,9 @@ async fn obtain(
 
     let material = match session.mode {
         CredentialMode::Certificate => {
-            certificate(&http, portal, &subject, &groups, session.token).await
+            certificate(http, portal, &subject, &groups, session.token).await
         }
-        CredentialMode::Oidc => token(&http, portal, session.token).await,
+        CredentialMode::Oidc => token(http, portal, session.token).await,
     }
     .map_err(Attempt::Unreachable)?;
 

@@ -4,7 +4,9 @@
 //! injectées depuis un `Secret` monté par le chart, sans jamais transiter par un ConfigMap ni
 //! par un argument de ligne de commande, où `ps` les exposerait à tout le nœud.
 
-use crate::ldap::mapping::GroupMappings;
+use crate::federation::mapping::GroupMappings;
+use crate::federation::Source;
+use crate::oidc_auth::graph::GraphConfig;
 use crate::ldap::profile::{LdapAttributes, LdapProfile};
 use crate::mail::{Encryption, SmtpConfig};
 use kdt_identity_api::portal::{AuthMode, CredentialMode};
@@ -82,6 +84,51 @@ pub const DEFAULT_LDAP_RESYNC: Duration = Duration::from_secs(15 * 60);
 const LDAP_RESYNC_RANGE: (Duration, Duration) =
     (Duration::from_secs(60), Duration::from_secs(24 * 3600));
 
+/// Délai au-delà duquel le fournisseur d'identité est tenu pour injoignable.
+///
+/// Même valeur et même raison que pour l'annuaire : au-delà, c'est le retour de connexion qui
+/// reste suspendu, et une panne du fournisseur se lit comme un portail en panne.
+pub const DEFAULT_OIDC_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bornes acceptées pour ce délai.
+const OIDC_AUTH_TIMEOUT_RANGE: (Duration, Duration) =
+    (Duration::from_secs(1), Duration::from_secs(60));
+
+/// Portées demandées par défaut au fournisseur.
+///
+/// `openid` est obligatoire — sans elle il n'y a pas de jeton d'identité — et ajoutée d'office
+/// si la configuration l'oublie. Les deux autres portent le nom et l'adresse, sans lesquels le
+/// `KdtUser` ne peut pas être créé.
+pub const DEFAULT_OIDC_AUTH_SCOPES: &str = "openid profile email";
+
+/// Plafond du droit de renouveler quand rien ne relit le fournisseur.
+///
+/// Une session se renouvelle en silence, sans jamais revenir au fournisseur : sur cette durée,
+/// un retrait de groupe fait chez lui ne se voit donc pas côté cluster. Sans relecture
+/// périodique, la seule borne est celle-ci — un jour, contre sept en mode local ou ldap, où le
+/// contrôleur relit l'annuaire. Déclarer l'accès à l'API du fournisseur rétablit cette relecture,
+/// et lève du même coup ce plafond.
+pub const OIDC_AUTH_REFRESH_CEILING: Duration = Duration::from_secs(24 * 3600);
+
+/// Intervalle par défaut entre deux relectures du fournisseur.
+///
+/// Même valeur et même raison qu'en LDAP : c'est le délai maximal entre un retrait de groupe fait
+/// chez lui et sa prise d'effet ici.
+pub const DEFAULT_GRAPH_RESYNC: Duration = Duration::from_secs(15 * 60);
+
+/// Racine de l'API du fournisseur, hors clouds souverains.
+pub const DEFAULT_GRAPH_ENDPOINT: &str = "https://graph.microsoft.com";
+
+/// Racine du service de jetons, hors clouds souverains.
+pub const DEFAULT_GRAPH_AUTHORITY: &str = "https://login.microsoftonline.com";
+
+/// Claim d'épinglage exigé dès que l'API du fournisseur est déclarée.
+///
+/// La relecture demande à Graph ce qu'il sait d'un compte, en le désignant par son identifiant
+/// d'objet dans le tenant. Le `sub` d'un jeton ne convient pas : il est propre à l'application qui
+/// l'a reçu, et Graph ne le connaît pas.
+pub const GRAPH_SUBJECT_CLAIM: &str = "oid";
+
 /// Emplacement du magasin d'autorités de l'image.
 ///
 /// Le bundle servi à tout le TLS sortant en dérive : voir [`LdapConfig::ca_file`].
@@ -133,6 +180,83 @@ pub struct LdapConfig {
     pub resync: Duration,
 }
 
+/// Tout ce qu'il faut pour déléguer l'authentification à un fournisseur OpenID Connect.
+///
+/// Absente du [`ServerConfig`] tant que le mode d'authentification n'est pas `oidc`, pour la
+/// même raison que [`LdapConfig`] : une configuration à moitié posée n'a aucune raison
+/// d'exister.
+#[derive(Debug, Clone)]
+pub struct OidcAuthConfig {
+    /// Racine de l'émetteur, telle qu'il se nomme lui-même.
+    ///
+    /// Le document de découverte est cherché sous `{issuer}/.well-known/openid-configuration`, et
+    /// son champ `issuer` est comparé à cette valeur : un fournisseur qui se nomme autrement est
+    /// refusé, car c'est aussi cette valeur que porteront les jetons.
+    pub issuer: String,
+    pub client_id: String,
+    /// Secret du client, si l'enregistrement en exige un.
+    ///
+    /// Absent, le portail se présente en client public et ne tient que par PKCE. C'est valable —
+    /// le code ne quitte jamais le navigateur de la personne — mais Entra ID comme Keycloak
+    /// distinguent les deux à l'enregistrement, et un secret configuré face à un client déclaré
+    /// public est refusé aussi sûrement que l'inverse.
+    pub client_secret: Option<Zeroizing<String>>,
+    /// Portées demandées, séparées par des espaces. `openid` y est garantie.
+    pub scopes: String,
+    /// Noms des claims, surchargeables un à un.
+    pub claims: OidcClaims,
+    /// Correspondance entre les groupes du fournisseur et les `KdtGroup`.
+    pub group_mappings: GroupMappings,
+    /// CA du fournisseur, en PEM, pour un émetteur interne.
+    ///
+    /// Contrairement au LDAP, elle n'est pas passée par `SSL_CERT_FILE` : le client HTTP est
+    /// bâti sur les racines publiques embarquées, et celle-ci s'y ajoute explicitement.
+    pub ca_file: Option<String>,
+    pub timeout: Duration,
+    /// Nom du fournisseur tel que la page de connexion le nomme.
+    ///
+    /// Purement cosmétique, et pourtant nécessaire : « Se connecter » sans dire à quoi laisse la
+    /// personne deviner sur quel compte elle est sur le point d'engager son accès au cluster.
+    pub provider_name: String,
+    /// Accès à l'API du fournisseur, s'il est déclaré.
+    ///
+    /// Facultatif, et pas anodin : sans lui, l'appartenance n'est relue qu'aux connexions
+    /// interactives et les jetons dont les groupes sont déportés sont refusés.
+    pub graph: Option<GraphConfig>,
+}
+
+/// Noms des claims dont le portail tire un compte.
+///
+/// Aucun n'est deviné : OpenID Connect ne normalise que `sub`, et chaque fournisseur nomme le
+/// reste à sa façon. Les défauts couvrent Entra ID et Keycloak ; tout le reste se déclare.
+#[derive(Debug, Clone)]
+pub struct OidcClaims {
+    /// Claim dont on tire l'identifiant de connexion, puis le nom du `KdtUser`.
+    pub username: String,
+    pub email: String,
+    pub display: String,
+    /// Claim qui porte les groupes. Chez Entra ID, ce sont des GUID.
+    pub groups: String,
+    /// Claim épinglé sur le compte, et revérifié à chaque connexion.
+    ///
+    /// `sub` par défaut, qui est le seul que la spécification garantit stable. Chez Entra ID il
+    /// est propre à l'application : réenregistrer le portail change tous les `sub`, et `oid` —
+    /// l'identifiant de l'objet dans le tenant — est alors le meilleur choix.
+    pub subject: String,
+}
+
+impl Default for OidcClaims {
+    fn default() -> Self {
+        Self {
+            username: "preferred_username".to_string(),
+            email: "email".to_string(),
+            display: "name".to_string(),
+            groups: "groups".to_string(),
+            subject: "sub".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Namespace où vivent les `Secret` de credentials.
@@ -165,6 +289,8 @@ pub struct ServerConfig {
     pub auth_mode: AuthMode,
     /// Présente si et seulement si `auth_mode` vaut `ldap`.
     pub ldap: Option<LdapConfig>,
+    /// Présente si et seulement si `auth_mode` vaut `oidc`.
+    pub oidc_auth: Option<OidcAuthConfig>,
     /// Durée de validité des certificats remis au plugin.
     pub cert_ttl: Duration,
     /// Durée de validité des certificats téléchargés depuis le portail.
@@ -220,6 +346,7 @@ impl ServerConfig {
             credential_mode: mode_from_env()?,
             auth_mode: auth_mode_from_env()?,
             ldap: ldap_from_env()?,
+            oidc_auth: oidc_auth_from_env()?,
             cert_ttl: duration_from_env(
                 "KDT_IDENTITY_CERT_TTL",
                 DEFAULT_CERT_TTL,
@@ -332,6 +459,81 @@ impl ServerConfig {
             }
         }
 
+        if let Some(oidc) = &self.oidc_auth {
+            // L'émetteur est comparé caractère pour caractère à celui que portent les jetons, et
+            // sert à joindre le fournisseur. En clair, les jetons d'identité de tout le cluster
+            // traverseraient le réseau en lecture directe.
+            if !oidc.issuer.starts_with("https://") {
+                return Err(ConfigError::Invalid(
+                    "KDT_IDENTITY_AUTH_OIDC_ISSUER",
+                    format!(
+                        "{:?} : une racine en https est exigée, c'est par là que passent les \
+                         jetons d'identité",
+                        oidc.issuer
+                    ),
+                ));
+            }
+
+            // L'adresse de retour est construite sur la racine du portail, et c'est elle qui
+            // reçoit le code d'autorisation. Les fournisseurs refusent d'ailleurs presque tous
+            // d'enregistrer une adresse de retour en clair — sauf sur la boucle locale, seul
+            // chemin praticable derrière un `port-forward`.
+            let local = self.portal_url.starts_with("http://localhost")
+                || self.portal_url.starts_with("http://127.0.0.1");
+            if !self.portal_url.starts_with("https://") && !local {
+                return Err(ConfigError::Invalid(
+                    "KDT_IDENTITY_PORTAL_URL",
+                    format!(
+                        "{:?} : le mode oidc exige une racine en https, c'est l'adresse de \
+                         retour où le code d'autorisation est redirigé",
+                        self.portal_url
+                    ),
+                ));
+            }
+
+            // Même raison qu'en mode ldap : une table vide décrit un déploiement où personne
+            // n'obtient de droit, ce qui ne se découvrirait qu'au premier `kubectl` refusé.
+            if oidc.group_mappings.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "KDT_IDENTITY_AUTH_OIDC_GROUP_MAPPINGS",
+                    "aucune correspondance de groupe : les comptes fédérés n'auraient aucun droit"
+                        .to_string(),
+                ));
+            }
+
+            // La relecture désigne les comptes par leur identifiant d'objet dans le tenant. Le
+            // `sub` d'un jeton ne convient pas : il est propre à l'application qui l'a reçu, et
+            // l'API du fournisseur ne le connaît pas. Refusé au démarrage, plutôt que de
+            // découvrir au premier tour de relecture que pas un compte n'est retrouvé.
+            if oidc.graph.is_some() && oidc.claims.subject != GRAPH_SUBJECT_CLAIM {
+                return Err(ConfigError::Invalid(
+                    "KDT_IDENTITY_AUTH_OIDC_SUBJECT_CLAIM",
+                    format!(
+                        "{:?} : la relecture par l'API du fournisseur désigne les comptes par \
+                         leur identifiant d'objet, que seul le claim {GRAPH_SUBJECT_CLAIM:?} \
+                         porte",
+                        oidc.claims.subject
+                    ),
+                ));
+            }
+
+            // Rien ne relit le fournisseur entre deux connexions interactives, sauf si son API
+            // est déclarée : le droit de renouveler est alors exactement la durée pendant
+            // laquelle un retrait de groupe fait chez lui reste sans effet ici. Sept jours sont
+            // tenables face à une relecture au quart d'heure ; ils ne le sont pas sans elle.
+            if oidc.graph.is_none() && self.refresh_ttl > OIDC_AUTH_REFRESH_CEILING {
+                return Err(ConfigError::Invalid(
+                    "KDT_IDENTITY_REFRESH_TTL",
+                    format!(
+                        "{:?} : sans accès déclaré à l'API du fournisseur, aucune relecture ne le \
+                         suit entre deux connexions, et ce droit borne le retard de \
+                         l'appartenance. Plafond {:?}, ou déclarer cet accès.",
+                        self.refresh_ttl, OIDC_AUTH_REFRESH_CEILING
+                    ),
+                ));
+            }
+        }
+
         Ok(self)
     }
 
@@ -409,8 +611,8 @@ fn ldap_from_env() -> Result<Option<LdapConfig>, ConfigError> {
     }
 
     let group_mappings = match env("KDT_IDENTITY_LDAP_GROUP_MAPPINGS") {
-        None => GroupMappings::default(),
-        Some(raw) => GroupMappings::parse(&raw)
+        None => GroupMappings::empty(Source::Ldap),
+        Some(raw) => GroupMappings::parse(&raw, Source::Ldap)
             .map_err(|e| ConfigError::Invalid("KDT_IDENTITY_LDAP_GROUP_MAPPINGS", e))?,
     };
 
@@ -442,6 +644,103 @@ fn ldap_from_env() -> Result<Option<LdapConfig>, ConfigError> {
             "KDT_IDENTITY_LDAP_RESYNC",
             DEFAULT_LDAP_RESYNC,
             LDAP_RESYNC_RANGE,
+        )?,
+    }))
+}
+
+/// Lit la configuration du fournisseur, ou rien si le mode ne l'est pas.
+///
+/// Même règle que pour l'annuaire : c'est le mode qui commande, et non la présence d'une URL.
+fn oidc_auth_from_env() -> Result<Option<OidcAuthConfig>, ConfigError> {
+    if auth_mode_from_env()? != AuthMode::Oidc {
+        return Ok(None);
+    }
+
+    let defaults = OidcClaims::default();
+    let claims = OidcClaims {
+        username: env("KDT_IDENTITY_AUTH_OIDC_USERNAME_CLAIM").unwrap_or(defaults.username),
+        email: env("KDT_IDENTITY_AUTH_OIDC_EMAIL_CLAIM").unwrap_or(defaults.email),
+        display: env("KDT_IDENTITY_AUTH_OIDC_DISPLAY_CLAIM").unwrap_or(defaults.display),
+        groups: env("KDT_IDENTITY_AUTH_OIDC_GROUPS_CLAIM").unwrap_or(defaults.groups),
+        subject: env("KDT_IDENTITY_AUTH_OIDC_SUBJECT_CLAIM").unwrap_or(defaults.subject),
+    };
+
+    let group_mappings = match env("KDT_IDENTITY_AUTH_OIDC_GROUP_MAPPINGS") {
+        None => GroupMappings::empty(Source::Oidc),
+        Some(raw) => GroupMappings::parse(&raw, Source::Oidc)
+            .map_err(|e| ConfigError::Invalid("KDT_IDENTITY_AUTH_OIDC_GROUP_MAPPINGS", e))?,
+    };
+
+    // `openid` n'est pas une portée comme les autres : sans elle, le fournisseur rend un jeton
+    // d'accès et aucun jeton d'identité, et il n'y a alors personne à reconnaître. L'ajouter
+    // vaut mieux que refuser — c'est un oubli sans ambiguïté, et le refus se paierait d'un
+    // démarrage manqué.
+    let scopes = env("KDT_IDENTITY_AUTH_OIDC_SCOPES")
+        .unwrap_or_else(|| DEFAULT_OIDC_AUTH_SCOPES.to_string());
+    let scopes = if scopes.split_whitespace().any(|scope| scope == "openid") {
+        scopes
+    } else {
+        format!("openid {scopes}")
+    };
+
+    Ok(Some(OidcAuthConfig {
+        issuer: env("KDT_IDENTITY_AUTH_OIDC_ISSUER")
+            .ok_or(ConfigError::Missing("KDT_IDENTITY_AUTH_OIDC_ISSUER"))?
+            .trim_end_matches('/')
+            .to_string(),
+        client_id: env("KDT_IDENTITY_AUTH_OIDC_CLIENT_ID")
+            .ok_or(ConfigError::Missing("KDT_IDENTITY_AUTH_OIDC_CLIENT_ID"))?,
+        client_secret: env("KDT_IDENTITY_AUTH_OIDC_CLIENT_SECRET").map(Zeroizing::new),
+        scopes,
+        claims,
+        group_mappings,
+        ca_file: env("KDT_IDENTITY_AUTH_OIDC_CA_FILE"),
+        timeout: duration_from_env(
+            "KDT_IDENTITY_AUTH_OIDC_TIMEOUT",
+            DEFAULT_OIDC_AUTH_TIMEOUT,
+            OIDC_AUTH_TIMEOUT_RANGE,
+        )?,
+        provider_name: env("KDT_IDENTITY_AUTH_OIDC_PROVIDER_NAME")
+            .unwrap_or_else(|| "votre fournisseur d'identité".to_string()),
+        graph: graph_from_env()?,
+    }))
+}
+
+/// Lit l'accès à l'API du fournisseur, ou rien s'il n'est pas déclaré.
+///
+/// C'est le tenant qui commande : sans lui, le reste n'a pas d'objet. Le secret, en revanche, est
+/// exigé dès que le tenant est là — un accès à moitié configuré échouerait à la première
+/// relecture, c'est-à-dire un quart d'heure après un démarrage réussi.
+fn graph_from_env() -> Result<Option<GraphConfig>, ConfigError> {
+    let Some(tenant_id) = env("KDT_IDENTITY_AUTH_OIDC_GRAPH_TENANT_ID") else {
+        return Ok(None);
+    };
+
+    Ok(Some(GraphConfig {
+        tenant_id,
+        // Le défaut est l'application du portail : elle a déjà une identité dans le tenant, et
+        // lui ajouter une permission coûte moins qu'en enregistrer une seconde.
+        client_id: env("KDT_IDENTITY_AUTH_OIDC_GRAPH_CLIENT_ID")
+            .or_else(|| env("KDT_IDENTITY_AUTH_OIDC_CLIENT_ID"))
+            .ok_or(ConfigError::Missing("KDT_IDENTITY_AUTH_OIDC_GRAPH_CLIENT_ID"))?,
+        client_secret: env("KDT_IDENTITY_AUTH_OIDC_GRAPH_CLIENT_SECRET")
+            .map(Zeroizing::new)
+            .ok_or(ConfigError::Missing(
+                "KDT_IDENTITY_AUTH_OIDC_GRAPH_CLIENT_SECRET",
+            ))?,
+        endpoint: env("KDT_IDENTITY_AUTH_OIDC_GRAPH_ENDPOINT")
+            .unwrap_or_else(|| DEFAULT_GRAPH_ENDPOINT.to_string()),
+        authority: env("KDT_IDENTITY_AUTH_OIDC_GRAPH_AUTHORITY")
+            .unwrap_or_else(|| DEFAULT_GRAPH_AUTHORITY.to_string()),
+        resync: duration_from_env(
+            "KDT_IDENTITY_AUTH_OIDC_GRAPH_RESYNC",
+            DEFAULT_GRAPH_RESYNC,
+            LDAP_RESYNC_RANGE,
+        )?,
+        timeout: duration_from_env(
+            "KDT_IDENTITY_AUTH_OIDC_TIMEOUT",
+            DEFAULT_OIDC_AUTH_TIMEOUT,
+            OIDC_AUTH_TIMEOUT_RANGE,
         )?,
     }))
 }
@@ -573,6 +872,7 @@ mod tests {
             credential_mode: CredentialMode::Certificate,
             auth_mode: AuthMode::Local,
             ldap: None,
+            oidc_auth: None,
             cert_ttl: DEFAULT_CERT_TTL,
             download_cert_ttl: DEFAULT_DOWNLOAD_CERT_TTL,
             kubeconfig_download: true,
@@ -681,6 +981,7 @@ mod tests {
             attributes: LdapProfile::ActiveDirectory.attributes(),
             group_mappings: GroupMappings::parse(
                 r#"[{"dn": "cn=k8s-admins,dc=example,dc=com", "group": "admins"}]"#,
+                Source::Ldap,
             )
             .unwrap(),
             ca_file: None,
@@ -747,7 +1048,7 @@ mod tests {
         let mut c = config();
         c.auth_mode = AuthMode::Ldap;
         c.ldap = Some(LdapConfig {
-            group_mappings: GroupMappings::default(),
+            group_mappings: GroupMappings::empty(Source::Ldap),
             ..ldap()
         });
         assert!(c.validated().is_err());
@@ -918,5 +1219,227 @@ mod tests {
         let mut c = config();
         c.portal_url = "https://identity.example.com".to_string();
         assert!(!c.activation_url("a", "b").contains("com//"));
+    }
+
+    fn oidc_auth() -> OidcAuthConfig {
+        OidcAuthConfig {
+            issuer: "https://login.microsoftonline.com/tenant/v2.0".to_string(),
+            client_id: "client".to_string(),
+            client_secret: None,
+            scopes: DEFAULT_OIDC_AUTH_SCOPES.to_string(),
+            claims: OidcClaims::default(),
+            group_mappings: GroupMappings::parse(
+                r#"[{"claim": "8f4a1c2e-0b77-4e3b-9a21-2c5d8e7f0a11", "group": "admins"}]"#,
+                Source::Oidc,
+            )
+            .unwrap(),
+            ca_file: None,
+            timeout: DEFAULT_OIDC_AUTH_TIMEOUT,
+            provider_name: "Entra ID".to_string(),
+            graph: None,
+        }
+    }
+
+    fn oidc_config() -> ServerConfig {
+        ServerConfig {
+            auth_mode: AuthMode::Oidc,
+            oidc_auth: Some(oidc_auth()),
+            refresh_ttl: OIDC_AUTH_REFRESH_CEILING,
+            ..config()
+        }
+    }
+
+    /// L'émetteur sert à joindre le fournisseur et à comparer ce que portent les jetons : en
+    /// clair, ils seraient lisibles par tout ce qui se trouve sur le chemin.
+    #[test]
+    fn un_emetteur_en_clair_empeche_le_demarrage() {
+        let mut c = oidc_config();
+        c.oidc_auth = Some(OidcAuthConfig {
+            issuer: "http://login.example.com".to_string(),
+            ..oidc_auth()
+        });
+        assert!(c.validated().is_err());
+        assert!(oidc_config().validated().is_ok());
+    }
+
+    /// Le code d'autorisation revient sur la racine du portail. Les fournisseurs refusent
+    /// d'enregistrer une adresse de retour en clair, la boucle locale exceptée.
+    #[test]
+    fn une_racine_de_portail_en_clair_empeche_le_demarrage_en_mode_oidc() {
+        let mut c = oidc_config();
+        c.portal_url = "http://identity.example.com".to_string();
+        assert!(c.clone().validated().is_err());
+
+        c.portal_url = "http://localhost:8080".to_string();
+        assert!(c.validated().is_ok());
+    }
+
+    /// Sans correspondance, personne n'obtient de groupe — donc aucun droit — et cela ne se
+    /// verrait qu'au premier `kubectl` refusé.
+    #[test]
+    fn un_fournisseur_sans_correspondance_empeche_le_demarrage() {
+        let mut c = oidc_config();
+        c.oidc_auth = Some(OidcAuthConfig {
+            group_mappings: GroupMappings::empty(Source::Oidc),
+            ..oidc_auth()
+        });
+        assert!(c.validated().is_err());
+    }
+
+    /// Rien ne relit le fournisseur entre deux connexions : le droit de renouveler est la durée
+    /// exacte pendant laquelle un retrait de groupe reste sans effet. Le défaut de sept jours,
+    /// tenable face à un annuaire relu, ne l'est pas ici.
+    #[test]
+    fn le_droit_de_renouveler_est_plafonne_en_mode_oidc() {
+        let mut c = oidc_config();
+        c.refresh_ttl = DEFAULT_REFRESH_TTL;
+        assert!(c.clone().validated().is_err());
+
+        c.refresh_ttl = OIDC_AUTH_REFRESH_CEILING;
+        assert!(c.validated().is_ok());
+    }
+
+    /// Sans `openid`, le fournisseur ne rend aucun jeton d'identité et il n'y a personne à
+    /// reconnaître. L'oubli se corrige, il ne se punit pas.
+    #[test]
+    fn la_portee_openid_est_ajoutee_si_elle_manque() {
+        let lu = with_env(
+            &[
+                ("KDT_IDENTITY_AUTH_MODE", "oidc"),
+                ("KDT_IDENTITY_AUTH_OIDC_ISSUER", "https://idp.example.com/"),
+                ("KDT_IDENTITY_AUTH_OIDC_CLIENT_ID", "kdt"),
+                ("KDT_IDENTITY_AUTH_OIDC_SCOPES", "profile email"),
+            ],
+            || oidc_auth_from_env().unwrap().unwrap(),
+        );
+
+        assert_eq!(lu.scopes, "openid profile email");
+        assert_eq!(lu.claims.username, "preferred_username");
+        // La barre oblique finale est retirée : l'émetteur est comparé caractère pour caractère
+        // à celui que portent les jetons, où elle ne figure pas.
+        assert_eq!(lu.issuer, "https://idp.example.com");
+
+        let deja = with_env(
+            &[
+                ("KDT_IDENTITY_AUTH_MODE", "oidc"),
+                ("KDT_IDENTITY_AUTH_OIDC_ISSUER", "https://idp.example.com"),
+                ("KDT_IDENTITY_AUTH_OIDC_CLIENT_ID", "kdt"),
+                ("KDT_IDENTITY_AUTH_OIDC_SCOPES", "openid groups"),
+            ],
+            || oidc_auth_from_env().unwrap().unwrap(),
+        );
+        assert_eq!(deja.scopes, "openid groups");
+    }
+
+    fn graph() -> GraphConfig {
+        GraphConfig {
+            tenant_id: "tenant".to_string(),
+            client_id: "client".to_string(),
+            client_secret: Zeroizing::new("secret".to_string()),
+            endpoint: DEFAULT_GRAPH_ENDPOINT.to_string(),
+            authority: DEFAULT_GRAPH_AUTHORITY.to_string(),
+            resync: DEFAULT_GRAPH_RESYNC,
+            timeout: DEFAULT_OIDC_AUTH_TIMEOUT,
+        }
+    }
+
+    /// La relecture désigne les comptes par leur identifiant d'objet. Épinglés sur le `sub` — qui
+    /// est propre à l'application — pas un compte ne serait retrouvé, et le premier tour les
+    /// désactiverait tous s'il prenait cette absence pour une disparition.
+    #[test]
+    fn la_relecture_exige_l_epinglage_sur_l_identifiant_d_objet() {
+        let mut c = oidc_config();
+        c.oidc_auth = Some(OidcAuthConfig {
+            graph: Some(graph()),
+            ..oidc_auth()
+        });
+        assert!(c.clone().validated().is_err());
+
+        c.oidc_auth = Some(OidcAuthConfig {
+            graph: Some(graph()),
+            claims: OidcClaims {
+                subject: GRAPH_SUBJECT_CLAIM.to_string(),
+                ..OidcClaims::default()
+            },
+            ..oidc_auth()
+        });
+        assert!(c.validated().is_ok());
+    }
+
+    /// Le plafond du droit de renouveler n'existe que faute de relecture : déclarer l'accès à
+    /// l'API du fournisseur le lève, puisque l'appartenance est alors suivie.
+    #[test]
+    fn la_relecture_leve_le_plafond_du_droit_de_renouveler() {
+        let mut c = oidc_config();
+        c.refresh_ttl = DEFAULT_REFRESH_TTL;
+        assert!(c.clone().validated().is_err());
+
+        c.oidc_auth = Some(OidcAuthConfig {
+            graph: Some(graph()),
+            claims: OidcClaims {
+                subject: GRAPH_SUBJECT_CLAIM.to_string(),
+                ..OidcClaims::default()
+            },
+            ..oidc_auth()
+        });
+        assert!(c.validated().is_ok());
+    }
+
+    /// Le tenant commande, et le secret va avec : à moitié configuré, l'accès échouerait au
+    /// premier tour de relecture, soit un quart d'heure après un démarrage réussi.
+    #[test]
+    fn l_acces_a_l_api_se_lit_d_un_bloc() {
+        let commun = [
+            ("KDT_IDENTITY_AUTH_MODE", "oidc"),
+            ("KDT_IDENTITY_AUTH_OIDC_ISSUER", "https://idp.example.com"),
+            ("KDT_IDENTITY_AUTH_OIDC_CLIENT_ID", "kdt"),
+        ];
+
+        // Sans tenant, pas d'accès : les autres variables ne le ressuscitent pas.
+        let mut sans = commun.to_vec();
+        sans.push(("KDT_IDENTITY_AUTH_OIDC_GRAPH_CLIENT_SECRET", "s"));
+        assert!(with_env(&sans, oidc_auth_from_env)
+            .unwrap()
+            .unwrap()
+            .graph
+            .is_none());
+
+        // Avec tenant mais sans secret, le démarrage échoue plutôt que la relecture.
+        let mut manquant = commun.to_vec();
+        manquant.push(("KDT_IDENTITY_AUTH_OIDC_GRAPH_TENANT_ID", "t"));
+        assert!(with_env(&manquant, oidc_auth_from_env).is_err());
+
+        // Complet : l'application du portail sert par défaut, puisqu'elle a déjà une identité
+        // dans le tenant.
+        let mut complet = manquant.clone();
+        complet.push(("KDT_IDENTITY_AUTH_OIDC_GRAPH_CLIENT_SECRET", "s"));
+        let lu = with_env(&complet, oidc_auth_from_env)
+            .unwrap()
+            .unwrap()
+            .graph
+            .expect("accès déclaré");
+        assert_eq!(lu.tenant_id, "t");
+        assert_eq!(lu.client_id, "kdt");
+        assert_eq!(lu.endpoint, DEFAULT_GRAPH_ENDPOINT);
+        assert_eq!(lu.resync, DEFAULT_GRAPH_RESYNC);
+    }
+
+    /// Le mode commande, et lui seul : des variables de fournisseur laissées derrière un retour
+    /// en mode local ne doivent pas ressusciter la configuration.
+    #[test]
+    fn le_mode_commande_la_lecture_du_fournisseur() {
+        let lu = with_env(
+            &[
+                ("KDT_IDENTITY_AUTH_OIDC_ISSUER", "https://idp.example.com"),
+                ("KDT_IDENTITY_AUTH_OIDC_CLIENT_ID", "kdt"),
+            ],
+            || oidc_auth_from_env().unwrap(),
+        );
+        assert!(lu.is_none());
+
+        // Et l'inverse : le mode sans l'émetteur refuse de démarrer plutôt que de laisser un
+        // portail qui ne saurait à qui parler.
+        let manquant = with_env(&[("KDT_IDENTITY_AUTH_MODE", "oidc")], oidc_auth_from_env);
+        assert!(manquant.is_err());
     }
 }

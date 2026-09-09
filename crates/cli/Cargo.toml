@@ -16,6 +16,9 @@ path = "src/main.rs"
 kdt-identity-api = { path = "../api", default-features = false }
 anyhow.workspace = true
 base64.workspace = true
+# Le tirage du vérificateur PKCE et de l'état : les deux sont des secrets d'un seul usage, et
+# c'est le CSPRNG du système qui les fournit.
+getrandom = "0.4.3"
 chrono.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 serde.workspace = true

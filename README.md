@@ -7,9 +7,10 @@ kubeconfig que l'apiserver reconnaît — sans modifier la configuration du cont
 Compagnon de [kdt](https://github.com/agardenat/kdt). 🗒️ [Changelog](CHANGELOG.md)
 
 Deux modes de délivrance, certificat ou OIDC, éprouvés contre un apiserver réel. Les comptes
-peuvent venir des CRDs ou d'un annuaire Active Directory / FreeIPA (`authMode: ldap`), auquel cas
-le `KdtUser` est créé à la première connexion réussie et l'appartenance reportée depuis les
-groupes de l'annuaire. Chart Helm et image fournis.
+peuvent venir des CRDs, d'un annuaire Active Directory / FreeIPA (`authMode: ldap`) ou d'un
+fournisseur OpenID Connect — Entra ID, Keycloak, Okta (`authMode: oidc`) : dans les deux cas le
+`KdtUser` est créé à la première connexion réussie et l'appartenance reportée depuis les groupes
+de la source. Chart Helm et image fournis.
 
 | Guide | Pour qui |
 | --- | --- |
@@ -18,6 +19,7 @@ groupes de l'annuaire. Chart Helm et image fournis.
 | [Administration](docs/administration.md) | comptes, groupes, révocation, droits RBAC |
 | [Mode OIDC](docs/oidc.md) | configurer l'apiserver |
 | [Mode LDAP](docs/ldap.md) | fédérer les comptes sur un annuaire Active Directory ou FreeIPA |
+| [Mode fournisseur](docs/fournisseur-oidc.md) | fédérer les comptes sur Entra ID, Keycloak ou Okta |
 
 ## Ce que ça fait
 
@@ -210,7 +212,8 @@ tester son cluster en une minute, comment basculer.
 kdt-identity ne modifie rien de l'existant : ni drapeaux de l'apiserver, ni configuration
 d'authentification, ni webhook. Il ajoute des CRDs dans son propre groupe d'API, un contrôleur, et
 des CSR éphémères supprimées après émission. Rancher, Entra ID, Keycloak et authentik continuent de
-fonctionner à l'identique. En `authMode: ldap`, l'annuaire est lu, jamais écrit.
+fonctionner à l'identique. En `authMode: ldap`, l'annuaire est lu, jamais écrit ; en
+`authMode: oidc`, le fournisseur ne reçoit du portail que ce qu'un client OAuth lui demande.
 
 | Risque | Ce qui est fait |
 |---|---|

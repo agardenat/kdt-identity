@@ -38,6 +38,17 @@ pub const PORTAL_PATH: &str = "/api/v1/portal";
 /// identités du cluster, ce qui est un geste de déploiement, pas un enregistrement à chaud.
 pub const WEB_CLIENT_ID: &str = "kdt-web";
 
+/// Identifiant du plugin `exec` quand il ouvre une session par le navigateur.
+///
+/// Déclaré ici et non dans la configuration, contrairement à [`WEB_CLIENT_ID`] : ce n'est pas une
+/// application tierce qu'un déploiement approuve, c'est l'autre moitié de ce produit. Son adresse
+/// de retour est la boucle locale du poste, qu'aucun administrateur ne pourrait déclarer — le
+/// port n'est connu qu'au lancement.
+pub const CLI_CLIENT_ID: &str = "kdt-identity-cli";
+
+/// Chemin de retour du plugin, sur la boucle locale.
+pub const CLI_CALLBACK_PATH: &str = "/callback";
+
 /// Chemin de retour, **côté application**, où le code d'autorisation est redirigé.
 ///
 /// Défini ici plutôt que d'un seul côté : le portail n'accepte que cette adresse, et
@@ -104,6 +115,13 @@ pub enum AuthMode {
     /// `KdtUser` est créé à la première connexion réussie, et le second facteur relève de
     /// l'annuaire.
     Ldap,
+    /// Comptes portés par un fournisseur OpenID Connect. Le portail ne voit jamais le mot de
+    /// passe : il redirige le navigateur, et c'est le fournisseur qui répond.
+    ///
+    /// À ne pas confondre avec [`CredentialMode::Oidc`], qui décrit ce que le portail **émet**
+    /// vers l'apiserver. Ici le portail est client d'un fournisseur ; là il en est un. Les deux
+    /// se combinent, et un déploiement peut n'en avoir aucun des deux.
+    Oidc,
 }
 
 impl AuthMode {
@@ -111,15 +129,26 @@ impl AuthMode {
         match self {
             Self::Local => "local",
             Self::Ldap => "ldap",
+            Self::Oidc => "oidc",
         }
     }
 
     /// Vrai si le portail attend un code TOTP en plus du mot de passe.
     ///
     /// Seul le mode local en gère un : en mode ldap, le second facteur — s'il existe — est celui
-    /// de l'annuaire, et kdt-identity n'a rien à en savoir.
+    /// de l'annuaire, et kdt-identity n'a rien à en savoir. En mode oidc, il n'y a pas même de
+    /// mot de passe à accompagner.
     pub fn totp_required(&self) -> bool {
         matches!(self, Self::Local)
+    }
+
+    /// Vrai si le portail accepte encore qu'on lui présente un mot de passe.
+    ///
+    /// Faux en mode oidc, et c'est le cœur de ce mode : laisser subsister une porte par mot de
+    /// passe à côté du fournisseur reviendrait à contourner tout ce qu'il applique — second
+    /// facteur, accès conditionnel, désactivation d'un compte parti.
+    pub fn accepts_password(&self) -> bool {
+        !matches!(self, Self::Oidc)
     }
 }
 
@@ -136,7 +165,8 @@ impl std::str::FromStr for AuthMode {
         match raw {
             "local" => Ok(Self::Local),
             "ldap" => Ok(Self::Ldap),
-            other => Err(format!("mode {other:?} inconnu, attendu local ou ldap")),
+            "oidc" => Ok(Self::Oidc),
+            other => Err(format!("mode {other:?} inconnu, attendu local, ldap ou oidc")),
         }
     }
 }
@@ -570,8 +600,19 @@ mod tests {
         assert_eq!(AuthMode::default(), AuthMode::Local);
         assert_eq!(AuthMode::from_str("ldap"), Ok(AuthMode::Ldap));
         assert_eq!(AuthMode::from_str("local"), Ok(AuthMode::Local));
+        assert_eq!(AuthMode::from_str("oidc"), Ok(AuthMode::Oidc));
         assert!(AuthMode::from_str("LDAP").is_err());
         assert!(AuthMode::from_str("ldaps").is_err());
+    }
+
+    /// La règle qui définit le mode oidc : plus aucun mot de passe n'est recevable. Un portail
+    /// qui en accepterait encore un offrirait un contournement du fournisseur.
+    #[test]
+    fn le_mode_oidc_n_accepte_plus_de_mot_de_passe() {
+        assert!(AuthMode::Local.accepts_password());
+        assert!(AuthMode::Ldap.accepts_password());
+        assert!(!AuthMode::Oidc.accepts_password());
+        assert!(!AuthMode::Oidc.totp_required());
     }
 
     /// Le second facteur n'existe que pour les comptes locaux. Si cette règle s'inversait, le

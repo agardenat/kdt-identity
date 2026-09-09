@@ -138,12 +138,16 @@ sessionKey: ""
 #   ldap  — les comptes vivent dans un annuaire. Le mot de passe y est vérifié par un bind, le
 #           KdtUser est créé à la première connexion réussie, et l'appartenance est reportée
 #           depuis les groupes de l'annuaire.
+#   oidc  — les comptes vivent chez un fournisseur OpenID Connect (Entra ID, Keycloak, Okta).
+#           Le portail ne voit jamais le mot de passe : il redirige le navigateur, et c'est le
+#           fournisseur qui répond.
 #
-# Orthogonal à credentialMode : celui-ci dit ce qu'on remet, celui-là qui on reconnaît. Les
-# quatre combinaisons sont valides.
+# Orthogonal à credentialMode : celui-ci dit ce qu'on remet, celui-là qui on reconnaît. Les six
+# combinaisons sont valides.
 #
-# En mode ldap, le second facteur relève de l'annuaire : kdt-identity n'enrôle plus de TOTP, ne
-# sert plus la page d'activation, et `invite` refuse de s'exécuter.
+# En mode ldap comme en mode oidc, le second facteur relève de la source : kdt-identity n'enrôle
+# plus de TOTP, ne sert plus la page d'activation, et `invite` refuse de s'exécuter. Le mode oidc
+# va plus loin : il n'accepte plus aucun mot de passe, nulle part.
 authMode: local
 
 ldap:
@@ -212,9 +216,97 @@ ldap:
   # Un compte dont l'entrée a disparu de l'annuaire passe en spec.disabled, jamais supprimé.
   resync: 15m
 
+# Fournisseur d'identité, en authMode=oidc.
+#
+# Le portail devient client du fournisseur : il envoie le navigateur chez lui, en récupère un
+# jeton d'identité, et en tire le compte et ses groupes. Le plugin kubectl, lui, ouvre alors sa
+# session par le navigateur — il n'a plus de mot de passe à présenter.
+oidcAuth:
+  # Racine de l'émetteur, telle qu'il se nomme lui-même. Le document de découverte est cherché
+  # sous <issuer>/.well-known/openid-configuration, et le champ `issuer` qu'il annonce doit
+  # correspondre exactement : c'est aussi ce que porteront les jetons.
+  #
+  #   Entra ID — https://login.microsoftonline.com/<tenant-id>/v2.0
+  #   Keycloak — https://sso.example.com/realms/<realm>
+  issuer: ""
+
+  # Identifiant de l'application enregistrée chez le fournisseur.
+  clientId: ""
+
+  # Nom du Secret portant KDT_IDENTITY_AUTH_OIDC_CLIENT_SECRET — et, si l'accès à l'API est
+  # déclaré ci-dessous, KDT_IDENTITY_AUTH_OIDC_GRAPH_CLIENT_SECRET.
+  #
+  # Laissé vide, le portail se présente en client public et ne tient que par PKCE. C'est valable,
+  # mais Entra ID comme Keycloak distinguent les deux à l'enregistrement : un secret configuré
+  # face à un client déclaré public est refusé aussi sûrement que l'inverse.
+  existingSecret: ""
+
+  # Adresse de retour à déclarer chez le fournisseur : <portalUrl>/login/callback.
+  # Elle se déduit de portalUrl et n'a pas à être répétée ici.
+
+  # Portées demandées. `openid` est ajoutée d'office si elle manque.
+  scopes: "openid profile email"
+
+  # Nom du fournisseur tel que la page de connexion le nomme, sur le bouton.
+  providerName: ""
+
+  # Noms des claims. Laissés vides, ils valent preferred_username, email, name, groups et sub.
+  #
+  # Chez Entra ID, `subject: oid` est le meilleur choix — et il devient obligatoire dès que
+  # graph.enabled est vrai : `sub` est propre à l'application, l'API du fournisseur ne le connaît
+  # pas, et réenregistrer le portail changerait tous les `sub` déjà épinglés.
+  claims:
+    username: ""
+    email: ""
+    display: ""
+    groups: ""
+    subject: ""
+
+  # Correspondance entre les groupes du fournisseur et les KdtGroup.
+  #
+  # Même règle qu'en LDAP : rien n'est déduit, ce qui ne figure pas ici n'existe pas côté
+  # cluster. La clé est la valeur telle qu'elle apparaît dans le claim — chez Entra ID, un GUID.
+  #
+  #   groupMappings:
+  #     - claim: "8f4a1c2e-0b77-4e3b-9a21-2c5d8e7f0a11"
+  #       group: admins
+  #     - claim: "/platform/devs"
+  #       group: devs
+  groupMappings: []
+
+  # Autorité qui a émis le certificat du fournisseur, en PEM. Inutile pour un fournisseur public
+  # — Entra ID, Okta — dont l'autorité est déjà dans le magasin de l'image.
+  caCert: ""
+
+  # Délai au-delà duquel le fournisseur est tenu pour injoignable.
+  timeout: 10s
+
+  # Accès à l'API du fournisseur (Microsoft Graph).
+  #
+  # Facultatif, et pas anodin — il répond à deux manques d'un coup :
+  #
+  #   1. au-delà d'environ deux cents groupes, Entra ID cesse de les mettre dans le jeton et n'y
+  #      laisse qu'un renvoi. Sans cet accès, la personne la mieux dotée en groupes est celle
+  #      dont la connexion est refusée ;
+  #   2. une session se renouvelle sans jamais revenir au fournisseur. Sans cet accès, un retrait
+  #      de groupe fait chez lui n'a d'effet qu'à la prochaine connexion interactive — et
+  #      refreshTtl est alors plafonné à 24h pour borner ce retard.
+  #
+  # Exige une permission d'application — GroupMember.Read.All et User.Read.All — accordée **et**
+  # consentie par un administrateur du tenant. Un compte fermé chez le fournisseur passe en
+  # spec.disabled, comme une entrée disparue de l'annuaire.
+  graph:
+    enabled: false
+    tenantId: ""
+    # Laissé vide, l'application du portail sert : elle a déjà une identité dans le tenant.
+    clientId: ""
+    endpoint: "https://graph.microsoft.com"
+    authority: "https://login.microsoftonline.com"
+    resync: 15m
+
 # SMTP est facultatif : l'invitation s'obtient par `kdt-identity-server invite`, qui affiche le
 # lien et le code à transmettre. `--send-mail` n'a besoin de ceci que pour envoyer le lien.
-# Sans objet en authMode=ldap, où il n'y a pas d'invitation.
+# Sans objet en authMode=ldap ni en authMode=oidc, où il n'y a pas d'invitation.
 smtp:
   enabled: false
   host: ""

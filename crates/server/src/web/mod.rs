@@ -35,7 +35,9 @@ use crate::oidc::discovery::{self, DISCOVERY_PATH, JWKS_PATH};
 use crate::oidc::key::JwkSet;
 use crate::oidc::{jwt, SigningMaterial};
 use crate::sessions::SessionStore;
-use crate::ldap::{provision, Directory, LdapError};
+use crate::federation::{provision, Source};
+use crate::ldap::{Directory, LdapError};
+use crate::oidc_auth::{OidcError, Pending, Provider};
 use kdt_identity_api::portal::{
     AuthMode, AuthorizeTokenRequest, CredentialMode, CredentialRequest, CredentialResponse,
     PortalDescriptor, RevokeRequest, SessionGrant, SessionRequest, SessionResponse, TokenRequest,
@@ -46,6 +48,7 @@ use kube::api::{Api, ListParams};
 use serde::Deserialize;
 use signer::Signer;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
@@ -57,14 +60,43 @@ mod purpose {
     pub const API_CREDENTIAL: &str = "api-credential";
     /// Code d'autorisation, remis au navigateur puis échangé par l'application.
     pub const AUTHORIZE_CODE: &str = "authorize-code";
+    /// Connexion en cours chez le fournisseur d'identité : ce que le portail doit retrouver au
+    /// retour du navigateur.
+    pub const OIDC_LOGIN: &str = "oidc-login";
 }
 
 const SESSION_COOKIE: &str = "kdt_identity_session";
 const SESSION_TTL: chrono::Duration = chrono::Duration::hours(12);
 
+/// Chemin de retour du fournisseur d'identité, à déclarer chez lui comme adresse de redirection.
+pub const OIDC_CALLBACK_PATH: &str = "/login/callback";
+
+/// Cookie qui porte la connexion en cours chez le fournisseur.
+const OIDC_PENDING_COOKIE: &str = "kdt_identity_oidc";
+
+/// Durée d'une connexion en cours.
+///
+/// Dix minutes : c'est le temps laissé pour s'authentifier chez le fournisseur, second facteur
+/// compris. Au-delà, le retour trouve un cookie périmé et la connexion se recommence — ce qui
+/// vaut mieux qu'un `state` valable indéfiniment.
+const OIDC_PENDING_TTL: chrono::Duration = chrono::Duration::minutes(10);
+
 /// Message unique de tout échec d'authentification.
 const GENERIC_AUTH_FAILURE: &str =
     "Compte, mot de passe ou code incorrect. Vérifiez vos identifiants et réessayez.";
+
+/// Le fournisseur n'a pas répondu, ou pas comme il faut. Distinct d'un refus : ce n'est pas la
+/// personne qui doit corriger quelque chose.
+const PROVIDER_UNAVAILABLE: &str =
+    "Le fournisseur d'identité est momentanément injoignable. Réessayez dans un instant.";
+
+/// La connexion a abouti chez le fournisseur, mais le compte n'a pas pu être ouvert ici.
+const ACCOUNT_UNUSABLE: &str =
+    "Votre identité a été reconnue, mais votre accès au cluster n'a pas pu être ouvert. \
+     Contactez votre administrateur.";
+
+/// La tentative de connexion a expiré, ou son retour ne correspond pas à ce qui est parti.
+const LOGIN_EXPIRED: &str = "Cette tentative de connexion a expiré. Recommencez.";
 
 const GENERIC_ACTIVATION_FAILURE: &str =
     "Ce lien ou ce code d'activation est invalide ou a expiré. Demandez une nouvelle invitation \
@@ -98,12 +130,15 @@ pub struct AppState {
     /// Même raison que pour `oidc` : absent, les chemins qui en dépendent n'existent pas, plutôt
     /// que d'exister et de refuser.
     directory: Option<Directory>,
-    /// L'application autorisée à demander des identités, si elle est déclarée.
+    /// Le fournisseur d'identité, si le mode d'authentification est `oidc`.
+    provider: Option<Provider>,
+    /// Les applications autorisées à demander des identités.
     ///
-    /// Absente — `webUrl` non renseignée — le flow d'autorisation n'est pas monté du tout. kdt-web
-    /// est facultatif : un portail qui servirait `/authorize` sans connaître personne ne pourrait
-    /// que refuser, et donnerait à croire qu'il manque une permission plutôt qu'une déclaration.
-    client: Option<authorize::Client>,
+    /// Jamais vide : le plugin `exec` en fait toujours partie, puisqu'il est l'autre moitié de ce
+    /// produit et que son adresse de retour — la boucle locale du poste — ne se déclare pas.
+    /// kdt-web, lui, n'y figure que si `webUrl` est renseignée : c'est une installation
+    /// facultative, et le portail ne suppose jamais la présence de ce qu'on ne lui a pas déclaré.
+    clients: Vec<authorize::Client>,
     /// Les codes déjà échangés, pour qu'un code ne serve qu'une fois.
     used_codes: authorize::UsedCodes,
 }
@@ -113,7 +148,6 @@ type Shared = Arc<AppState>;
 pub fn router(state: Shared) -> Router {
     let router = Router::new()
         .route("/", get(account_page))
-        .route("/login", get(login_page).post(login_submit))
         // Le descripteur est monté dans tous les modes et sans authentification : c'est ce que
         // le plugin lit pour savoir quoi demander, donc avant d'avoir quoi que ce soit à
         // présenter.
@@ -127,12 +161,26 @@ pub fn router(state: Shared) -> Router {
         .route(kdt_identity_api::portal::REVOKE_PATH, post(api_revoke))
         .route("/healthz", get(|| async { "ok" }));
 
-    // L'activation n'existe que pour les comptes que le cluster porte. En mode ldap il n'y a ni
-    // invitation, ni mot de passe à poser, ni TOTP à enrôler : servir la page inviterait à
-    // définir un mot de passe que rien ne vérifierait jamais.
+    // La page de connexion suit le mode, et le formulaire de mot de passe n'existe que là où
+    // un mot de passe est vérifiable. En mode oidc, le POST n'est pas monté du tout : monté et
+    // refusant, il resterait une cible à essayer, et un client mal réglé croirait à une panne
+    // plutôt qu'à un mode.
+    let router = match state.config.auth_mode {
+        AuthMode::Local | AuthMode::Ldap => {
+            router.route("/login", get(login_page).post(login_submit))
+        }
+        AuthMode::Oidc => router
+            .route("/login", get(login_page))
+            .route("/login/oidc", get(login_oidc_start))
+            .route(OIDC_CALLBACK_PATH, get(login_oidc_callback)),
+    };
+
+    // L'activation n'existe que pour les comptes que le cluster porte. En mode ldap comme en
+    // mode oidc il n'y a ni invitation, ni mot de passe à poser, ni TOTP à enrôler : servir la
+    // page inviterait à définir un mot de passe que rien ne vérifierait jamais.
     let router = match state.config.auth_mode {
         AuthMode::Local => router.route("/activate", get(activate_page).post(activate_submit)),
-        AuthMode::Ldap => router,
+        AuthMode::Ldap | AuthMode::Oidc => router,
     };
 
     // Les points d'accès OIDC n'existent qu'en mode OIDC. Le document de découverte est
@@ -146,20 +194,18 @@ pub fn router(state: Shared) -> Router {
             .route(kdt_identity_api::portal::TOKEN_PATH, post(api_token)),
     };
 
-    // Le flow d'autorisation n'existe que si une application est déclarée, pour la même raison :
-    // monté sans client, il ne saurait que refuser.
-    let router = match state.client {
-        None => router,
-        Some(_) => router
-            .route(
-                kdt_identity_api::portal::AUTHORIZE_PATH,
-                get(authorize_page).post(authorize_submit),
-            )
-            .route(
-                kdt_identity_api::portal::AUTHORIZE_TOKEN_PATH,
-                post(api_authorize_token),
-            ),
-    };
+    // Le flow d'autorisation est monté dans tous les cas, puisqu'il y a toujours au moins un
+    // client : le plugin. Ce qu'il accorde ne dépend d'ailleurs pas de son montage — un code
+    // n'est émis qu'après un accord donné, sur le portail, par quelqu'un qui y est connecté.
+    let router = router
+        .route(
+            kdt_identity_api::portal::AUTHORIZE_PATH,
+            get(authorize_page).post(authorize_submit),
+        )
+        .route(
+            kdt_identity_api::portal::AUTHORIZE_TOKEN_PATH,
+            post(api_authorize_token),
+        );
 
     router.with_state(state)
 }
@@ -170,12 +216,15 @@ pub fn state(
     endpoint: ClusterEndpoint,
     signer: Signer,
     oidc: Option<OidcState>,
+    provider: Option<Provider>,
 ) -> Shared {
-    let authorized = config.web_url.as_deref().map(authorize::Client::from_web_url);
+    let mut clients = vec![authorize::Client::cli()];
+    clients.extend(config.web_url.as_deref().map(authorize::Client::from_web_url));
     let directory = config.ldap.clone().map(Directory::new);
 
     Arc::new(AppState {
         directory,
+        provider,
         users: Api::all(client.clone()),
         groups: Api::all(client.clone()),
         store: CredentialStore::new(client.clone(), &config.namespace),
@@ -185,7 +234,7 @@ pub fn state(
         endpoint,
         config,
         oidc,
-        client: authorized,
+        clients,
         used_codes: authorize::UsedCodes::new(),
     })
 }
@@ -387,7 +436,21 @@ async fn login_page(
         // Déjà connecté : on ne redemande rien, on reprend là où la demande allait.
         return Redirect::to(next.as_deref().unwrap_or("/")).into_response();
     }
-    Html(views::login(None, next.as_deref()).into_string()).into_response()
+    Html(login_markup(&state, None, next.as_deref())).into_response()
+}
+
+/// Page de connexion du mode en vigueur.
+///
+/// Un seul endroit où le choix se fait : les trois chemins qui rendent cette page — l'entrée, le
+/// refus du fournisseur, l'échec d'un formulaire — doivent rendre la même, sans quoi un mode
+/// afficherait le formulaire de l'autre.
+fn login_markup(state: &AppState, error: Option<&str>, next: Option<&str>) -> String {
+    match &state.provider {
+        Some(provider) => {
+            views::login_oidc(&provider.config().provider_name, error, next).into_string()
+        }
+        None => views::login(error, next).into_string(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -433,6 +496,289 @@ async fn login_submit(State(state): State<Shared>, Form(form): Form<LoginForm>) 
     }
 }
 
+// ------------------------------------------------- connexion par fournisseur
+
+/// Départ vers le fournisseur d'identité.
+///
+/// Ce qui doit survivre à l'aller-retour — l'anti-rejeu, le secret PKCE, la page où reprendre —
+/// part avec le navigateur dans un cookie signé. Le portail ne garde rien : une table de
+/// connexions en cours ne survivrait ni à un redémarrage ni à une seconde instance, et perdre
+/// une entrée reviendrait à refuser un retour parfaitement légitime.
+async fn login_oidc_start(State(state): State<Shared>, Query(query): Query<LoginQuery>) -> Response {
+    let Some(provider) = &state.provider else {
+        // Route montée sans fournisseur : impossible par construction, mais le dire vaut mieux
+        // que rediriger vers une URL vide.
+        return login_unavailable(&state, None);
+    };
+
+    let pending = Pending::new(safe_next(&query.next));
+    let redirect_uri = format!("{}{OIDC_CALLBACK_PATH}", state.config.portal_url);
+
+    let url = match provider.authorize_url(&pending, &redirect_uri).await {
+        Ok(url) => url,
+        Err(e) => {
+            warn!(erreur = %e, "départ vers le fournisseur impossible");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Html(login_markup(&state, Some(PROVIDER_UNAVAILABLE), pending.next.as_deref())),
+            )
+                .into_response();
+        }
+    };
+
+    let payload = match serde_json::to_string(&pending) {
+        Ok(payload) => payload,
+        Err(e) => {
+            warn!(erreur = %e, "connexion en cours non sérialisable");
+            return login_unavailable(&state, pending.next.as_deref());
+        }
+    };
+
+    let token = state.signer.sign(
+        purpose::OIDC_LOGIN,
+        &payload,
+        (Utc::now() + OIDC_PENDING_TTL).timestamp(),
+    );
+
+    (
+        [(
+            header::SET_COOKIE,
+            pending_cookie(&token, OIDC_PENDING_TTL.num_seconds()),
+        )],
+        Redirect::to(&url),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CallbackQuery {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    state: String,
+    /// Le fournisseur refuse, et dit pourquoi. Journalisé, jamais montré tel quel : son texte
+    /// est écrit pour un développeur, et il nomme parfois le compte.
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    error_description: String,
+}
+
+/// Retour du fournisseur, où la session s'ouvre pour de bon.
+async fn login_oidc_callback(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Query(query): Query<CallbackQuery>,
+) -> Response {
+    let Some(provider) = &state.provider else {
+        return login_unavailable(&state, None);
+    };
+
+    // Le cookie s'efface dans toutes les issues : une tentative aboutie ne se rejoue pas, et une
+    // tentative échouée ne laisse pas traîner un `state` encore valable.
+    let efface = (header::SET_COOKIE, pending_cookie("", 0));
+
+    let Some(pending) = pending_login(&state, &headers) else {
+        warn!("retour du fournisseur sans connexion en cours : cookie absent ou périmé");
+        return (
+            StatusCode::BAD_REQUEST,
+            [efface],
+            Html(login_markup(&state, Some(LOGIN_EXPIRED), None)),
+        )
+            .into_response();
+    };
+
+    // L'anti-rejeu : ce retour doit être celui du navigateur qui est parti. Sans cette
+    // comparaison, un lien fabriqué ferait aboutir dans ce navigateur-ci une connexion ouverte
+    // ailleurs, sur un compte que la personne n'a pas choisi.
+    if query.state.as_bytes().ct_eq(pending.state.as_bytes()).unwrap_u8() != 1 {
+        warn!("retour du fournisseur avec un state qui ne correspond pas");
+        return (
+            StatusCode::BAD_REQUEST,
+            [efface],
+            Html(login_markup(&state, Some(LOGIN_EXPIRED), pending.next.as_deref())),
+        )
+            .into_response();
+    }
+
+    if !query.error.is_empty() {
+        warn!(
+            erreur = %query.error,
+            detail = %query.error_description,
+            "connexion refusée par le fournisseur"
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            [efface],
+            Html(login_markup(&state, Some(GENERIC_AUTH_FAILURE), pending.next.as_deref())),
+        )
+            .into_response();
+    }
+
+    if query.code.is_empty() {
+        warn!("retour du fournisseur sans code ni erreur");
+        return (
+            StatusCode::BAD_REQUEST,
+            [efface],
+            Html(login_markup(&state, Some(GENERIC_AUTH_FAILURE), pending.next.as_deref())),
+        )
+            .into_response();
+    }
+
+    let redirect_uri = format!("{}{OIDC_CALLBACK_PATH}", state.config.portal_url);
+    let federated = match provider
+        .authenticate(&query.code, &pending, &redirect_uri, Utc::now().timestamp())
+        .await
+    {
+        Ok(federated) => federated,
+        Err(e) => {
+            warn!(erreur = %e, "échange impossible avec le fournisseur");
+            // Une panne du fournisseur n'est pas un refus, et la personne qui lit la page doit
+            // savoir laquelle des deux réessayer. Le détail, lui, reste dans le journal.
+            let (code, message) = match e {
+                OidcError::Unavailable(_) | OidcError::Config(_) => {
+                    (StatusCode::BAD_GATEWAY, PROVIDER_UNAVAILABLE)
+                }
+                OidcError::Unusable(_) => (StatusCode::UNAUTHORIZED, ACCOUNT_UNUSABLE),
+                OidcError::Rejected(_) => (StatusCode::UNAUTHORIZED, GENERIC_AUTH_FAILURE),
+            };
+            return (
+                code,
+                [efface],
+                Html(login_markup(&state, Some(message), pending.next.as_deref())),
+            )
+                .into_response();
+        }
+    };
+
+    let user = match authenticate_oidc(&state, &federated).await {
+        Ok(user) => user,
+        Err(reason) => {
+            warn!(login = %federated.login, raison = reason, "connexion refusée après le fournisseur");
+            return (
+                StatusCode::UNAUTHORIZED,
+                [efface],
+                Html(login_markup(&state, Some(ACCOUNT_UNUSABLE), pending.next.as_deref())),
+            )
+                .into_response();
+        }
+    };
+
+    let name = user.metadata.name.clone().unwrap_or_else(|| federated.login.clone());
+    info!(user = %name, "connexion réussie par le fournisseur");
+
+    let token = state.signer.sign(
+        purpose::SESSION,
+        &name,
+        (Utc::now() + SESSION_TTL).timestamp(),
+    );
+
+    (
+        [
+            efface,
+            (
+                header::SET_COOKIE,
+                session_cookie(&token, SESSION_TTL.num_seconds()),
+            ),
+        ],
+        Redirect::to(pending.next.as_deref().unwrap_or("/")),
+    )
+        .into_response()
+}
+
+/// Relit la connexion en cours dans le cookie signé.
+fn pending_login(state: &AppState, headers: &HeaderMap) -> Option<Pending> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    let token = cookies
+        .split(';')
+        .filter_map(|c| c.trim().split_once('='))
+        .find(|(name, _)| *name == OIDC_PENDING_COOKIE)
+        .map(|(_, value)| value)?;
+
+    let payload = state
+        .signer
+        .verify(purpose::OIDC_LOGIN, token, Utc::now().timestamp())
+        .ok()?;
+
+    serde_json::from_str(&payload).ok()
+}
+
+/// Ouvre le compte d'une personne que le fournisseur vient de reconnaître.
+///
+/// Aucun compteur d'échecs n'est touché, ni dans un sens ni dans l'autre : rien de secret n'a été
+/// présenté au portail, et le verrouillage progressif appartient à qui vérifie le mot de passe.
+async fn authenticate_oidc(state: &AppState, federated: &crate::federation::FederatedUser) -> Result<KdtUser, &'static str> {
+    let name = provision::normalize_login(&federated.login)
+        .map_err(|_| "identifiant hors du jeu accepté")?;
+
+    // Le compte n'existe pas encore à la première connexion : c'est le cas nominal. Seul un
+    // compte déjà connu peut être désactivé.
+    let existant = state
+        .users
+        .get_opt(&name)
+        .await
+        .map_err(|_| "lecture du compte")?;
+    if existant.as_ref().is_some_and(|u| u.spec.disabled) {
+        return Err("compte désactivé");
+    }
+
+    let user = provision::ensure_user(&state.users, federated, Source::Oidc)
+        .await
+        .map_err(|e| {
+            warn!(login = %federated.login, erreur = %e, "compte non provisionné");
+            "compte non provisionné"
+        })?;
+
+    // Un compte peut avoir été désactivé entre la lecture ci-dessus et maintenant, ou exister
+    // déjà désactivé sans que la normalisation l'ait désigné — on revérifie sur l'objet réel.
+    if user.spec.disabled {
+        return Err("compte désactivé");
+    }
+
+    let Some(provider) = &state.provider else {
+        return Err("fournisseur non configuré");
+    };
+    let mappings = &provider.config().group_mappings;
+    let wanted = mappings.resolve(&federated.member_of);
+
+    if let Err(e) = provision::sync_groups(
+        &state.groups,
+        &name,
+        &wanted,
+        &mappings.managed_groups(),
+        Source::Oidc,
+    )
+    .await
+    {
+        // Même arbitrage qu'en mode ldap : accepter la connexion donnerait des droits périmés
+        // en silence, la refuser les donne visiblement.
+        warn!(compte = %name, erreur = %e, "appartenance non synchronisée");
+        return Err("appartenance non synchronisée");
+    }
+
+    Ok(user)
+}
+
+fn pending_cookie(token: &str, max_age: i64) -> String {
+    // `SameSite=Lax`, là où le cookie de session est `Strict` : ce cookie-ci doit revenir sur une
+    // navigation venue du fournisseur, donc d'un autre site. En `Strict`, le navigateur ne
+    // l'enverrait pas, et chaque connexion échouerait au retour sur un cookie « absent » que
+    // rien n'expliquerait. `Lax` suffit ici : il ne voyage que sur une navigation de premier
+    // plan en GET, et il ne porte aucun droit — seulement de quoi reconnaître un retour.
+    format!(
+        "{OIDC_PENDING_COOKIE}={token}; Path=/login; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age}"
+    )
+}
+
+/// Échec côté portail sur le chemin de connexion : la page de connexion, et non une page nue.
+fn login_unavailable(state: &AppState, next: Option<&str>) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Html(login_markup(state, Some(GENERIC_AUTH_FAILURE), next)),
+    )
+        .into_response()
+}
+
 /// Ce que le portail dit de lui-même, sans rien demander.
 ///
 /// Non authentifié, et ce n'est pas un oubli : le client a besoin de ces valeurs *avant* d'avoir
@@ -470,6 +816,10 @@ async fn authenticate(
             authenticate_local(state, name, password, totp_code).await
         }
         AuthMode::Ldap => authenticate_ldap(state, name, password).await,
+        // Le mode oidc n'a pas de chemin par mot de passe, et ne doit pas en avoir : le
+        // formulaire n'est pas monté, l'API le refuse plus haut, et ce bras est la troisième
+        // barrière — celle qui tient même si un appelant futur oublie les deux autres.
+        AuthMode::Oidc => Err("le mode oidc n'accepte aucun mot de passe"),
     }
 }
 
@@ -610,7 +960,7 @@ async fn authenticate_ldap(
         }
     };
 
-    let user = provision::ensure_user(&state.users, &directory_user)
+    let user = provision::ensure_user(&state.users, &directory_user, Source::Ldap)
         .await
         .map_err(|e| {
             warn!(login = %login, erreur = %e, "compte non provisionné");
@@ -630,6 +980,7 @@ async fn authenticate_ldap(
         &name,
         &wanted,
         &mappings.managed_groups(),
+        Source::Ldap,
     )
     .await
     {
@@ -873,13 +1224,14 @@ async fn authorize_page(
     State(state): State<Shared>,
     Query(query): Query<authorize::AuthorizeQuery>,
 ) -> Response {
-    let redirect_uri = match authorize::check(&query, state.client.as_ref()) {
-        Ok(uri) => uri,
+    let (redirect_uri, client) = match authorize::check(&query, &state.clients) {
+        Ok(pair) => pair,
         Err(e) => {
             warn!(client = %query.client_id, raison = %e, "demande d'autorisation refusée");
             return authorize_refused();
         }
     };
+    let label = client.label.clone();
 
     let Some(user) = current_user(&state, &headers) else {
         // La personne n'est pas connectée : on l'y envoie, en gardant la demande pour reprendre
@@ -887,7 +1239,7 @@ async fn authorize_page(
         return Redirect::to(&login_with_next(&query, &redirect_uri)).into_response();
     };
 
-    render_consent(&state, &user, &query, &redirect_uri, None).await
+    render_consent(&state, &user, &query, &redirect_uri, &label, None).await
 }
 
 #[derive(Deserialize)]
@@ -918,13 +1270,14 @@ async fn authorize_submit(
         code_challenge_method: form.code_challenge_method,
     };
 
-    let redirect_uri = match authorize::check(&query, state.client.as_ref()) {
-        Ok(uri) => uri,
+    let (redirect_uri, client) = match authorize::check(&query, &state.clients) {
+        Ok(pair) => pair,
         Err(e) => {
             warn!(client = %query.client_id, raison = %e, "accord refusé");
             return authorize_refused();
         }
     };
+    let label = client.label.clone();
 
     let Some(user) = current_user(&state, &headers) else {
         return Redirect::to(&login_with_next(&query, &redirect_uri)).into_response();
@@ -949,7 +1302,8 @@ async fn authorize_submit(
         Ok(()) => {}
         Err(message) => {
             warn!(user = %user, raison = %message, "autorisation refusée");
-            return render_consent(&state, &user, &query, &redirect_uri, Some(&message)).await;
+            return render_consent(&state, &user, &query, &redirect_uri, &label, Some(&message))
+                .await;
         }
     }
 
@@ -1109,6 +1463,7 @@ async fn render_consent(
     user: &str,
     query: &authorize::AuthorizeQuery,
     redirect_uri: &str,
+    label: &str,
     error: Option<&str>,
 ) -> Response {
     let (subject, groups) = match subjects(state, user).await {
@@ -1129,7 +1484,7 @@ async fn render_consent(
             subject: &subject,
             groups: &groups,
             cluster: &state.config.cluster_name,
-            application: &query.client_id,
+            application: label,
             redirect_uri,
             csrf: &csrf,
             state: &query.state,
@@ -1260,13 +1615,29 @@ async fn api_session(
     // groupes — se lit sous le nom du `KdtUser`, jamais sous celui qui a été tapé.
     let mut name = match state.config.auth_mode {
         AuthMode::Local => request.user.clone(),
-        AuthMode::Ldap => {
+        AuthMode::Ldap | AuthMode::Oidc => {
             provision::normalize_login(&request.user).unwrap_or_else(|_| request.user.clone())
         }
     };
 
     // Une ouverture par mot de passe rend un droit de renouveler ; un renouvellement n'en rend
     // pas un second. Sans cela, une session volée se prolongerait indéfiniment d'elle-même.
+    // Un mot de passe présenté à un portail qui délègue est refusé avant toute lecture : le
+    // vérifier n'aurait aucun sens, et le refuser plus loin laisserait croire à un compte
+    // inconnu plutôt qu'à un mode. Le renouvellement silencieux, lui, reste ouvert — c'est ce
+    // qui fait vivre les sessions déjà obtenues par le navigateur.
+    if !state.config.auth_mode.accepts_password() && matches!(grant, SessionGrant::Password { .. })
+    {
+        warn!(
+            user = %request.user,
+            "mot de passe présenté à un portail en mode oidc"
+        );
+        return bad_request_json(
+            "ce portail délègue l'authentification à un fournisseur d'identité : ouvrez une \
+             session depuis le portail, il n'y a pas de mot de passe à présenter ici",
+        );
+    }
+
     let ouvre_un_droit = match grant {
         SessionGrant::Password { password, totp } => {
             match authenticate(&state, &request.user, password, totp).await {
@@ -1703,6 +2074,31 @@ mod tests {
     #[test]
     fn la_deconnexion_expire_le_cookie() {
         assert!(session_cookie("", 0).contains("Max-Age=0"));
+    }
+
+    /// Le cookie d'une connexion en cours revient d'une navigation venue du fournisseur, donc
+    /// d'un autre site. En `SameSite=Strict` — celui du cookie de session — le navigateur ne
+    /// l'enverrait pas, et chaque connexion échouerait au retour sans que rien ne l'explique.
+    #[test]
+    fn le_cookie_de_connexion_en_cours_revient_d_un_autre_site() {
+        let cookie = pending_cookie("abc", 600);
+        for attribut in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/login"] {
+            assert!(cookie.contains(attribut), "{attribut} manquant : {cookie}");
+        }
+        assert!(!cookie.contains("SameSite=Strict"), "{cookie}");
+
+        // Et il s'efface dans toutes les issues du retour, pour qu'un `state` ne resserve pas.
+        assert!(pending_cookie("", 0).contains("Max-Age=0"));
+    }
+
+    /// L'adresse de retour est celle qui doit être déclarée chez le fournisseur : elle se
+    /// construit sur la racine du portail, sans barre oblique en trop.
+    #[test]
+    fn l_adresse_de_retour_se_construit_sur_la_racine_du_portail() {
+        assert_eq!(
+            format!("{}{OIDC_CALLBACK_PATH}", "https://identity.example.com"),
+            "https://identity.example.com/login/callback"
+        );
     }
 
     /// Le SVG est inséré tel quel dans une page HTML : il doit être un élément, pas un

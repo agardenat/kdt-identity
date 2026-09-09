@@ -96,6 +96,27 @@ pub async fn run(client: Client, config: ServerConfig) {
         tokio::spawn(async move { resync::run(users, groups, directory).await });
     }
 
+    // Le fournisseur ne se relit que si son API a été déclarée. Sans elle, l'appartenance ne
+    // bouge qu'aux connexions interactives — ce que la configuration compense en plafonnant le
+    // droit de renouveler.
+    if let Some(oidc) = config.oidc_auth.as_ref() {
+        match crate::oidc_auth::Resync::from_config(oidc) {
+            Ok(Some(source)) => {
+                let users = ctx.users.clone();
+                let groups = ctx.groups.clone();
+                let source = Arc::new(source);
+                tokio::spawn(async move { resync::run(users, groups, source).await });
+            }
+            Ok(None) => tracing::info!(
+                "aucun accès déclaré à l'API du fournisseur : l'appartenance ne sera relue qu'aux \
+                 connexions"
+            ),
+            // Le contrôleur continue sans relecture plutôt que de s'arrêter : les deux
+            // réconciliations qu'il porte, elles, n'ont besoin de personne.
+            Err(e) => tracing::error!(erreur = %e, "relecture du fournisseur non démarrée"),
+        }
+    }
+
     let (mut tx, on_user_change) = futures::channel::mpsc::channel::<()>(1);
     let watched_users = ctx.users.clone();
     tokio::spawn(async move {

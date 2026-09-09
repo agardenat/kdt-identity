@@ -5,15 +5,18 @@ kdt-identity a **deux modes indépendants**, et il faut les distinguer avant de 
 | Axe | Valeur | Répond à | Valeurs |
 |---|---|---|---|
 | Mode de délivrance | `credentialMode` | ce que le portail **remet** | `certificate`, `oidc` |
-| Mode d'authentification | `authMode` | qui il **reconnaît** | `local`, `ldap` |
+| Mode d'authentification | `authMode` | qui il **reconnaît** | `local`, `ldap`, `oidc` |
 
-Ils se combinent librement : les quatre couples sont valides. Un annuaire d'entreprise peut
-aussi bien aboutir à un certificat qu'à un jeton, et changer l'un n'oblige jamais à toucher
-l'autre.
+Ils se combinent librement : les six couples sont valides. Un annuaire d'entreprise peut aussi
+bien aboutir à un certificat qu'à un jeton, et changer l'un n'oblige jamais à toucher l'autre.
 
 Ce document traite du mode de délivrance. Pour le mode d'authentification, voir
-[ldap.md](ldap.md) — en `local`, le défaut, les comptes vivent dans le cluster et il n'y a rien
-à configurer.
+[ldap.md](ldap.md) et [fournisseur-oidc.md](fournisseur-oidc.md) — en `local`, le défaut, les
+comptes vivent dans le cluster et il n'y a rien à configurer.
+
+⚠️ `oidc` désigne deux choses différentes selon l'axe. En délivrance, le portail **émet** des
+jetons que l'apiserver vérifie. En authentification, il **consomme** ceux d'un fournisseur. Les
+deux sont indépendants, et un déploiement peut n'en avoir aucun comme les avoir tous les deux.
 
 ## Les deux modes de délivrance
 

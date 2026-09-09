@@ -8,6 +8,56 @@ tag `v<version>` qui a déclenché sa publication.
 Les notes de version publiées avec un tag sont la section correspondante de ce fichier, extraite
 par `packaging/changelog-section.sh` : ce fichier est la source, pas une copie.
 
+## [1.3.0] — 2026-09-09
+
+- **feat(server, cli)** — **fédération d'identité sur un fournisseur OpenID Connect**, Entra ID,
+  Keycloak ou Okta. `authMode: oidc` fait du fournisseur la source des identités : le portail
+  n'accepte plus aucun mot de passe, il redirige le navigateur et échange le code contre un jeton
+  d'identité dont il tire le compte et ses groupes. Le `KdtUser` est créé à la première connexion
+  réussie, comme en mode ldap.
+
+  Le refus du mot de passe est posé à trois endroits — le formulaire n'est pas monté, l'API rejette
+  la demande avant toute lecture, la fonction d'authentification a un cas qui refuse. Laisser
+  subsister cette porte à côté du fournisseur reviendrait à contourner tout ce qu'il applique :
+  second facteur, accès conditionnel, départ d'un collaborateur.
+
+  La correspondance entre groupes du fournisseur et `KdtGroup` est **déclarée**, comme en LDAP :
+  `oidcAuth.groupMappings`, avec la valeur telle qu'elle figure dans le claim — chez Entra ID, un
+  GUID. Ce qui n'y figure pas n'existe pas côté cluster.
+
+  Le compte est **épinglé** sur le claim `sub`, ou sur un autre que la configuration nomme : le nom
+  du `KdtUser` est dérivé de `preferred_username` par une normalisation qui n'est pas injective, et
+  l'épinglage est ce qui empêche deux identités d'aboutir au même compte. Chez Entra ID, `oid` est
+  le meilleur choix — `sub` y est propre à l'application.
+
+  Voir [docs/fournisseur-oidc.md](docs/fournisseur-oidc.md).
+
+- **feat(cli)** — **le plugin ouvre sa session par le navigateur** quand le portail délègue. Il
+  devient un second client du flow d'autorisation déjà écrit pour kdt-web : port éphémère sur la
+  boucle locale, PKCE, et une session ordinaire au bout — même cache, même renouvellement
+  silencieux, même révocation. Rien n'est à déclarer chez le fournisseur pour lui : son adresse de
+  retour est un port local, que le portail accepte pour cette raison (RFC 8252 §7.3).
+
+  L'URL est affichée même quand le navigateur s'ouvre : sur une session distante il n'y a rien à
+  ouvrir, et c'est alors le seul moyen de continuer. `--browser` force ce chemin en `local` et en
+  `ldap`, pour qui préfère son navigateur au terminal.
+
+- **feat(server)** — **relecture périodique du fournisseur**, quand l'accès à son API est déclaré
+  (`oidcAuth.graph`). Elle répond à deux manques d'un coup : au-delà d'environ deux cents groupes,
+  Entra ID cesse de les mettre dans le jeton et n'y laisse qu'un renvoi — sans cet accès, la
+  personne la mieux dotée en groupes est celle dont la connexion est refusée ; et une session se
+  renouvelant sans jamais revenir au fournisseur, un retrait de groupe fait chez lui n'aurait
+  d'effet qu'à la prochaine connexion interactive.
+
+  Sans cet accès, `refreshTtl` est **plafonné à 24 h** pour borner ce retard ; le déclarer lève le
+  plafond. Un compte supprimé **ou fermé** chez le fournisseur passe en `spec.disabled` — le mode
+  ldap ne connaît que la disparition d'une entrée, alors qu'un départ se traduit d'abord par un
+  `accountEnabled: false`.
+
+- **change(server)** — le flow d'autorisation est désormais monté **même sans `webUrl`** : le
+  plugin en est un client permanent. La page d'accord nomme l'application par un libellé lisible —
+  « kdt-web », « le plugin kubectl, sur ce poste » — au lieu de son identifiant.
+
 ## [1.2.1] — 2026-09-09
 
 - **chore(release)** — le chart est publié dans un **dépôt Helm**, partagé avec celui de kdt-web :

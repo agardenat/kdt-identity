@@ -95,19 +95,39 @@ pub struct CodePayload {
     pub j: String,
 }
 
-/// L'application déclarée dans la configuration. Il n'y en a qu'une : kdt-web.
-///
-/// Pas de registre dynamique, pas d'enregistrement à chaud. Approuver une application qui parle
-/// à ce portail revient à lui confier des identités du cluster : c'est un geste de déploiement,
-/// il vit dans les valeurs du chart et se relit dans un dépôt GitOps.
+/// Comment les adresses de retour d'un client sont reconnues.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Client {
-    pub id: String,
-    /// Adresses de retour acceptées, comparées **en entier**.
+pub enum Redirects {
+    /// Adresses déclarées, comparées **en entier**.
     ///
     /// Jamais par préfixe : `https://kdt.example.com/` suivi d'un préfixe accepterait
     /// `https://kdt.example.com.attaquant.test/`, et un code redirigé est un code donné.
-    pub redirect_uris: Vec<String>,
+    Exact(Vec<String>),
+    /// Boucle locale du poste, sur un port quelconque.
+    ///
+    /// C'est le seul assouplissement, et il est prévu par la RFC 8252 §7.3 pour exactement ce
+    /// cas : une application installée écoute sur un port que le système lui attribue au
+    /// lancement, et que personne ne peut donc déclarer d'avance. Ce qui reste vérifié est ce qui
+    /// compte — l'hôte est une adresse de bouclage **littérale**, jamais un nom, et le chemin est
+    /// celui-ci et aucun autre.
+    Loopback,
+}
+
+/// Une application autorisée à demander des identités.
+///
+/// Pas de registre dynamique, pas d'enregistrement à chaud. Approuver une application qui parle
+/// à ce portail revient à lui confier des identités du cluster : c'est un geste de déploiement,
+/// il vit dans les valeurs du chart et se relit dans un dépôt GitOps. La seule exception est le
+/// plugin, qui n'est pas une application tierce mais l'autre moitié de ce produit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Client {
+    pub id: String,
+    /// Nom lisible, tel que la page d'accord le nomme.
+    ///
+    /// Distinct de l'identifiant : « kdt-identity-cli » ne dit rien à qui lit la page, et c'est
+    /// pourtant sur cette page qu'un accès au cluster se donne.
+    pub label: String,
+    pub redirects: Redirects,
 }
 
 impl Client {
@@ -120,9 +140,69 @@ impl Client {
         let root = web_url.trim_end_matches('/');
         Self {
             id: DEFAULT_CLIENT_ID.to_string(),
-            redirect_uris: vec![format!("{root}{CALLBACK_PATH}")],
+            label: "kdt-web".to_string(),
+            redirects: Redirects::Exact(vec![format!("{root}{CALLBACK_PATH}")]),
         }
     }
+
+    /// Le plugin `exec`, qui écoute sur la boucle locale le temps d'une connexion.
+    ///
+    /// Toujours déclaré, dans tous les modes : c'est le seul chemin d'ouverture de session en
+    /// mode oidc, et il reste utilisable ailleurs pour qui préfère son navigateur au terminal.
+    /// Il ne coûte rien à un déploiement qui ne s'en sert pas — un code n'est émis qu'après un
+    /// accord donné sur le portail, par quelqu'un qui y est déjà connecté.
+    pub fn cli() -> Self {
+        Self {
+            id: CLI_CLIENT_ID.to_string(),
+            label: "le plugin kubectl, sur ce poste".to_string(),
+            redirects: Redirects::Loopback,
+        }
+    }
+
+    fn accepts(&self, redirect_uri: &str) -> bool {
+        match &self.redirects {
+            Redirects::Exact(uris) => uris.iter().any(|uri| uri == redirect_uri),
+            Redirects::Loopback => is_loopback_redirect(redirect_uri),
+        }
+    }
+}
+
+/// Une adresse de retour sur la boucle locale, telle que le plugin la sert.
+///
+/// Écrit à la main plutôt qu'avec un analyseur d'URL : ce qui est accepté ici doit l'être pour des
+/// raisons qu'on peut énoncer, et une bibliothèque généraliste normalise des formes — hôte en
+/// majuscules, chemin avec `..`, adresse IPv4 écrite en décimal — dont aucune n'a de raison
+/// d'apparaître ici.
+fn is_loopback_redirect(redirect_uri: &str) -> bool {
+    // En clair, et c'est correct : la requête ne quitte pas la machine. C'est même exigé — un
+    // certificat pour `127.0.0.1` n'existe pas.
+    let Some(rest) = redirect_uri.strip_prefix("http://") else {
+        return false;
+    };
+
+    // Ni requête ni fragment : le portail ajoute `?code=…`, et un paramètre déjà présent
+    // changerait ce que l'application relit.
+    if rest.contains('?') || rest.contains('#') {
+        return false;
+    }
+
+    let Some((authority, path)) = rest.split_once('/') else {
+        return false;
+    };
+    if format!("/{path}") != CLI_CALLBACK_PATH {
+        return false;
+    }
+
+    // L'hôte est une adresse littérale, jamais un nom : `localhost` se résout par le système, et
+    // ce qu'il désigne dépend d'un fichier `hosts` et d'un serveur DNS.
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    if host != "127.0.0.1" && host != "[::1]" {
+        return false;
+    }
+
+    matches!(port.parse::<u16>(), Ok(port) if port > 0)
 }
 
 /// Identifiant de l'unique application déclarée, et son chemin de retour.
@@ -130,7 +210,8 @@ impl Client {
 /// Repris du contrat plutôt que redéclarés : l'application doit servir exactement l'adresse que le
 /// portail accepte, et deux constantes séparées finiraient par diverger.
 pub use kdt_identity_api::portal::{
-    AUTHORIZE_CALLBACK_PATH as CALLBACK_PATH, WEB_CLIENT_ID as DEFAULT_CLIENT_ID,
+    AUTHORIZE_CALLBACK_PATH as CALLBACK_PATH, CLI_CALLBACK_PATH, CLI_CLIENT_ID,
+    WEB_CLIENT_ID as DEFAULT_CLIENT_ID,
 };
 
 /// Vérifie qu'une demande vise bien l'application déclarée, et rend l'adresse de retour retenue.
@@ -138,12 +219,16 @@ pub use kdt_identity_api::portal::{
 /// L'ordre compte : tant que le client et l'adresse ne sont pas reconnus, **aucune redirection**
 /// ne doit avoir lieu, pas même pour signaler l'erreur. Rediriger vers une adresse non validée
 /// est exactement ce que cette fonction existe pour empêcher.
-pub fn check(query: &AuthorizeQuery, client: Option<&Client>) -> Result<String, AuthorizeError> {
-    let client = client.ok_or(AuthorizeError::UnknownClient)?;
-    if query.client_id != client.id {
-        return Err(AuthorizeError::UnknownClient);
-    }
-    if !client.redirect_uris.iter().any(|uri| uri == &query.redirect_uri) {
+pub fn check<'a>(
+    query: &AuthorizeQuery,
+    clients: &'a [Client],
+) -> Result<(String, &'a Client), AuthorizeError> {
+    let client = clients
+        .iter()
+        .find(|client| client.id == query.client_id)
+        .ok_or(AuthorizeError::UnknownClient)?;
+
+    if !client.accepts(&query.redirect_uri) {
         return Err(AuthorizeError::UnknownRedirect);
     }
 
@@ -156,7 +241,7 @@ pub fn check(query: &AuthorizeQuery, client: Option<&Client>) -> Result<String, 
         return Err(AuthorizeError::BadChallenge);
     }
 
-    Ok(query.redirect_uri.clone())
+    Ok((query.redirect_uri.clone(), client))
 }
 
 /// Vérifie qu'un vérificateur correspond au défi enfermé dans le code.
@@ -291,29 +376,36 @@ mod tests {
     #[test]
     fn l_adresse_de_retour_se_deduit_de_la_racine() {
         assert_eq!(
-            client().redirect_uris,
-            vec!["https://kdt.example.com/auth/callback".to_string()]
+            client().redirects,
+            Redirects::Exact(vec!["https://kdt.example.com/auth/callback".to_string()])
         );
         // Une barre oblique finale ne doit pas produire une adresse à double barre.
         assert_eq!(
-            Client::from_web_url("https://kdt.example.com/").redirect_uris,
-            vec!["https://kdt.example.com/auth/callback".to_string()]
+            Client::from_web_url("https://kdt.example.com/").redirects,
+            Redirects::Exact(vec!["https://kdt.example.com/auth/callback".to_string()])
         );
     }
 
     #[test]
     fn une_demande_conforme_est_acceptee() {
         assert_eq!(
-            check(&query(), Some(&client())).unwrap(),
+            check(&query(), &[client()]).unwrap().0,
             "https://kdt.example.com/auth/callback"
         );
     }
 
-    /// Sans application déclarée, le flow n'existe pas : kdt-web est facultatif, et un portail
-    /// qui n'en connaît aucune ne doit autoriser personne.
+    /// kdt-web est facultatif : un portail où il n'est pas déclaré ne doit pas l'autoriser
+    /// parce qu'un autre client, lui, existe.
     #[test]
-    fn sans_application_declaree_tout_est_refuse() {
-        assert_eq!(check(&query(), None), Err(AuthorizeError::UnknownClient));
+    fn une_application_non_declaree_est_refusee() {
+        assert_eq!(
+            check(&query(), &[]).map(|(uri, _)| uri),
+            Err(AuthorizeError::UnknownClient)
+        );
+        assert_eq!(
+            check(&query(), &[Client::cli()]).map(|(uri, _)| uri),
+            Err(AuthorizeError::UnknownClient)
+        );
     }
 
     /// Le test qui justifie la comparaison en entier : un préfixe accepterait un domaine voisin
@@ -331,18 +423,91 @@ mod tests {
             let mut q = query();
             q.redirect_uri = usurpee.to_string();
             assert_eq!(
-                check(&q, Some(&client())),
+                check(&q, &[client()]).map(|(uri, _)| uri),
                 Err(AuthorizeError::UnknownRedirect),
                 "{usurpee} accepté à tort"
             );
         }
     }
 
+    /// Le port d'un client installé n'est connu qu'à son lancement : la RFC 8252 §7.3 demande
+    /// donc de l'accepter quel qu'il soit. Tout le reste de l'adresse, lui, reste fixé.
+    #[test]
+    fn la_boucle_locale_est_acceptee_sur_n_importe_quel_port() {
+        for retour in [
+            "http://127.0.0.1:1024/callback",
+            "http://127.0.0.1:65535/callback",
+            "http://[::1]:41234/callback",
+        ] {
+            let mut q = query();
+            q.client_id = CLI_CLIENT_ID.to_string();
+            q.redirect_uri = retour.to_string();
+            assert_eq!(
+                check(&q, &[Client::cli()]).map(|(uri, _)| uri),
+                Ok(retour.to_string()),
+                "{retour} refusé à tort"
+            );
+        }
+    }
+
+    /// Ce que l'assouplissement du port ne doit surtout pas ouvrir. `localhost` en fait partie :
+    /// c'est un nom, et ce qu'il désigne dépend d'un fichier `hosts` et d'un résolveur.
+    #[test]
+    fn une_boucle_locale_contrefaite_est_refusee() {
+        for usurpee in [
+            "http://localhost:8080/callback",
+            "http://127.0.0.1:8080/callback?next=https://evil.test",
+            "http://127.0.0.1:8080/callback#x",
+            "http://127.0.0.1:8080/callback/",
+            "http://127.0.0.1:8080/autre",
+            "http://127.0.0.1/callback",
+            "http://127.0.0.1:0/callback",
+            "http://127.0.0.1:99999/callback",
+            "http://127.0.0.1:8080@evil.test/callback",
+            "http://evil.test/callback",
+            "https://127.0.0.1:8080/callback",
+            "http://127.0.0.2:8080/callback",
+        ] {
+            let mut q = query();
+            q.client_id = CLI_CLIENT_ID.to_string();
+            q.redirect_uri = usurpee.to_string();
+            assert_eq!(
+                check(&q, &[Client::cli()]).map(|(uri, _)| uri),
+                Err(AuthorizeError::UnknownRedirect),
+                "{usurpee} accepté à tort"
+            );
+        }
+    }
+
+    /// Les deux clients coexistent sans que l'un ouvre les adresses de l'autre : un code émis
+    /// pour kdt-web ne doit pas pouvoir partir vers un port local, ni l'inverse.
+    #[test]
+    fn chaque_client_garde_ses_adresses() {
+        let clients = [Client::cli(), client()];
+
+        let mut q = query();
+        q.redirect_uri = "http://127.0.0.1:8080/callback".to_string();
+        assert_eq!(
+            check(&q, &clients).map(|(uri, _)| uri),
+            Err(AuthorizeError::UnknownRedirect)
+        );
+
+        let mut q = query();
+        q.client_id = CLI_CLIENT_ID.to_string();
+        assert_eq!(
+            check(&q, &clients).map(|(uri, _)| uri),
+            Err(AuthorizeError::UnknownRedirect)
+        );
+    }
+
     #[test]
     fn un_autre_client_est_refuse() {
         let mut q = query();
         q.client_id = "autre".to_string();
-        assert_eq!(check(&q, Some(&client())), Err(AuthorizeError::UnknownClient));
+        assert_eq!(
+            check(&q, &[client()]).map(|(uri, _)| uri),
+            Err(AuthorizeError::UnknownClient)
+        );
     }
 
     /// `plain` transporterait le secret dans l'URL, ce qui revient à ne rien protéger.
@@ -352,7 +517,7 @@ mod tests {
             let mut q = query();
             q.code_challenge_method = methode.to_string();
             assert_eq!(
-                check(&q, Some(&client())),
+                check(&q, &[client()]).map(|(uri, _)| uri),
                 Err(AuthorizeError::BadChallengeMethod),
                 "{methode:?} accepté à tort"
             );
@@ -366,7 +531,7 @@ mod tests {
             q.code_challenge = defi.to_string();
             assert!(
                 matches!(
-                    check(&q, Some(&client())),
+                    check(&q, &[client()]).map(|(uri, _)| uri),
                     Err(AuthorizeError::BadChallenge)
                 ),
                 "{defi:?} accepté à tort"

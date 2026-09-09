@@ -23,7 +23,8 @@
 //! ```
 
 use kdt_identity_server::config::{LdapConfig, DEFAULT_LDAP_RESYNC, DEFAULT_LDAP_TIMEOUT};
-use kdt_identity_server::ldap::mapping::GroupMappings;
+use kdt_identity_server::federation::mapping::GroupMappings;
+use kdt_identity_server::federation::Source;
 use kdt_identity_server::ldap::profile::LdapProfile;
 use kdt_identity_server::ldap::{Directory, LdapError};
 use zeroize::Zeroizing;
@@ -50,10 +51,13 @@ fn directory() -> Directory {
         .map(Zeroizing::new);
 
     let group_dn = var("KDT_TEST_LDAP_GROUP_DN");
-    let mappings = GroupMappings::parse(&format!(
-        r#"[{{"dn": {}, "group": "e2e-groupe"}}]"#,
-        serde_json::to_string(&group_dn).unwrap()
-    ))
+    let mappings = GroupMappings::parse(
+        &format!(
+            r#"[{{"dn": {}, "group": "e2e-groupe"}}]"#,
+            serde_json::to_string(&group_dn).unwrap()
+        ),
+        Source::Ldap,
+    )
     .expect("table de correspondance");
 
     Directory::new(LdapConfig {
@@ -85,7 +89,7 @@ async fn le_profil_retenu_trouve_la_personne() {
         .expect("recherche")
         .expect("le compte de test doit exister dans l'annuaire");
 
-    println!("dn           : {}", user.dn);
+    println!("dn           : {}", user.pin);
     println!("login        : {}", user.login);
     println!("email        : {:?}", user.email);
     println!("nom affiché  : {:?}", user.display_name);
@@ -168,7 +172,7 @@ async fn la_relecture_par_dn_retrouve_la_meme_personne() {
         .expect("le compte de test doit exister");
 
     let par_dn = directory
-        .lookup_dn(&par_login.dn)
+        .lookup_dn(&par_login.pin)
         .await
         .expect("relecture")
         .expect("le DN qui vient d'être lu doit se relire");

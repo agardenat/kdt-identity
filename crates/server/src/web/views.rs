@@ -196,6 +196,45 @@ pub fn login(error: Option<&str>, next: Option<&str>) -> Markup {
     )
 }
 
+/// Page de connexion d'un portail qui délègue à un fournisseur d'identité.
+///
+/// Un bouton, et non une redirection immédiate. Deux raisons, dont la seconde est la vraie :
+/// après une déconnexion, une redirection automatique renverrait aussitôt chez un fournisseur
+/// dont la session, elle, est toujours ouverte — la personne se retrouverait reconnectée sans
+/// l'avoir demandé. Et un départ déclenché par le seul chargement d'une page est un départ que
+/// n'importe quel site tiers peut provoquer.
+pub fn login_oidc(provider: &str, error: Option<&str>, next: Option<&str>) -> Markup {
+    page(
+        "Connexion",
+        html! {
+            div."card" {
+                h1 { "Connexion" }
+                p."sub" {
+                    @if next.is_some() {
+                        "Connectez-vous pour autoriser l'accès demandé."
+                    } @else {
+                        "Portail d'accès au cluster Kubernetes."
+                    }
+                }
+                (error_box(error))
+
+                p."sub" { "Ce portail délègue l'authentification à " (provider) "." }
+
+                // Un formulaire plutôt qu'un lien : le style du bouton est déjà celui des
+                // autres pages, et le paramètre de reprise est encodé par le navigateur plutôt
+                // qu'à la main.
+                form method="get" action="/login/oidc" {
+                    @if let Some(next) = next {
+                        input type="hidden" name="next" value=(next);
+                    }
+                    button type="submit" { "Se connecter avec " (provider) }
+                }
+            }
+            footer { "kdt-identity" }
+        },
+    )
+}
+
 /// Page du compte : identité effective et téléchargement du kubeconfig.
 /// Ce qu'il faut pour rendre la page « Mon accès ».
 ///
@@ -446,6 +485,37 @@ pub fn message(title: &str, heading: &str, body: &str) -> Markup {
 
 #[cfg(test)]
 mod tests {
+    /// Un portail qui délègue ne montre aucun champ de mot de passe : il n'en vérifierait aucun,
+    /// et en montrer un inviterait à saisir le mot de passe du fournisseur dans une page qui
+    /// n'est pas la sienne.
+    #[test]
+    fn la_page_de_connexion_deleguee_ne_demande_aucun_secret() {
+        let rendu = login_oidc("Entra ID", None, None).into_string();
+
+        assert!(!rendu.contains("type=\"password\""), "{rendu}");
+        assert!(!rendu.contains("one-time-code"), "{rendu}");
+        assert!(rendu.contains("Se connecter avec Entra ID"), "{rendu}");
+        assert!(rendu.contains("action=\"/login/oidc\""), "{rendu}");
+    }
+
+    /// Le nom du fournisseur vient de la configuration, donc d'ailleurs : il est échappé comme
+    /// tout le reste.
+    #[test]
+    fn le_nom_du_fournisseur_est_echappe() {
+        let rendu = login_oidc("<script>alerte</script>", None, None).into_string();
+        assert!(!rendu.contains("<script>alerte"), "{rendu}");
+        assert!(rendu.contains("&lt;script&gt;"), "{rendu}");
+    }
+
+    /// La reprise après connexion traverse le départ vers le fournisseur : sans elle, une
+    /// autorisation demandée par kdt-web se perdrait et il faudrait la redemander.
+    #[test]
+    fn la_page_deleguee_conserve_la_reprise() {
+        let rendu = login_oidc("Entra ID", None, Some("/authorize?client_id=kdt-web")).into_string();
+        assert!(rendu.contains("name=\"next\""), "{rendu}");
+        assert!(rendu.contains("/authorize?client_id=kdt-web"), "{rendu}");
+    }
+
     use super::*;
 
     /// Une variable CSS non définie tombe sur sa valeur de repli, ou sur rien du tout : un

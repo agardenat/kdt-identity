@@ -14,28 +14,13 @@
 //! recherche en changerait l'identité au milieu de son usage.
 
 pub mod filter;
-pub mod mapping;
 pub mod profile;
-pub mod provision;
 pub mod trust;
 
 use crate::config::LdapConfig;
+use crate::federation::{self, FederatedUser};
 use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
 use tracing::warn;
-
-/// Ce que l'annuaire dit d'une personne.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirectoryUser {
-    /// DN de l'entrée, tel que l'annuaire le rend. Épinglé sur le `KdtUser` à sa création, et
-    /// revérifié à chaque connexion.
-    pub dn: String,
-    /// Identifiant de connexion, tel que l'annuaire le porte — pas tel qu'il a été saisi.
-    pub login: String,
-    pub email: Option<String>,
-    pub display_name: Option<String>,
-    /// DN des groupes de la personne, avant toute correspondance.
-    pub member_of: Vec<String>,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum LdapError {
@@ -59,8 +44,56 @@ pub enum LdapError {
     Cluster(String),
 }
 
+/// Ce que le provisionnement peut refuser, traduit dans les termes de l'annuaire.
+///
+/// La distinction entre une entrée inutilisable et un cluster qui ne suit pas est déjà faite
+/// par [`federation::Error`] : la reporter ici garde les journaux et le verrouillage identiques
+/// quelle que soit l'étape qui a échoué.
+impl From<federation::Error> for LdapError {
+    fn from(error: federation::Error) -> Self {
+        match error {
+            federation::Error::Unusable(raison) => Self::Unusable(raison),
+            federation::Error::Unavailable(raison) => Self::Unavailable(raison),
+            federation::Error::Cluster(raison) => Self::Cluster(raison),
+        }
+    }
+}
+
 pub struct Directory {
     config: LdapConfig,
+}
+
+/// L'annuaire vu par la relecture périodique.
+///
+/// Une entrée est désignée par son DN, qui est ce que le compte a épinglé : son nom kdt est une
+/// forme *normalisée* de l'identifiant, qu'on ne sait pas dénormaliser.
+impl federation::Federated for Directory {
+    fn source(&self) -> federation::Source {
+        federation::Source::Ldap
+    }
+
+    fn interval(&self) -> std::time::Duration {
+        self.config.resync
+    }
+
+    fn mappings(&self) -> &crate::federation::mapping::GroupMappings {
+        &self.config.group_mappings
+    }
+
+    async fn lookup_groups(
+        &self,
+        pin: &str,
+    ) -> Result<Option<Vec<String>>, federation::Error> {
+        match self.lookup_dn(pin).await {
+            Ok(entry) => Ok(entry.map(|user| user.member_of)),
+            Err(LdapError::Unusable(raison)) => Err(federation::Error::Unusable(raison)),
+            Err(LdapError::Cluster(raison)) => Err(federation::Error::Cluster(raison)),
+            // Un refus d'identifiants n'a pas de sens ici — rien n'est présenté — mais s'il
+            // survenait, ce serait le bind de service : une panne de configuration, pas une
+            // disparition de compte.
+            Err(e) => Err(federation::Error::Unavailable(format!("{e}"))),
+        }
+    }
 }
 
 impl Directory {
@@ -77,7 +110,7 @@ impl Directory {
         &self,
         login: &str,
         password: &str,
-    ) -> Result<DirectoryUser, LdapError> {
+    ) -> Result<FederatedUser, LdapError> {
         // Un bind avec un mot de passe vide est un *bind non authentifié* : la RFC 4513 le
         // définit comme une connexion anonyme, et l'annuaire répond `success`. Sans ce refus,
         // n'importe quel identifiant existant ouvrirait une session sans mot de passe.
@@ -95,7 +128,7 @@ impl Directory {
         ldap3::drive!(conn);
 
         let resultat = ldap
-            .simple_bind(&user.dn, password)
+            .simple_bind(&user.pin, password)
             .await
             .map_err(|e| LdapError::Unavailable(format!("bind : {e}")))?;
         let refuse = resultat.success().is_err();
@@ -112,7 +145,7 @@ impl Directory {
     ///
     /// Sert à la resynchronisation : le contrôleur relit l'appartenance de comptes dont
     /// personne n'a saisi le mot de passe, et doit pouvoir constater qu'une entrée a disparu.
-    pub async fn lookup(&self, login: &str) -> Result<Option<DirectoryUser>, LdapError> {
+    pub async fn lookup(&self, login: &str) -> Result<Option<FederatedUser>, LdapError> {
         let (conn, mut ldap) = self.connect().await?;
         ldap3::drive!(conn);
 
@@ -159,7 +192,7 @@ impl Directory {
         // L'identifiant vient de l'annuaire, jamais de la saisie : c'est lui qui nommera le
         // `KdtUser`, et le laisser venir du formulaire ferait dépendre le nom du compte de la
         // casse tapée ce jour-là.
-        self.to_directory_user(entry).map(Some).ok_or_else(|| {
+        self.to_federated_user(entry).map(Some).ok_or_else(|| {
             LdapError::Unusable(format!(
                 "l'entrée {dn} ne porte pas d'attribut {}",
                 attributes.login
@@ -177,7 +210,7 @@ impl Directory {
     /// `Ok(None)` dit que l'entrée a disparu, et seulement cela : une panne remonte en
     /// [`LdapError::Unavailable`], que l'appelant ne doit surtout pas confondre avec une
     /// disparition.
-    pub async fn lookup_dn(&self, dn: &str) -> Result<Option<DirectoryUser>, LdapError> {
+    pub async fn lookup_dn(&self, dn: &str) -> Result<Option<FederatedUser>, LdapError> {
         let (conn, mut ldap) = self.connect().await?;
         ldap3::drive!(conn);
 
@@ -211,7 +244,7 @@ impl Directory {
         Ok(entries
             .into_iter()
             .next()
-            .and_then(|entry| self.to_directory_user(SearchEntry::construct(entry))))
+            .and_then(|entry| self.to_federated_user(SearchEntry::construct(entry))))
     }
 
     async fn service_bind(&self, ldap: &mut ldap3::Ldap) -> Result<(), LdapError> {
@@ -228,9 +261,9 @@ impl Directory {
     }
 
     /// Traduit une entrée en compte, ou rien si elle ne porte pas d'identifiant de connexion.
-    fn to_directory_user(&self, entry: SearchEntry) -> Option<DirectoryUser> {
+    fn to_federated_user(&self, entry: SearchEntry) -> Option<FederatedUser> {
         let attributes = &self.config.attributes;
-        Some(DirectoryUser {
+        Some(FederatedUser {
             login: first(&entry, &attributes.login)?,
             email: first(&entry, &attributes.email),
             display_name: first(&entry, &attributes.display),
@@ -240,7 +273,7 @@ impl Directory {
                 .find(|(nom, _)| nom.eq_ignore_ascii_case(&attributes.member_of))
                 .map(|(_, valeurs)| valeurs.clone())
                 .unwrap_or_default(),
-            dn: entry.dn,
+            pin: entry.dn,
         })
     }
 

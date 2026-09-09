@@ -1,19 +1,19 @@
-//! Création des comptes et report de l'appartenance depuis l'annuaire.
+//! Création des comptes et report de l'appartenance depuis une source fédérée.
 //!
 //! # Ce qui distingue un compte fédéré
 //!
-//! Un label, `identity.kdt.sh/source: ldap`, et une annotation qui garde son DN. Ni l'un ni
-//! l'autre n'est dans la spec, et c'est délibéré : les CRD n'ont pas à changer pour ça, et un
-//! label se liste (`kubectl get kdtusers -l identity.kdt.sh/source=ldap`) là où un champ de spec
-//! demanderait un `jsonpath`.
+//! Un label, `identity.kdt.sh/source`, et une annotation qui garde la valeur sur laquelle il est
+//! épinglé. Ni l'un ni l'autre n'est dans la spec, et c'est délibéré : les CRD n'ont pas à
+//! changer pour ça, et un label se liste (`kubectl get kdtusers -l
+//! identity.kdt.sh/source=ldap`) là où un champ de spec demanderait un `jsonpath`.
 //!
 //! # L'appartenance reste dans la spec
 //!
 //! La synchronisation écrit `KdtGroup.spec.members`, elle ne double pas la source de vérité.
-//! L'annuaire alimente la spec, la spec reste ce qui décide — donc `logic::member_of` et
-//! `subjects()` continuent de lire au même endroit, sans rien savoir de LDAP.
+//! La source alimente la spec, la spec reste ce qui décide — donc `logic::member_of` et
+//! `subjects()` continuent de lire au même endroit, sans rien savoir de la fédération.
 
-use super::{DirectoryUser, LdapError};
+use super::{Error, FederatedUser, Source};
 use kdt_identity_api::{validate_name, KdtGroup, KdtGroupSpec, KdtUser, KdtUserSpec};
 use kube::api::{Api, ObjectMeta, Patch, PatchParams, PostParams};
 use std::collections::BTreeMap;
@@ -21,13 +21,6 @@ use tracing::{info, warn};
 
 /// Label qui marque l'origine d'un compte ou d'un groupe.
 pub const SOURCE_LABEL: &str = "identity.kdt.sh/source";
-/// Valeur du label pour ce qui vient d'un annuaire.
-pub const SOURCE_LDAP: &str = "ldap";
-/// Annotation qui garde le DN de l'entrée d'origine.
-pub const DN_ANNOTATION: &str = "identity.kdt.sh/ldap-dn";
-
-/// Nom de gestionnaire des écritures d'appartenance.
-const FIELD_MANAGER: &str = "kdt-identity-ldap";
 
 /// Nombre de reprises sur conflit d'écriture.
 ///
@@ -35,31 +28,47 @@ const FIELD_MANAGER: &str = "kdt-identity-ldap";
 /// vouloir modifier le même groupe, et la seconde doit relire plutôt qu'écraser.
 const MAX_ATTEMPTS: usize = 3;
 
-/// Vrai si ce compte vient d'un annuaire.
+/// Vrai si ce compte vient d'une source fédérée, quelle qu'elle soit.
+///
+/// La question posée par le contrôleur est « ce compte est-il gouverné ailleurs ? », pas « par
+/// quelle source ». Un compte laissé par un ancien mode compte donc encore comme fédéré, ce qui
+/// est la réponse utile : il n'a ni mot de passe ni TOTP à lui.
 pub fn is_federated(user: &KdtUser) -> bool {
-    user.metadata
+    source_of(user).is_some()
+}
+
+/// Source qui gouverne ce compte, si elle est connue.
+pub fn source_of(user: &KdtUser) -> Option<Source> {
+    match user
+        .metadata
         .labels
         .as_ref()
         .and_then(|labels| labels.get(SOURCE_LABEL))
-        .map(|source| source == SOURCE_LDAP)
-        .unwrap_or(false)
+        .map(String::as_str)
+    {
+        Some("ldap") => Some(Source::Ldap),
+        Some("oidc") => Some(Source::Oidc),
+        _ => None,
+    }
 }
 
-/// DN épinglé sur un compte à sa création.
-pub fn recorded_dn(user: &KdtUser) -> Option<&str> {
+/// Valeur épinglée sur un compte à sa création : DN pour un annuaire, sujet pour un
+/// fournisseur.
+pub fn recorded_pin(user: &KdtUser, source: Source) -> Option<&str> {
     user.metadata
         .annotations
         .as_ref()
-        .and_then(|annotations| annotations.get(DN_ANNOTATION))
+        .and_then(|annotations| annotations.get(source.pin_annotation()))
         .map(String::as_str)
 }
 
 /// Nom de `KdtUser` correspondant à un identifiant de connexion.
 ///
-/// La normalisation est nécessaire — un `sAMAccountName` porte des majuscules et des soulignés,
-/// qu'un nom de ressource Kubernetes n'accepte pas — et elle est **ambiguë** : `Jean_Dupont` et
-/// `jean-dupont` aboutissent au même nom. C'est exactement pour ça que le DN est épinglé et
-/// revérifié : la normalisation ne garantit pas l'unicité, l'épinglage si.
+/// La normalisation est nécessaire — un `sAMAccountName` comme un `preferred_username` portent
+/// des majuscules, des soulignés et parfois un `@`, qu'un nom de ressource Kubernetes n'accepte
+/// pas — et elle est **ambiguë** : `Jean_Dupont` et `jean-dupont` aboutissent au même nom. C'est
+/// exactement pour ça que la valeur d'origine est épinglée et revérifiée : la normalisation ne
+/// garantit pas l'unicité, l'épinglage si.
 pub fn normalize_login(login: &str) -> Result<String, String> {
     let normalise: String = login
         .trim()
@@ -76,31 +85,32 @@ pub fn normalize_login(login: &str) -> Result<String, String> {
 
 /// Garantit qu'un `KdtUser` existe pour cette personne, et le rend.
 ///
-/// Le compte est créé s'il manque. S'il existe, son DN est **revérifié** : c'est la barrière qui
-/// empêche deux identités distinctes de l'annuaire, normalisées vers le même nom, de partager un
-/// compte — et donc à la seconde d'hériter des droits de la première.
+/// Le compte est créé s'il manque. S'il existe, sa valeur épinglée est **revérifiée** : c'est la
+/// barrière qui empêche deux identités distinctes de la source, normalisées vers le même nom, de
+/// partager un compte — et donc à la seconde d'hériter des droits de la première.
 pub async fn ensure_user(
     users: &Api<KdtUser>,
-    directory_user: &DirectoryUser,
-) -> Result<KdtUser, LdapError> {
-    let name = normalize_login(&directory_user.login).map_err(LdapError::Unusable)?;
+    federated: &FederatedUser,
+    source: Source,
+) -> Result<KdtUser, Error> {
+    let name = normalize_login(&federated.login).map_err(Error::Unusable)?;
 
     let existant = users
         .get_opt(&name)
         .await
-        .map_err(|e| LdapError::Cluster(format!("lecture du compte {name} : {e}")))?;
+        .map_err(|e| Error::Cluster(format!("lecture du compte {name} : {e}")))?;
 
     if let Some(user) = existant {
-        return verify_existing(user, &name, directory_user);
+        return verify_existing(user, &name, federated, source);
     }
 
     // `KdtUserSpec::email` est requis par le schéma : sans adresse, l'objet serait refusé par
     // l'apiserver. Le dire ici nomme l'attribut manquant, plutôt que de laisser remonter une
     // erreur de validation qui parle de `spec.email`.
-    let email = directory_user.email.clone().ok_or_else(|| {
-        LdapError::Unusable(format!(
-            "l'entrée {} ne porte pas d'adresse électronique, requise pour créer le compte",
-            directory_user.dn
+    let email = federated.email.clone().ok_or_else(|| {
+        Error::Unusable(format!(
+            "l'identité {} ne porte pas d'adresse électronique, requise pour créer le compte",
+            federated.pin
         ))
     })?;
 
@@ -109,17 +119,17 @@ pub async fn ensure_user(
             name: Some(name.clone()),
             labels: Some(BTreeMap::from([(
                 SOURCE_LABEL.to_string(),
-                SOURCE_LDAP.to_string(),
+                source.label().to_string(),
             )])),
             annotations: Some(BTreeMap::from([(
-                DN_ANNOTATION.to_string(),
-                directory_user.dn.clone(),
+                source.pin_annotation().to_string(),
+                federated.pin.clone(),
             )])),
             ..Default::default()
         },
         spec: KdtUserSpec {
             email,
-            display_name: directory_user.display_name.clone(),
+            display_name: federated.display_name.clone(),
             disabled: false,
         },
         status: None,
@@ -127,7 +137,7 @@ pub async fn ensure_user(
 
     match users.create(&PostParams::default(), &user).await {
         Ok(cree) => {
-            info!(compte = %name, dn = %directory_user.dn, "compte créé depuis l'annuaire");
+            info!(compte = %name, source = %source, epingle = %federated.pin, "compte créé depuis la fédération");
             Ok(cree)
         }
         // Deux connexions simultanées de la même personne : l'autre a gagné, et son objet est
@@ -136,12 +146,10 @@ pub async fn ensure_user(
             let user = users
                 .get(&name)
                 .await
-                .map_err(|e| LdapError::Cluster(format!("relecture du compte {name} : {e}")))?;
-            verify_existing(user, &name, directory_user)
+                .map_err(|e| Error::Cluster(format!("relecture du compte {name} : {e}")))?;
+            verify_existing(user, &name, federated, source)
         }
-        Err(e) => Err(LdapError::Cluster(format!(
-            "création du compte {name} : {e}"
-        ))),
+        Err(e) => Err(Error::Cluster(format!("création du compte {name} : {e}"))),
     }
 }
 
@@ -149,44 +157,44 @@ pub async fn ensure_user(
 fn verify_existing(
     user: KdtUser,
     name: &str,
-    directory_user: &DirectoryUser,
-) -> Result<KdtUser, LdapError> {
-    match recorded_dn(&user) {
-        // Le cas nominal : le même DN qu'à la création.
-        Some(dn) if super::mapping::normalize_dn(dn) == super::mapping::normalize_dn(&directory_user.dn) => {
-            Ok(user)
-        }
-        // Un DN différent sous le même nom : deux personnes de l'annuaire se disputent un
+    federated: &FederatedUser,
+    source: Source,
+) -> Result<KdtUser, Error> {
+    match recorded_pin(&user, source) {
+        // Le cas nominal : la même valeur épinglée qu'à la création.
+        Some(pin) if source.same_pin(pin, &federated.pin) => Ok(user),
+        // Une valeur différente sous le même nom : deux personnes de la source se disputent un
         // compte. Refusé, jamais arbitré — laisser passer donnerait à la seconde les droits de
         // la première.
-        Some(dn) => {
+        Some(pin) => {
             warn!(
                 compte = %name,
-                dn_epingle = %dn,
-                dn_presente = %directory_user.dn,
-                "le compte est épinglé sur un autre DN, connexion refusée"
+                epingle = %pin,
+                presente = %federated.pin,
+                "le compte est épinglé sur une autre identité, connexion refusée"
             );
-            Err(LdapError::Unusable(format!(
-                "le compte {name} est déjà rattaché à une autre entrée de l'annuaire"
+            Err(Error::Unusable(format!(
+                "le compte {name} est déjà rattaché à une autre identité"
             )))
         }
-        // Un compte local qui porte ce nom. On ne le fédère pas d'office : ce serait prendre
-        // possession d'un compte que quelqu'un a créé à la main, avec son mot de passe et son
-        // TOTP.
+        // Un compte local — ou venu d'une autre source — porte ce nom. On ne le reprend pas
+        // d'office : ce serait prendre possession d'un compte que quelqu'un a créé à la main,
+        // avec son mot de passe et son TOTP, ou qu'une autre fédération gouverne.
         None => {
             warn!(
                 compte = %name,
-                dn = %directory_user.dn,
-                "un compte local porte déjà ce nom, connexion refusée"
+                epingle_par = ?source_of(&user).map(|s| s.label()),
+                presente = %federated.pin,
+                "un compte de même nom existe déjà sans être épinglé sur cette source, connexion refusée"
             );
-            Err(LdapError::Unusable(format!(
-                "un compte local nommé {name} existe déjà"
+            Err(Error::Unusable(format!(
+                "un compte nommé {name} existe déjà et n'est pas gouverné par cette source"
             )))
         }
     }
 }
 
-/// Aligne l'appartenance de cette personne sur ce que dit l'annuaire.
+/// Aligne l'appartenance de cette personne sur ce que dit la source.
 ///
 /// `wanted` est ce à quoi elle a droit, `managed` l'ensemble des groupes que la table de
 /// correspondance gouverne. Le second est nécessaire : sans lui on saurait ajouter, jamais
@@ -196,10 +204,11 @@ pub async fn sync_groups(
     user: &str,
     wanted: &[String],
     managed: &[String],
-) -> Result<(), LdapError> {
+    source: Source,
+) -> Result<(), Error> {
     for group in managed {
         let member = wanted.iter().any(|g| g == group);
-        sync_one(groups, group, user, member).await?;
+        sync_one(groups, group, user, member, source).await?;
     }
     Ok(())
 }
@@ -209,12 +218,13 @@ async fn sync_one(
     group: &str,
     user: &str,
     member: bool,
-) -> Result<(), LdapError> {
+    source: Source,
+) -> Result<(), Error> {
     for _ in 0..MAX_ATTEMPTS {
         let existant = groups
             .get_opt(group)
             .await
-            .map_err(|e| LdapError::Cluster(format!("lecture du groupe {group} : {e}")))?;
+            .map_err(|e| Error::Cluster(format!("lecture du groupe {group} : {e}")))?;
 
         let Some(mut objet) = existant else {
             // Le groupe est déclaré dans la table mais n'existe pas encore. Le créer vide quand
@@ -224,29 +234,27 @@ async fn sync_one(
                 return Ok(());
             }
             match groups
-                .create(&PostParams::default(), &federated_group(group, user))
+                .create(&PostParams::default(), &federated_group(group, user, source))
                 .await
             {
                 Ok(_) => {
-                    info!(groupe = %group, "groupe créé depuis l'annuaire");
+                    info!(groupe = %group, source = %source, "groupe créé depuis la fédération");
                     return Ok(());
                 }
                 // Créé entre-temps par une autre connexion : on repasse par la lecture.
                 Err(kube::Error::Api(e)) if e.code == 409 => continue,
-                Err(e) => {
-                    return Err(LdapError::Cluster(format!(
-                        "création du groupe {group} : {e}"
-                    )))
-                }
+                Err(e) => return Err(Error::Cluster(format!("création du groupe {group} : {e}"))),
             }
         };
 
-        // Un groupe qui n'est pas marqué comme venant de l'annuaire est géré à la main. Y
-        // écrire écraserait le travail d'un administrateur, et le silence serait total.
-        if !group_is_federated(&objet) {
+        // Un groupe qui n'est pas marqué comme venant de cette source est géré à la main, ou
+        // par une autre. Y écrire écraserait le travail d'un administrateur, et le silence
+        // serait total.
+        if !group_is_from(&objet, source) {
             warn!(
                 groupe = %group,
-                "groupe déclaré dans la table mais non fédéré, appartenance laissée intacte"
+                source = %source,
+                "groupe déclaré dans la table mais gouverné ailleurs, appartenance laissée intacte"
             );
             return Ok(());
         }
@@ -263,14 +271,14 @@ async fn sync_one(
             Ok(_) => return Ok(()),
             Err(kube::Error::Api(e)) if e.code == 409 => continue,
             Err(e) => {
-                return Err(LdapError::Cluster(format!(
+                return Err(Error::Cluster(format!(
                     "mise à jour du groupe {group} : {e}"
                 )))
             }
         }
     }
 
-    Err(LdapError::Cluster(format!(
+    Err(Error::Cluster(format!(
         "groupe {group} modifié sans relâche par ailleurs, abandon après {MAX_ATTEMPTS} essais"
     )))
 }
@@ -294,49 +302,53 @@ pub fn members_after(current: &[String], user: &str, member: bool) -> Option<Vec
     Some(members)
 }
 
-fn group_is_federated(group: &KdtGroup) -> bool {
+fn group_is_from(group: &KdtGroup, source: Source) -> bool {
     group
         .metadata
         .labels
         .as_ref()
         .and_then(|labels| labels.get(SOURCE_LABEL))
-        .map(|source| source == SOURCE_LDAP)
+        .map(|label| label == source.label())
         .unwrap_or(false)
 }
 
-fn federated_group(name: &str, user: &str) -> KdtGroup {
+fn federated_group(name: &str, user: &str, source: Source) -> KdtGroup {
     KdtGroup {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             labels: Some(BTreeMap::from([(
                 SOURCE_LABEL.to_string(),
-                SOURCE_LDAP.to_string(),
+                source.label().to_string(),
             )])),
             ..Default::default()
         },
         spec: KdtGroupSpec {
-            description: Some("Groupe alimenté depuis l'annuaire.".to_string()),
+            description: Some(source.group_description().to_string()),
             members: vec![user.to_string()],
         },
         status: None,
     }
 }
 
-/// Désactive un compte dont l'entrée a disparu de l'annuaire.
+/// Désactive un compte dont l'identité a disparu de la source.
 ///
 /// Désactivé, jamais supprimé : un compte effacé emporterait ses `Secret` par cascade, et une
-/// panne de lecture de l'annuaire prise pour une disparition ferait perdre des comptes. La
+/// panne de lecture de la source prise pour une disparition ferait perdre des comptes. La
 /// désactivation, elle, se défait — et le contrôleur ferme déjà les sessions qu'elle laisse
 /// ouvertes.
-pub async fn disable(users: &Api<KdtUser>, name: &str) -> Result<(), LdapError> {
+pub async fn disable(users: &Api<KdtUser>, name: &str, source: Source) -> Result<(), Error> {
     let patch = serde_json::json!({ "spec": { "disabled": true } });
 
     users
-        .patch(name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Merge(&patch))
+        .patch(
+            name,
+            &PatchParams::apply(source.field_manager()).force(),
+            &Patch::Merge(&patch),
+        )
         .await
-        .map_err(|e| LdapError::Cluster(format!("désactivation du compte {name} : {e}")))?;
+        .map_err(|e| Error::Cluster(format!("désactivation du compte {name} : {e}")))?;
 
-    info!(compte = %name, "compte désactivé, entrée absente de l'annuaire");
+    info!(compte = %name, source = %source, "compte désactivé, identité absente de la source");
     Ok(())
 }
 
@@ -371,9 +383,9 @@ mod tests {
         }
     }
 
-    fn directory_user(dn: &str) -> DirectoryUser {
-        DirectoryUser {
-            dn: dn.to_string(),
+    fn federated(pin: &str) -> FederatedUser {
+        FederatedUser {
+            pin: pin.to_string(),
             login: "alice".to_string(),
             email: Some("alice@example.com".to_string()),
             display_name: None,
@@ -398,9 +410,9 @@ mod tests {
         }
     }
 
-    /// Le test qui justifie tout l'épinglage. Deux identités distinctes de l'annuaire donnent
-    /// le même nom kdt : sans vérification du DN, la seconde se connecterait sur le compte de
-    /// la première et hériterait de ses droits.
+    /// Le test qui justifie tout l'épinglage. Deux identités distinctes de la source donnent
+    /// le même nom kdt : sans vérification de la valeur épinglée, la seconde se connecterait
+    /// sur le compte de la première et hériterait de ses droits.
     #[test]
     fn deux_identifiants_peuvent_donner_le_meme_nom() {
         assert_eq!(
@@ -412,29 +424,60 @@ mod tests {
     /// Et voici la barrière qui rattrape cette ambiguïté.
     #[test]
     fn un_compte_epingle_sur_un_autre_dn_refuse_la_connexion() {
+        let source = Source::Ldap;
         let user = user_with(
-            &[(SOURCE_LABEL, SOURCE_LDAP)],
-            &[(DN_ANNOTATION, "cn=jean dupont,ou=a,dc=x")],
+            &[(SOURCE_LABEL, source.label())],
+            &[(source.pin_annotation(), "cn=jean dupont,ou=a,dc=x")],
         );
 
-        assert!(verify_existing(user.clone(), "jean-dupont", &directory_user("cn=jean-dupont,ou=b,dc=x")).is_err());
+        assert!(verify_existing(
+            user.clone(),
+            "jean-dupont",
+            &federated("cn=jean-dupont,ou=b,dc=x"),
+            source
+        )
+        .is_err());
 
         // Le même DN à la casse et aux espaces près reste le même DN.
         assert!(verify_existing(
             user,
             "jean-dupont",
-            &directory_user("CN=Jean Dupont, OU=A, DC=X")
+            &federated("CN=Jean Dupont, OU=A, DC=X"),
+            source
         )
         .is_ok());
     }
 
-    /// Un compte créé à la main, avec son mot de passe et son TOTP, ne se fait pas absorber par
-    /// l'annuaire parce qu'il porte le même nom.
+    /// Un sujet de jeton est opaque : rien n'autorise à le comparer à la tolérance près, et
+    /// deux sujets qui ne diffèrent que par la casse sont deux personnes différentes.
     #[test]
-    fn un_compte_local_n_est_pas_repris_par_l_annuaire() {
+    fn un_sujet_de_jeton_se_compare_a_l_identique() {
+        let source = Source::Oidc;
+        let user = user_with(
+            &[(SOURCE_LABEL, source.label())],
+            &[(source.pin_annotation(), "AbC-123")],
+        );
+
+        assert!(verify_existing(user.clone(), "alice", &federated("AbC-123"), source).is_ok());
+        assert!(verify_existing(user, "alice", &federated("abc-123"), source).is_err());
+    }
+
+    /// Un compte créé à la main, avec son mot de passe et son TOTP, ne se fait pas absorber par
+    /// la fédération parce qu'il porte le même nom. Un compte laissé par une autre source non
+    /// plus : l'annotation d'épinglage n'est pas la même.
+    #[test]
+    fn un_compte_d_une_autre_origine_n_est_pas_repris() {
         let local = user_with(&[], &[]);
         assert!(!is_federated(&local));
-        assert!(verify_existing(local, "alice", &directory_user("cn=alice,dc=x")).is_err());
+        assert!(verify_existing(local, "alice", &federated("cn=alice,dc=x"), Source::Ldap).is_err());
+
+        let ldap = user_with(
+            &[(SOURCE_LABEL, Source::Ldap.label())],
+            &[(Source::Ldap.pin_annotation(), "cn=alice,dc=x")],
+        );
+        assert!(is_federated(&ldap));
+        assert_eq!(source_of(&ldap), Some(Source::Ldap));
+        assert!(verify_existing(ldap, "alice", &federated("sub-42"), Source::Oidc).is_err());
     }
 
     #[test]

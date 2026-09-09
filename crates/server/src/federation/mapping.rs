@@ -1,39 +1,57 @@
-//! Correspondance entre les groupes de l'annuaire et les `KdtGroup`.
+//! Correspondance entre les groupes de la source et les `KdtGroup`.
 //!
-//! Elle est déclarée, jamais devinée. Dériver un nom kdt d'un DN demanderait de le normaliser —
-//! minuscules, caractères interdits remplacés, longueur coupée — et deux groupes distincts de
-//! l'annuaire pourraient alors aboutir au même nom, donc aux mêmes droits. Une table écrite à
-//! la main n'a pas ce défaut : ce qui n'y figure pas n'existe pas côté cluster.
+//! Elle est déclarée, jamais devinée. Dériver un nom kdt d'un DN — ou d'un identifiant de
+//! groupe — demanderait de le normaliser : minuscules, caractères interdits remplacés, longueur
+//! coupée. Deux groupes distincts de la source pourraient alors aboutir au même nom, donc aux
+//! mêmes droits. Une table écrite à la main n'a pas ce défaut : ce qui n'y figure pas n'existe
+//! pas côté cluster.
 
+use super::Source;
 use kdt_identity_api::validate_name;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Deserialize)]
 struct RawMapping {
-    dn: String,
+    /// Ce que la source appelle ce groupe : un DN pour un annuaire, la valeur telle qu'elle
+    /// figure dans le claim pour un fournisseur.
+    ///
+    /// Deux noms pour un même champ, parce que les deux tables sont écrites par des gens qui ne
+    /// regardent pas la même chose : `dn` reste le nom historique, et écrire `dn` en face d'un
+    /// identifiant de groupe Entra n'aurait aucun sens.
+    #[serde(rename = "dn", alias = "claim")]
+    key: String,
     group: String,
 }
 
-/// Table `DN de l'annuaire` → `nom de KdtGroup`.
+/// Table `groupe de la source` → `nom de KdtGroup`.
 ///
-/// Les deux sens sont plusieurs-à-plusieurs, volontairement : deux groupes de l'annuaire
-/// peuvent conduire au même groupe kdt, et un seul groupe de l'annuaire peut en ouvrir
-/// plusieurs. Contraindre l'un ou l'autre interdirait des organisations légitimes sans rien
-/// protéger.
-#[derive(Debug, Clone, Default)]
+/// Les deux sens sont plusieurs-à-plusieurs, volontairement : deux groupes de la source peuvent
+/// conduire au même groupe kdt, et un seul groupe de la source peut en ouvrir plusieurs.
+/// Contraindre l'un ou l'autre interdirait des organisations légitimes sans rien protéger.
+#[derive(Debug, Clone)]
 pub struct GroupMappings {
-    /// DN normalisé, nom du groupe kdt.
+    /// Clé normalisée, nom du groupe kdt.
     entries: Vec<(String, String)>,
+    /// La source décide de ce que « la même clé » veut dire.
+    source: Source,
 }
 
 impl GroupMappings {
+    /// Table vide pour une source donnée : personne n'obtient de groupe.
+    pub fn empty(source: Source) -> Self {
+        Self {
+            entries: Vec::new(),
+            source,
+        }
+    }
+
     /// Lit la table telle que le chart la rend, en JSON.
     ///
     /// Chaque nom de groupe est validé ici, au démarrage. Le laisser passer produirait un
     /// `KdtGroup` que l'apiserver refuse à la première connexion, c'est-à-dire une erreur
     /// découverte par la personne qui se connecte plutôt que par celle qui a écrit la table.
-    pub fn parse(raw: &str) -> Result<Self, String> {
+    pub fn parse(raw: &str, source: Source) -> Result<Self, String> {
         let parsed: Vec<RawMapping> =
             serde_json::from_str(raw).map_err(|e| format!("table de correspondance illisible : {e}"))?;
 
@@ -42,26 +60,33 @@ impl GroupMappings {
             validate_name(&mapping.group)
                 .map_err(|e| format!("groupe {:?} : {e}", mapping.group))?;
 
-            let dn = normalize_dn(&mapping.dn);
-            if dn.is_empty() {
-                return Err(format!("groupe {:?} : DN vide", mapping.group));
+            let key = normalize(&mapping.key, source);
+            if key.is_empty() {
+                return Err(format!(
+                    "groupe {:?} : la clé de correspondance est vide",
+                    mapping.group
+                ));
             }
-            entries.push((dn, mapping.group));
+            entries.push((key, mapping.group));
         }
 
-        Ok(Self { entries })
+        Ok(Self { entries, source })
     }
 
-    /// Groupes kdt ouverts par les DN dont la personne est membre.
+    /// Groupes kdt ouverts par les groupes dont la personne est membre.
     ///
-    /// Un DN sans correspondance est ignoré sans bruit : c'est le cas courant, un annuaire
-    /// d'entreprise portant des centaines de groupes dont aucun ne concerne le cluster.
+    /// Une clé sans correspondance est ignorée sans bruit : c'est le cas courant, un annuaire
+    /// d'entreprise — ou un tenant — portant des centaines de groupes dont aucun ne concerne le
+    /// cluster.
     pub fn resolve(&self, member_of: &[String]) -> Vec<String> {
-        let dns: BTreeSet<String> = member_of.iter().map(|dn| normalize_dn(dn)).collect();
+        let keys: BTreeSet<String> = member_of
+            .iter()
+            .map(|key| normalize(key, self.source))
+            .collect();
 
         self.entries
             .iter()
-            .filter(|(dn, _)| dns.contains(dn))
+            .filter(|(key, _)| keys.contains(key))
             .map(|(_, group)| group.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -84,6 +109,19 @@ impl GroupMappings {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// Forme comparable d'une clé, selon ce que la source y met.
+///
+/// Un identifiant de groupe rendu par un fournisseur n'a pas de structure : c'est un GUID chez
+/// Entra, un chemin chez Keycloak, un nom ailleurs. Seules la casse et les espaces de bordure
+/// sont neutralisés — deux groupes qui ne différeraient que par la casse seraient donc
+/// confondus, ce qui est le prix de la tolérance qui fait correspondre `GUID` et `guid`.
+fn normalize(key: &str, source: Source) -> String {
+    match source {
+        Source::Ldap => normalize_dn(key),
+        Source::Oidc => key.trim().to_lowercase(),
     }
 }
 
@@ -136,6 +174,7 @@ mod tests {
                 {"dn": "cn=k8s-admins,ou=groups,dc=example,dc=com", "group": "admins"},
                 {"dn": "CN=K8s-Devs, OU=Groups, DC=example, DC=com", "group": "devs"}
             ]"#,
+            Source::Ldap,
         )
         .unwrap()
     }
@@ -164,6 +203,7 @@ mod tests {
     fn une_virgule_echappee_ne_separe_pas_deux_composants() {
         let table = GroupMappings::parse(
             r#"[{"dn": "cn=Doe\\, John,ou=groups,dc=example,dc=com", "group": "direction"}]"#,
+            Source::Ldap,
         )
         .unwrap();
 
@@ -181,6 +221,7 @@ mod tests {
                 {"dn": "cn=b,dc=x", "group": "ops"},
                 {"dn": "cn=a,dc=x", "group": "lecture"}
             ]"#,
+            Source::Ldap,
         )
         .unwrap();
 
@@ -196,7 +237,7 @@ mod tests {
         for group in ["Admins", "kdt:admins", "system:masters", "-admins", ""] {
             let raw = format!(r#"[{{"dn": "cn=g,dc=x", "group": "{group}"}}]"#);
             assert!(
-                GroupMappings::parse(&raw).is_err(),
+                GroupMappings::parse(&raw, Source::Ldap).is_err(),
                 "{group:?} accepté à tort"
             );
         }
@@ -204,8 +245,44 @@ mod tests {
 
     #[test]
     fn une_table_vide_est_valide_et_n_ouvre_rien() {
-        let table = GroupMappings::parse("[]").unwrap();
+        let table = GroupMappings::parse("[]", Source::Ldap).unwrap();
         assert!(table.is_empty());
         assert!(table.resolve(&["cn=a,dc=x".to_string()]).is_empty());
+    }
+
+    /// La table d'un fournisseur se déclare avec `claim`, et sa clé n'a aucune structure : un
+    /// GUID Entra doit correspondre quelle que soit la casse sous laquelle il est écrit de part
+    /// et d'autre.
+    #[test]
+    fn une_table_de_fournisseur_se_declare_avec_claim() {
+        let table = GroupMappings::parse(
+            r#"[
+                {"claim": "8F4A1C2E-0B77-4E3B-9A21-2C5D8E7F0A11", "group": "admins"},
+                {"claim": "/platform/devs", "group": "devs"}
+            ]"#,
+            Source::Oidc,
+        )
+        .unwrap();
+
+        let member_of = vec![
+            "8f4a1c2e-0b77-4e3b-9a21-2c5d8e7f0a11".to_string(),
+            "/platform/devs".to_string(),
+            "b7e0-inconnu".to_string(),
+        ];
+        assert_eq!(table.resolve(&member_of), vec!["admins", "devs"]);
+    }
+
+    /// Une clé de fournisseur n'est pas un DN : la découper sur les virgules ferait
+    /// correspondre des groupes qui n'ont rien à voir.
+    #[test]
+    fn une_cle_de_fournisseur_n_est_pas_decoupee() {
+        let table = GroupMappings::parse(
+            r#"[{"claim": "equipe,plateforme", "group": "ops"}]"#,
+            Source::Oidc,
+        )
+        .unwrap();
+
+        assert_eq!(table.resolve(&["equipe,plateforme".to_string()]), vec!["ops"]);
+        assert!(table.resolve(&["equipe".to_string()]).is_empty());
     }
 }

@@ -118,6 +118,54 @@ app.kubernetes.io/instance: {{ .Release.Name }}
   value: /run/kdt-identity
 {{- end }}
 {{- end }}
+{{- if eq .Values.authMode "oidc" }}
+- name: KDT_IDENTITY_AUTH_OIDC_ISSUER
+  value: {{ required "oidcAuth.issuer est obligatoire en authMode=oidc" .Values.oidcAuth.issuer | quote }}
+- name: KDT_IDENTITY_AUTH_OIDC_CLIENT_ID
+  value: {{ required "oidcAuth.clientId est obligatoire en authMode=oidc" .Values.oidcAuth.clientId | quote }}
+- name: KDT_IDENTITY_AUTH_OIDC_SCOPES
+  value: {{ .Values.oidcAuth.scopes | quote }}
+- name: KDT_IDENTITY_AUTH_OIDC_TIMEOUT
+  value: {{ .Values.oidcAuth.timeout | quote }}
+{{- /*
+  Même forme qu'en LDAP, et pour la même raison : le JSON est ce qu'une variable d'environnement
+  porte sans ambiguïté, et `toJson` échappe ce que des chemins de groupes mettraient à mal.
+*/}}
+- name: KDT_IDENTITY_AUTH_OIDC_GROUP_MAPPINGS
+  value: {{ .Values.oidcAuth.groupMappings | toJson | quote }}
+{{- if .Values.oidcAuth.providerName }}
+- name: KDT_IDENTITY_AUTH_OIDC_PROVIDER_NAME
+  value: {{ .Values.oidcAuth.providerName | quote }}
+{{- end }}
+{{- /*
+  Les claims ne sont posés que s'ils sont surchargés : une variable vide vaut une variable
+  absente côté serveur, qui reprend alors son défaut.
+*/}}
+{{- range $var, $value := dict "USERNAME_CLAIM" .Values.oidcAuth.claims.username "EMAIL_CLAIM" .Values.oidcAuth.claims.email "DISPLAY_CLAIM" .Values.oidcAuth.claims.display "GROUPS_CLAIM" .Values.oidcAuth.claims.groups "SUBJECT_CLAIM" .Values.oidcAuth.claims.subject }}
+{{- if $value }}
+- name: KDT_IDENTITY_AUTH_OIDC_{{ $var }}
+  value: {{ $value | quote }}
+{{- end }}
+{{- end }}
+{{- if $.Values.oidcAuth.caCert }}
+- name: KDT_IDENTITY_AUTH_OIDC_CA_FILE
+  value: /etc/kdt-identity/oidc/ca.crt
+{{- end }}
+{{- if $.Values.oidcAuth.graph.enabled }}
+- name: KDT_IDENTITY_AUTH_OIDC_GRAPH_TENANT_ID
+  value: {{ required "oidcAuth.graph.tenantId est obligatoire quand graph.enabled" .Values.oidcAuth.graph.tenantId | quote }}
+{{- if .Values.oidcAuth.graph.clientId }}
+- name: KDT_IDENTITY_AUTH_OIDC_GRAPH_CLIENT_ID
+  value: {{ .Values.oidcAuth.graph.clientId | quote }}
+{{- end }}
+- name: KDT_IDENTITY_AUTH_OIDC_GRAPH_ENDPOINT
+  value: {{ .Values.oidcAuth.graph.endpoint | quote }}
+- name: KDT_IDENTITY_AUTH_OIDC_GRAPH_AUTHORITY
+  value: {{ .Values.oidcAuth.graph.authority | quote }}
+- name: KDT_IDENTITY_AUTH_OIDC_GRAPH_RESYNC
+  value: {{ .Values.oidcAuth.graph.resync | quote }}
+{{- end }}
+{{- end }}
 {{- end -}}
 
 {{/*
@@ -145,6 +193,22 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/*
+  CA du fournisseur d'identité. Un seul volume, là où l'annuaire en demande deux : le client HTTP
+  reçoit cette autorité directement, sans magasin à assembler au démarrage.
+*/}}
+{{- define "kdt-identity.oidcVolumes" -}}
+- name: oidc-ca
+  configMap:
+    name: {{ include "kdt-identity.fullname" . }}-oidc-ca
+{{- end -}}
+
+{{- define "kdt-identity.oidcVolumeMounts" -}}
+- name: oidc-ca
+  mountPath: /etc/kdt-identity/oidc
+  readOnly: true
+{{- end -}}
+
+{{/*
   Refuse une combinaison de valeurs qui produirait un déploiement inerte : le portail
   démarrerait, signerait des jetons parfaitement formés, et l'apiserver les refuserait tous
   sans que rien ne dise pourquoi.
@@ -166,8 +230,51 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- fail "webUrl doit être en https : un code d'autorisation s'échange contre un droit de session, il n'a pas à voyager en clair" -}}
 {{- end -}}
 {{- end -}}
-{{- if not (has .Values.authMode (list "local" "ldap")) -}}
-{{- fail (printf "authMode vaut %q : attendu local ou ldap" .Values.authMode) -}}
+{{- if not (has .Values.authMode (list "local" "ldap" "oidc")) -}}
+{{- fail (printf "authMode vaut %q : attendu local, ldap ou oidc" .Values.authMode) -}}
+{{- end -}}
+{{- if eq .Values.authMode "oidc" -}}
+{{- /*
+  L'émetteur sert à joindre le fournisseur et se compare à ce que portent les jetons. En clair,
+  les jetons d'identité de tout le cluster traverseraient le réseau en lecture directe.
+*/}}
+{{- if not (hasPrefix "https://" .Values.oidcAuth.issuer) -}}
+{{- fail (printf "oidcAuth.issuer vaut %q : une racine en https est exigée, c'est par là que passent les jetons d'identité" .Values.oidcAuth.issuer) -}}
+{{- end -}}
+{{- /*
+  Le code d'autorisation revient sur la racine du portail. Les fournisseurs refusent d'ailleurs
+  presque tous d'enregistrer une adresse de retour en clair, la boucle locale exceptée.
+*/}}
+{{- if and (not (hasPrefix "https://" .Values.portalUrl)) (not (hasPrefix "http://localhost" .Values.portalUrl)) (not (hasPrefix "http://127.0.0.1" .Values.portalUrl)) -}}
+{{- fail "authMode=oidc exige un portalUrl en https : c'est l'adresse de retour où le code d'autorisation est redirigé" -}}
+{{- end -}}
+{{- if not .Values.oidcAuth.groupMappings -}}
+{{- fail "oidcAuth.groupMappings est vide : les comptes fédérés se connecteraient sans obtenir le moindre groupe, donc le moindre droit" -}}
+{{- end -}}
+{{- range .Values.oidcAuth.groupMappings -}}
+{{- if not .claim -}}
+{{- fail "chaque entrée de oidcAuth.groupMappings doit porter un claim" -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$" (.group | default "")) -}}
+{{- fail (printf "oidcAuth.groupMappings : le groupe %q n'est pas un nom de ressource valide (minuscules, chiffres, - et ., 60 caractères au plus)" (.group | default "")) -}}
+{{- end -}}
+{{- if gt (len .group) 60 -}}
+{{- fail (printf "oidcAuth.groupMappings : le groupe %q dépasse 60 caractères" .group) -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.oidcAuth.graph.enabled -}}
+{{- /*
+  La relecture désigne les comptes par leur identifiant d'objet dans le tenant. Le `sub` d'un
+  jeton ne convient pas : il est propre à l'application qui l'a reçu, et Graph ne le connaît pas.
+  Sans ce garde-fou, le premier tour de relecture ne retrouverait pas un seul compte.
+*/}}
+{{- if not (eq (.Values.oidcAuth.claims.subject | default "") "oid") -}}
+{{- fail "oidcAuth.graph.enabled exige oidcAuth.claims.subject=oid : la relecture désigne les comptes par leur identifiant d'objet, que seul ce claim porte" -}}
+{{- end -}}
+{{- if not .Values.oidcAuth.existingSecret -}}
+{{- fail "oidcAuth.graph.enabled exige oidcAuth.existingSecret : le secret d'application y est lu sous KDT_IDENTITY_AUTH_OIDC_GRAPH_CLIENT_SECRET" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- if eq .Values.authMode "ldap" -}}
 {{- if not (has .Values.ldap.profile (list "activedirectory" "freeipa")) -}}

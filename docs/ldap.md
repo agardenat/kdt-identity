@@ -8,6 +8,10 @@ groupes d'annuaire.
 C'est un axe **indépendant** du mode de délivrance : `ldap` se combine aussi bien avec
 `certificate` qu'avec `oidc`. Voir [modes.md](modes.md).
 
+Pour fédérer sur un fournisseur OpenID Connect plutôt que sur un annuaire — Entra ID n'expose pas
+de LDAP, sauf à passer par Entra Domain Services ou par un AD synchronisé — voir
+[fournisseur-oidc.md](fournisseur-oidc.md).
+
 ## À quoi il sert vraiment
 
 Sans lui, un cluster dont l'entreprise a déjà un annuaire porte deux populations de comptes et

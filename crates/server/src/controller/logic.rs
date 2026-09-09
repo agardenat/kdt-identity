@@ -64,7 +64,7 @@ pub fn phase(user: &KdtUser, has_credentials: bool) -> UserPhase {
     if user.spec.disabled {
         return UserPhase::Disabled;
     }
-    if has_credentials || crate::ldap::provision::is_federated(user) {
+    if has_credentials || crate::federation::provision::is_federated(user) {
         UserPhase::Active
     } else {
         UserPhase::Pending

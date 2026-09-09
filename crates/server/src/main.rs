@@ -266,7 +266,28 @@ async fn serve(context: Option<&str>) -> anyhow::Result<()> {
         );
     }
 
-    let state = web::state(client, config, endpoint, signer, oidc);
+    // Le client du fournisseur est bâti ici, où sa configuration peut encore faire échouer le
+    // démarrage — une CA illisible est une erreur d'installation, pas de connexion. Il ne joint
+    // personne pour autant : la découverte est faite à la première connexion, pour qu'un
+    // fournisseur momentanément absent n'empêche pas le portail de servir les sessions en cours.
+    let provider = match config.oidc_auth.clone() {
+        None => None,
+        Some(oidc_auth) => {
+            tracing::info!(
+                emetteur = %oidc_auth.issuer,
+                client = %oidc_auth.client_id,
+                groupes = oidc_auth.group_mappings.managed_groups().len(),
+                retour = %format!("{}{}", config.portal_url, web::OIDC_CALLBACK_PATH),
+                "fédération d'identité active"
+            );
+            Some(
+                kdt_identity_server::oidc_auth::Provider::new(oidc_auth)
+                    .context("fournisseur d'identité")?,
+            )
+        }
+    };
+
+    let state = web::state(client, config, endpoint, signer, oidc, provider);
     axum::serve(listener, web::router(state))
         .await
         .context("service HTTP")?;

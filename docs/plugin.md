@@ -96,6 +96,38 @@ Au bout de sept jours, ou si quelqu'un a fermé la session, l'invite revient.
 **Le portail web n'intervient jamais dans ce cycle.** Le plugin l'appelle en HTTP, mais la
 saisie se fait dans le terminal. Le navigateur ne sert qu'une fois, à l'activation du compte.
 
+### Quand le portail délègue à un fournisseur d'identité
+
+En `authMode: oidc`, il n'y a pas de mot de passe à saisir : le portail n'en accepte aucun. Le
+plugin le découvre en lisant le descripteur du portail, ouvre un port sur la boucle locale, et
+attend le retour du navigateur :
+
+```console
+$ kubectl get pods
+kdt-identity : ouverture de session dans le navigateur.
+Si rien ne s'ouvre, ouvrez cette adresse :
+
+  https://identity.example.com/authorize?client_id=kdt-identity-cli&…
+
+NAME   READY   STATUS
+…
+```
+
+L'adresse est affichée même quand le navigateur s'ouvre, et c'est délibéré : sur une session
+distante, il n'y a rien à ouvrir, et c'est alors le seul moyen de continuer — depuis un poste qui
+peut joindre ce port.
+
+Rien d'autre ne change : ce qui en sort est une session ordinaire, avec le même cache, le même
+renouvellement silencieux et la même révocation. Rien n'est à déclarer chez le fournisseur pour le
+plugin — son adresse de retour est un port local, que le portail accepte pour cette raison
+(RFC 8252 §7.3).
+
+`--browser` force ce chemin dans les autres modes, pour qui préfère son navigateur au terminal :
+
+```sh
+kubectl kdt-identity credential --portal https://identity.example.com --user alice --browser
+```
+
 ## Se déconnecter
 
 ```sh
@@ -117,6 +149,9 @@ l'entrée standard, qui appartient à la commande en cours : lire dessus captera
 destiné à `kubectl`, ou bloquerait indéfiniment. Un `kubectl` lancé par un script, ou dans un
 conteneur sans tty, reçoit donc une erreur explicite plutôt qu'une attente sans fin.
 
+En mode fournisseur, la même limite prend une autre forme : il n'y a pas de saisie, mais il faut
+un navigateur capable d'atteindre le port local, et quelqu'un pour donner son accord.
+
 C'est un outil de poste de travail. Une chaîne d'intégration s'authentifie par ServiceAccount,
 pas avec le compte de quelqu'un.
 
@@ -137,6 +172,9 @@ remplacé, au prix d'une authentification.
 | `renouvellement refusé (compte, mot de passe, code ou session invalide)` | la session a été fermée, ou le compte désactivé. Une authentification complète suit. |
 | `renouvellement refusé (ce cluster n'émet plus de jetons)` | le déploiement a changé de mode. Le plugin se ré-authentifie et s'adapte. |
 | `authentification nécessaire … mais aucun terminal n'est disponible` | `kubectl` a été lancé sans tty. Rejouer la commande dans un terminal. |
+| `aucun retour du navigateur au bout de 300 s` | la connexion chez le fournisseur n'a pas abouti dans les cinq minutes. Rejouer la commande. |
+| `le retour du navigateur ne correspond pas à la demande partie d'ici` | un lien ouvert dans ce navigateur a tenté de faire aboutir une autre connexion. Refusé. |
+| `le portail a refusé l'échange du code` | l'accord n'a pas été donné, ou le code a expiré (une minute). |
 | `le portail a répondu pour X alors que Y était demandé` | à ne pas ignorer : le portail désigne une autre identité que celle demandée. Le plugin refuse de construire une demande dessus. |
 | `failed to find any PEM data` (côté kubectl) | version de plugin et de portail désaccordées. Réinstaller le binaire depuis l'image du déploiement. |
 

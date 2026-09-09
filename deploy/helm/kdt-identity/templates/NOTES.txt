@@ -9,13 +9,17 @@ Créer un utilisateur et un groupe :
   spec: {email: alice@example.com}
   YAML
 
-L'inviter — le lien et le code ne s'affichent qu'une fois, et sont à transmettre par deux
+{{ if eq .Values.authMode "local" }}L'inviter — le lien et le code ne s'affichent qu'une fois, et sont à transmettre par deux
 canaux différents :
 
   kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "kdt-identity.fullname" . }}-controller -- \
       /usr/local/bin/kdt-identity-server invite alice
 
   (chemin absolu : l'image ne contient ni shell ni PATH)
+{{- else }}
+En authMode={{ .Values.authMode }}, ce KdtUser n'est pas à créer à la main : il l'est à la première
+connexion réussie, avec son adresse et ses groupes. Il n'y a ni invitation ni mot de passe à poser.
+{{- end }}
 
 {{ if .Values.ingress.enabled }}Portail : https://{{ .Values.ingress.host }}
 {{- else }}
@@ -31,6 +35,24 @@ Un groupe n'accorde rien tant qu'aucun binding ne le vise. Le sujet à référen
 dans le statut du groupe :
 
   kubectl get kdtgroup -o custom-columns=NOM:.metadata.name,SUJET:.status.subject
+{{ if eq .Values.authMode "oidc" }}
+Authentification déléguée. À déclarer chez le fournisseur, sur l'application {{ .Values.oidcAuth.clientId }} :
+
+  adresse de retour   {{ .Values.portalUrl }}/login/callback
+
+C'est la seule à enregistrer. Le plugin kubectl, lui, ouvre sa session par le navigateur sur un
+port de la boucle locale, que le portail accepte sans qu'il soit déclaré nulle part (RFC 8252).
+{{ if not .Values.oidcAuth.graph.enabled }}
+L'accès à l'API du fournisseur n'est pas déclaré (oidcAuth.graph). Deux conséquences :
+
+  - une personne membre de plus de ~200 groupes ne pourra pas se connecter — le fournisseur
+    cesse alors de les mettre dans le jeton ;
+  - l'appartenance n'est relue qu'aux connexions, d'où refreshTtl plafonné à 24h.
+{{- else }}
+L'appartenance est relue toutes les {{ .Values.oidcAuth.graph.resync }}. Un compte supprimé ou fermé chez le
+fournisseur passe en spec.disabled.
+{{- end }}
+{{- end }}
 {{ if eq .Values.credentialMode "oidc" }}
 Mode OIDC. Rien ne fonctionnera tant que l'apiserver ne connaîtra pas cet émetteur :
 

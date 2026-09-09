@@ -4,10 +4,12 @@ pub mod auth;
 pub mod controller;
 pub mod config;
 pub mod credentials;
+pub mod federation;
 pub mod ldap;
 pub mod mail;
 pub mod manifests;
 pub mod oidc;
+pub mod oidc_auth;
 pub mod sessions;
 pub mod web;
 

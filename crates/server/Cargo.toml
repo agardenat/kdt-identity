@@ -40,6 +40,9 @@ hmac = "0.13"
 # openssl. `tls-rustls-ring` reprend la pile déjà en place — rustls 0.23 sur ring — et laisse
 # l'application installer le provider, ce que fait `install_crypto_provider()`.
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
+# Le seul client HTTP sortant du serveur, et il ne sert qu'au fournisseur d'identité : mêmes
+# features que dans le plugin, pour que les deux binaires partagent la pile TLS déjà en place.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.8"
 maud = "0.27"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
