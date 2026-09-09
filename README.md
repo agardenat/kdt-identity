@@ -369,15 +369,15 @@ de l'image, ou compiler depuis les sources — voir le
 
 ## Installation
 
-Le chart n'est pas encore publié dans un registre : il s'installe depuis une copie du dépôt.
+Le chart est publié dans un dépôt Helm : rien à cloner.
 
 ```sh
-git clone https://github.com/agardenat/kdt-identity
-cd kdt-identity
+helm repo add kdt https://agardenat.github.io/helm-charts
+helm repo update
 ```
 
 ```sh
-helm install kdt-identity deploy/helm/kdt-identity \
+helm install kdt-identity kdt/kdt-identity \
     --namespace kdt-identity --create-namespace \
     --set clusterName=production \
     --set portalUrl=https://identity.example.com \
@@ -423,15 +423,16 @@ networkPolicy:
 ```
 
 ```sh
-git clone --branch v1.0.0 https://github.com/agardenat/kdt-identity
-helm upgrade --install kdt-identity kdt-identity/deploy/helm/kdt-identity \
+helm repo add kdt https://agardenat.github.io/helm-charts
+helm repo update
+helm upgrade --install kdt-identity kdt/kdt-identity --version 1.2.0 \
     --namespace kdt-identity --create-namespace \
     --values helm-values.yaml
 ```
 
 `upgrade --install` est idempotent : la même commande installe la première fois et met à jour
-ensuite, ce qu'attend une chaîne d'intégration qui rejoue le même pipeline. Le clone est épinglé
-sur un tag, sans quoi la version déployée dépend de la date du pipeline.
+ensuite, ce qu'attend une chaîne d'intégration qui rejoue le même pipeline. La version du chart est
+épinglée par `--version`, sans quoi la version déployée dépend de la date du pipeline.
 
 #### La clé de session, si le rendu se fait hors du cluster
 
@@ -446,7 +447,7 @@ chaque synchronisation, et toutes les sessions ouvertes tombent.
 Dans ce cas, fixer la clé explicitement, depuis le gestionnaire de secrets de la chaîne :
 
 ```sh
-helm upgrade --install kdt-identity kdt-identity/deploy/helm/kdt-identity \
+helm upgrade --install kdt-identity kdt/kdt-identity --version 1.2.0 \
     --namespace kdt-identity --create-namespace \
     --values helm-values.yaml \
     --set sessionKey="$KDT_SESSION_KEY"

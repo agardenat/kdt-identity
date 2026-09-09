@@ -8,6 +8,14 @@ tag `v<version>` qui a déclenché sa publication.
 Les notes de version publiées avec un tag sont la section correspondante de ce fichier, extraite
 par `packaging/changelog-section.sh` : ce fichier est la source, pas une copie.
 
+## [1.2.1] — 2026-09-09
+
+- **chore(release)** — le chart est publié dans un **dépôt Helm**, partagé avec celui de kdt-web :
+  `helm repo add kdt https://agardenat.github.io/helm-charts`, puis
+  `helm upgrade --install kdt-identity kdt/kdt-identity`. Plus de `git clone` avant d'installer.
+  Le job `chart` de `release.yml` y dépose l'archive sur le même tag `v*` que l'image, à la version
+  du tag, et reconstruit l'index.
+
 ## [1.2.0] — 2026-09-08
 
 - **feat(server)** — **fédération d'identité sur un annuaire LDAP(S)**, Active Directory ou
