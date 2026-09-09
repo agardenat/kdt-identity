@@ -58,13 +58,12 @@ par `packaging/changelog-section.sh` : ce fichier est la source, pas une copie.
   plugin en est un client permanent. La page d'accord nomme l'application par un libellé lisible —
   « kdt-web », « le plugin kubectl, sur ce poste » — au lieu de son identifiant.
 
-## [1.2.1] — 2026-09-09
-
 - **chore(release)** — le chart est publié dans un **dépôt Helm**, partagé avec celui de kdt-web :
   `helm repo add kdt https://agardenat.github.io/helm-charts`, puis
   `helm upgrade --install kdt-identity kdt/kdt-identity`. Plus de `git clone` avant d'installer.
   Le job `chart` de `release.yml` y dépose l'archive sur le même tag `v*` que l'image, à la version
-  du tag, et reconstruit l'index.
+  du tag, et reconstruit l'index. Écrit pour une 1.2.1 qui n'a jamais été taguée : la publication
+  part donc avec cette version.
 
 ## [1.2.0] — 2026-09-08
 

@@ -344,7 +344,7 @@ networkPolicy:
 ```
 
 ```sh
-helm upgrade --install kdt-identity kdt/kdt-identity --version 1.2.0 \
+helm upgrade --install kdt-identity kdt/kdt-identity --version 1.3.0 \
     --namespace kdt-identity --create-namespace \
     --values helm-values.yaml
 ```
@@ -363,7 +363,7 @@ l'appliquer — Argo CD par défaut. Là, la clé est régénérée à chaque sy
 sessions ouvertes tombent. Dans ce cas, fixer la clé explicitement :
 
 ```sh
-helm upgrade --install kdt-identity kdt/kdt-identity --version 1.2.0 \
+helm upgrade --install kdt-identity kdt/kdt-identity --version 1.3.0 \
     --namespace kdt-identity --create-namespace \
     --values helm-values.yaml \
     --set sessionKey="$KDT_SESSION_KEY"
