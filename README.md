@@ -1,24 +1,15 @@
 # kdt-identity — utilisateurs et groupes locaux pour Kubernetes
 
-Kubernetes n'a volontairement aucun objet `User` ni `Group` : l'authentification est déléguée à
-un composant externe, et un groupe n'est qu'une chaîne portée par le credential. Sur un cluster
-vanilla, il n'existe donc aucun moyen de dire « crée l'utilisateur X, mets-le dans le groupe Y,
-envoie-lui son accès ».
+Des utilisateurs et des groupes en CRDs, un contrôleur qui tient leur appartenance à jour, un
+portail d'activation, un plugin d'authentification pour `kubectl`, et l'émission à la demande d'un
+kubeconfig que l'apiserver reconnaît — sans modifier la configuration du control plane.
 
-kdt-identity comble ce trou : des utilisateurs et des groupes matérialisés en CRDs, un
-contrôleur qui en tient l'appartenance à jour, et l'émission à la demande d'un kubeconfig que
-l'apiserver reconnaît — sans toucher à la configuration du control plane.
+Compagnon de [kdt](https://github.com/agardenat/kdt). 🗒️ [Changelog](CHANGELOG.md)
 
-Compagnon de [kdt](https://github.com/agardenat/kdt).
-
-> **État : en service.** Créer un compte, l'inviter, l'activer depuis le portail avec mot de
-> passe et TOTP, puis obtenir un accès que le plugin renouvelle tout seul et qu'un
-> administrateur peut révoquer. Deux modes de délivrance — certificat ou OIDC — éprouvés
-> contre un apiserver réel. Chart Helm et image fournis.
->
-> Les comptes peuvent aussi venir d'un annuaire Active Directory ou FreeIPA
-> (`authMode: ldap`) : le `KdtUser` est alors créé à la première connexion réussie et
-> l'appartenance reportée depuis les groupes de l'annuaire.
+Deux modes de délivrance, certificat ou OIDC, éprouvés contre un apiserver réel. Les comptes
+peuvent venir des CRDs ou d'un annuaire Active Directory / FreeIPA (`authMode: ldap`), auquel cas
+le `KdtUser` est créé à la première connexion réussie et l'appartenance reportée depuis les
+groupes de l'annuaire. Chart Helm et image fournis.
 
 | Guide | Pour qui |
 | --- | --- |
@@ -58,20 +49,39 @@ Username    kdt:alice
 Groups      [kdt:lecteurs system:authenticated]
 ```
 
-Un groupe n'accorde rien par lui-même. Pour qu'il serve à quelque chose, il faut un binding qui
-le vise — c'est un geste délibéré, à committer dans votre dépôt GitOps :
+Un groupe n'accorde aucun droit par lui-même : il faut un binding RBAC qui vise son sujet, publié
+dans `KdtGroup.status.subject`.
 
 ```yaml
 subjects:
 - kind: Group
-  name: kdt:lecteurs        # le sujet est publié dans KdtGroup.status.subject
+  name: kdt:lecteurs
   apiGroup: rbac.authorization.k8s.io
 ```
 
+### Faire vivre les groupes
+
+Le portail comme le plugin relisent les groupes depuis le cluster au moment d'émettre, jamais
+depuis un cache. Un certificat déjà émis garde les siens jusqu'à expiration — dix minutes au plus
+—, `logout` force le passage immédiatement.
+
+```console
+$ kubectl patch kdtgroup ops --type=merge -p '{"spec":{"members":[]}}'
+
+$ kubectl auth whoami                    # certificat déjà émis : inchangé
+Groups   [kdt:ops kdt:lecteurs system:authenticated]
+
+$ kdt-identity logout --portal … --user alice && kubectl auth whoami
+Groups   [kdt:lecteurs system:authenticated]
+```
+
+Créer, inviter, désactiver, gérer l'appartenance et passer des groupes aux droits RBAC :
+[guide d'administration](docs/administration.md).
+
 ## Inviter quelqu'un
 
-L'invitation est une action d'administrateur, pas un envoi automatique : aucun SMTP n'est requis
-pour faire tourner kdt-identity.
+L'invitation est une commande d'administrateur ; aucun SMTP n'est requis pour faire tourner
+kdt-identity.
 
 ```console
 $ kdt-identity-server invite alice
@@ -84,34 +94,15 @@ Transmettez le lien et le code par deux canaux différents :
 le code de vive voix, pour qu'intercepter le lien ne suffise pas.
 ```
 
-Activer un compte demande **les deux**. C'est délibéré : le lien voyage presque toujours par
-courriel, c'est-à-dire par le canal le moins maîtrisé de la chaîne, et l'intercepter ne doit pas
-suffire. Le code est court, prononçable et dépourvu de caractères confondables (`O`/`0`,
-`I`/`1`/`L`) pour être dicté au téléphone sans erreur.
+Activer un compte demande les deux. Le code est court, prononçable et sans caractères confondables
+(`O`/`0`, `I`/`1`/`L`) ; il est consommé au moment où le mot de passe est posé, dans la même
+écriture. Le TOTP s'enrôle par QR code dans le navigateur pendant l'activation.
 
-C'est un mot de passe à usage unique au sens strict : il est consommé au moment où le mot de
-passe est posé, dans la même écriture, donc aucun chemin ne peut le laisser rejouable.
+`--send-mail` envoie le lien par courriel si un SMTP est configuré ; le code reste affiché dans le
+terminal. Ni le lien ni le code ne sont journalisés ni écrits dans le statut du `KdtUser`.
 
-`--send-mail` envoie le lien par courriel si un SMTP est configuré. Le code reste affiché dans
-le terminal : l'envoyer par le même canal que le lien annulerait tout l'intérêt de la
-séparation.
-
-Ni le lien ni le code ne sont journalisés, ni écrits dans le statut du `KdtUser` — un statut est
-lisible par quiconque peut lister les utilisateurs. Ils n'apparaissent que dans le terminal de
-l'administrateur qui les demande, une seule fois.
-
-Relancer `invite` sur un compte existant réémet une invitation et efface le mot de passe
-précédent : c'est aussi le chemin de réinitialisation.
-
-### Pourquoi pas un code TOTP par SMS
-
-TOTP ne se bootstrape pas par un code : les codes sont *dérivés* d'un secret partagé. Il
-faudrait donc transmettre le secret lui-même — or il est permanent, là où le SMS est en clair,
-conservé par l'opérateur et vulnérable au SIM-swap. Une passerelle SMS serait par ailleurs une
-dépendance au moins aussi lourde que le SMTP qu'on cherche à éviter.
-
-Le TOTP s'enrôle par QR code dans le navigateur au moment de l'activation, ce qui est la seule
-façon correcte. Le code d'activation, lui, joue le rôle de second canal.
+Relancer `invite` sur un compte existant réémet une invitation et efface le mot de passe précédent
+— c'est aussi le chemin de réinitialisation.
 
 ## Le portail
 
@@ -119,9 +110,7 @@ façon correcte. Le code d'activation, lui, joue le rôle de second canal.
 kdt-identity-server serve
 ```
 
-Trois pages, rendues côté serveur, sans script ni ressource externe — le portail manipule des
-credentials, il doit rester lisible sur un réseau isolé et incapable d'exfiltrer ce qu'il
-affiche.
+Trois pages rendues côté serveur, sans script ni ressource externe :
 
 | Page | Ce qu'elle demande |
 |---|---|
@@ -130,16 +119,9 @@ affiche.
 | `/` | rien — affiche l'identité effective et produit le kubeconfig |
 
 Aucune réponse ne distingue « ce compte n'existe pas » de « le mot de passe est faux », ni « ce
-lien est faux » de « ce lien a expiré ». Un portail qui répond précisément est un annuaire : il
-laisse énumérer les comptes du cluster depuis l'extérieur. Les journaux, eux, gardent la raison
-exacte — c'est là qu'elle sert.
-
-Un code TOTP n'est accepté qu'une fois, comme l'exige la [RFC 6238
-§5.2](https://datatracker.ietf.org/doc/html/rfc6238#section-5.2). Les échecs répétés allongent
-progressivement l'attente, sans jamais verrouiller définitivement : un verrou permanent
-déclenché à distance serait un déni de service offert à qui connaît un nom de compte.
-
-Variables d'environnement du portail :
+lien est faux » de « ce lien a expiré » ; les journaux gardent la raison exacte. Un code TOTP n'est
+accepté qu'une fois ([RFC 6238 §5.2](https://datatracker.ietf.org/doc/html/rfc6238#section-5.2)).
+Les échecs répétés allongent progressivement l'attente, sans verrouillage définitif.
 
 | Variable | Rôle |
 |---|---|
@@ -149,20 +131,20 @@ Variables d'environnement du portail :
 | `KDT_IDENTITY_SESSION_KEY` | clé de signature, 32 octets en base64 |
 | `KDT_IDENTITY_LISTEN` | adresse d'écoute, `0.0.0.0:8080` par défaut |
 
-Sans `KDT_IDENTITY_SESSION_KEY`, une clé est tirée au démarrage : les sessions ne survivent
-alors ni à un redémarrage ni à une seconde instance. Le serveur le signale au lancement.
+Sans `KDT_IDENTITY_SESSION_KEY`, une clé est tirée au démarrage : les sessions ne survivent alors
+ni à un redémarrage ni à une seconde instance. Le serveur le signale au lancement.
 
 ## Le plugin `kdt-identity`
 
-Le chemin recommandé sur un poste de travail. `kubectl` appelle le plugin quand il a besoin d'un
-accès ; il l'obtient, le met en cache et le renouvelle tout seul.
+Sur un poste de travail, `kubectl` appelle le plugin quand il a besoin d'un accès ; il l'obtient,
+le met en cache et le renouvelle tout seul.
 
 ```sh
 kdt-identity kubeconfig --portal https://identity.example.com --user alice \
     --cluster production --server https://k8s.example.com:6443 --ca-file ca.crt > ~/.kube/config
 ```
 
-Le kubeconfig produit ne contient **aucun secret** : il dit seulement à `kubectl` d'appeler
+Le kubeconfig produit ne contient aucun secret : il dit seulement à `kubectl` d'appeler
 `kdt-identity`.
 
 ```console
@@ -176,144 +158,87 @@ NAME   READY   STATUS
 $ kubectl get pods        # plus aucune saisie, pendant sept jours
 ```
 
-Deux durées, qui ne mesurent pas la même chose : le credential vaut **dix minutes** et se
-renouvelle en silence, le droit de session vaut **sept jours** et borne l'intervalle entre deux
-saisies. La première rend l'accès révocable, la seconde le rend supportable.
-
-La clé privée est engendrée sur le poste et n'en sort jamais ; seule la demande de signature
-part sur le réseau.
+Deux durées : le credential vaut dix minutes et se renouvelle en silence, le droit de session vaut
+sept jours et borne l'intervalle entre deux saisies. La clé privée est engendrée sur le poste et
+n'en sort jamais ; seule la demande de signature part sur le réseau.
 
 Installation, cycle de vie, déconnexion, cache et dépannage : [guide du plugin](docs/plugin.md).
 
-### Faire vivre les groupes
-
-Ajouter ou retirer quelqu'un d'un groupe fonctionne normalement : le portail comme le plugin
-relisent les groupes depuis le cluster **au moment d'émettre**, jamais depuis un cache.
-
-```console
-$ kubectl patch kdtgroup ops --type=merge -p '{"spec":{"members":[]}}'
-
-$ kubectl auth whoami                    # certificat déjà émis : inchangé
-Groups   [kdt:ops kdt:lecteurs system:authenticated]
-
-$ kdt-identity logout --portal … --user alice && kubectl auth whoami
-Groups   [kdt:lecteurs system:authenticated]
-```
-
-Le certificat déjà émis garde ses groupes jusqu'à expiration : un changement d'appartenance
-prend effet au renouvellement suivant, soit dix minutes au plus. `logout` force le passage
-immédiatement.
-
-Les opérations courantes — créer, inviter, désactiver, gérer l'appartenance, et surtout passer
-des groupes aux droits RBAC — sont rassemblées dans le [guide d'administration](docs/administration.md).
-
 ## Autoriser une application
 
-Le plugin présente le mot de passe et le code TOTP directement, ce qui est correct sur un poste :
-il tourne pour la personne qui les tape. Une application web ne peut pas faire cela — les relayer
-ferait d'elle un second endroit par où passent les mots de passe du cluster.
-
-D'où un chemin séparé, celui d'OAuth 2.0 réduit à ce qui est nécessaire. L'application envoie le
+Une application web obtient un accès par OAuth 2.0 réduit à ce qui est nécessaire : elle envoie le
 navigateur sur `/authorize`, le portail reconnaît la session ouverte, montre sous quelle identité
-l'accès sera utilisé et attend un accord ; il redirige alors vers l'application avec un code
-valable une minute, que celle-ci échange contre un droit de session en prouvant qu'elle est bien
-celle qui l'a demandé (PKCE, `S256`).
+l'accès sera utilisé et attend un accord, puis redirige vers l'application avec un code valable une
+minute, échangé contre un droit de session avec PKCE (`S256`).
 
 ```yaml
 # helm-values.yaml
 webUrl: https://kdt.example.com
 ```
 
-Une seule valeur : l'adresse de retour en découle — `https://kdt.example.com/auth/callback`, et
-c'est la seule que le portail acceptera. Il n'y a pas de registre d'applications, et rien ne
-s'enregistre à chaud : approuver une application qui parle à ce portail revient à lui confier des
-identités du cluster, c'est un geste de déploiement qui se relit dans un dépôt GitOps.
+L'adresse de retour en découle — `https://kdt.example.com/auth/callback` — et c'est la seule que le
+portail accepte. Il n'y a pas de registre d'applications ni d'enregistrement à chaud. Laissée vide,
+`webUrl` ne monte pas les points d'accès et la page du compte n'en dit rien.
 
-Laissée vide, `webUrl` ne fait rien du tout : les points d'accès ne sont pas montés et la page du
-compte n'en dit pas un mot. Rien n'est détecté — un lien affiché parce qu'un Service existe serait
-mort le temps qu'un ingress se propage.
-
-Ce que l'application obtient est **un droit de session ordinaire** : il compte dans les sessions
-du compte, `revoke` le ferme, `spec.disabled` le coupe. Il n'y a pas deux façons de révoquer.
+Ce que l'application obtient est un droit de session ordinaire : il compte dans les sessions du
+compte, `revoke` le ferme, `spec.disabled` le coupe.
 
 > **Servez l'application sous le même domaine enregistrable que le portail.** Le cookie de session
 > est `SameSite=Strict` : `kdt.example.com` et `identity.example.com` le partagent, un domaine
 > étranger ne le recevra pas et chaque autorisation repassera par une connexion complète.
 
 Le premier client de ce chemin est [kdt-web](https://github.com/agardenat/kdt), l'interface web de
-kdt. Elle s'installe séparément, et rien ici ne la suppose.
+kdt. Elle s'installe séparément.
 
-## Comment ça marche
+## Ce que l'apiserver reconnaît
 
 Par défaut, les identités sont des certificats clients X.509 obtenus via l'API
-`CertificateSigningRequest` : `CN=kdt:<utilisateur>`, un `O=kdt:<groupe>` par groupe, signés par
-la CA du cluster. Ils durent dix minutes et le plugin les renouvelle en silence.
+`CertificateSigningRequest` : `CN=kdt:<utilisateur>`, un `O=kdt:<groupe>` par groupe, signés par la
+CA du cluster. Ils durent dix minutes et le plugin les renouvelle en silence. Rien à changer sur le
+control plane — aucun drapeau de l'apiserver, aucune `AuthenticationConfiguration`, aucun IdP à
+déplacer — mais le cluster doit honorer ce signeur : k3s et AKS oui, EKS non.
 
-Ce choix a deux conséquences structurantes :
+Le mode `oidc` remplace les certificats par des jetons que l'apiserver valide. Il sert aux clusters
+qui ne signent pas, et à tracer les sessions individuellement. La révocation et l'identité produite
+sont identiques dans les deux cas.
 
-- **Rien à changer sur le control plane.** Aucun drapeau de l'apiserver, aucune
-  `AuthenticationConfiguration`, aucun IdP à déplacer. Une installation Helm, et c'est tout.
-- **Le cluster doit honorer ce signeur**, ce qui n'est pas acquis sur un control plane managé.
-  Vérifié : k3s et AKS oui, EKS non.
-
-Un second mode, `oidc`, remplace les certificats par des jetons que l'apiserver valide. Il sert
-aux clusters qui ne signent pas, et à tracer les sessions individuellement. La révocation et
-l'identité produite sont identiques dans les deux cas.
-
-**[Guide des modes](docs/modes.md)** — tableau de décision, compatibilité par plateforme,
-comment tester son cluster en une minute, comment basculer.
+[Guide des modes](docs/modes.md) — tableau de décision, compatibilité par plateforme, comment
+tester son cluster en une minute, comment basculer.
 
 ### Coexistence avec un IdP déjà en place
 
-L'authentification Kubernetes est une chaîne d'authentificateurs essayés jusqu'à ce que l'un
-accepte. kdt-identity **ne modifie rien de l'existant** : ni drapeaux de l'apiserver, ni
-configuration d'authentification, ni webhook. Il ajoute des CRDs dans son propre groupe d'API,
-un contrôleur, et des CSR éphémères supprimées après émission.
-
-Rancher, Entra ID, Keycloak, authentik continuent de fonctionner à l'identique. Cela vaut aussi
-en `authMode: ldap` : kdt-identity **lit** l'annuaire, ne lui écrit jamais rien, et n'intervient
-pas dans la façon dont un autre composant s'y authentifie.
-
-Deux précautions sont prises pour que la cohabitation reste lisible :
+kdt-identity ne modifie rien de l'existant : ni drapeaux de l'apiserver, ni configuration
+d'authentification, ni webhook. Il ajoute des CRDs dans son propre groupe d'API, un contrôleur, et
+des CSR éphémères supprimées après émission. Rancher, Entra ID, Keycloak et authentik continuent de
+fonctionner à l'identique. En `authMode: ldap`, l'annuaire est lu, jamais écrit.
 
 | Risque | Ce qui est fait |
 |---|---|
 | Rancher expose déjà un kind `User` | Les kinds sont `KdtUser` / `KdtGroup`, shortNames `kdtuser` / `kdtgroup`. Jamais `user` ni `group`. |
-| Un sujet RBAC n'est qu'une chaîne : `alice` émis ici hériterait d'un binding Rancher visant `alice` | Toute identité émise porte le préfixe `kdt:`, non désactivable. Aucune collision possible avec les `u-*` de Rancher, les UPN Entra ou `system:*`. |
+| Un sujet RBAC n'est qu'une chaîne : `alice` émis ici hériterait d'un binding Rancher visant `alice` | Toute identité émise porte le préfixe `kdt:`, non désactivable. Aucune collision avec les `u-*` de Rancher, les UPN Entra ou `system:*`. |
 
-Le kubeconfig produit ne décrit **que** le cluster et l'identité : ni `proxy-url`, ni bastion.
-Atteindre l'apiserver est une propriété du poste, pas du cluster ; qui passe par un tunnel le
-sait et l'ajoute de son côté.
+Le kubeconfig produit ne décrit que le cluster et l'identité : ni `proxy-url`, ni bastion.
 
 ## Sécurité
 
 **kdt-identity est un composant équivalent cluster-admin.** Approuver une CSR
 `kubernetes.io/kube-apiserver-client` revient à choisir une identité auprès de l'apiserver : qui
-peut le faire peut forger `O=system:masters`. Déployez-le comme tel — namespace dédié,
+peut le faire peut forger `O=system:masters`. Déploiement en conséquence — namespace dédié,
 NetworkPolicy en deny-by-default, RBAC restreint au seul signeur utilisé.
 
-Trois barrières indépendantes empêchent une identité de sortir du cadre :
+Trois vérifications encadrent les identités, et se recouvrent volontairement :
 
-1. **À l'admission** — une `ValidatingAdmissionPolicy` en CEL refuse les noms réservés, hors jeu
-   de caractères ou trop longs, y compris dans la liste des membres d'un groupe.
-2. **À la construction** — `Subject` ne peut être obtenu que par une fonction validante, et
-   ajoute lui-même le préfixe.
-3. **Avant approbation** — le sujet de la CSR est relu et doit correspondre **exactement** à
-   l'identité attendue, groupes compris. Une demande fournie par un client n'est jamais crue sur
-   parole : c'est ce qui empêche un utilisateur authentifié de réclamer une autre identité.
-
-La politique d'admission et la vérification à l'émission se recouvrent volontairement. Une CRD
-peut être créée avant l'installation de la politique, ou la politique être retirée : aucune des
-deux ne doit dépendre de l'autre.
+1. **À l'admission** — une `ValidatingAdmissionPolicy` en CEL refuse les noms réservés, hors jeu de
+   caractères ou trop longs, y compris dans la liste des membres d'un groupe.
+2. **À la construction** — `Subject` ne peut être obtenu que par une fonction validante, qui ajoute
+   elle-même le préfixe.
+3. **Avant approbation** — le sujet de la CSR est relu et doit correspondre exactement à l'identité
+   attendue, groupes compris ; une demande fournie par un client n'est jamais crue sur parole.
 
 ### Révocation
 
-Un credential émis vaut jusqu'à son expiration, sans exception : Kubernetes ne consulte aucune
-CRL, et un jeton signé ne se rappelle pas. La révocation ne vient donc pas de l'annulation d'un
-credential — elle vient du **retrait du droit d'en obtenir un autre**, conservé dans le
-cluster, combiné à une durée assez courte pour que l'attente soit supportable.
-
-D'où deux gestes, qui ne disent pas la même chose :
+Un credential émis vaut jusqu'à son expiration : Kubernetes ne consulte aucune CRL. La révocation
+porte donc sur le droit d'en obtenir un autre, conservé dans le cluster. Deux gestes :
 
 ```console
 $ kubectl -n kdt-identity exec deploy/kdt-identity-controller -- \
@@ -323,49 +248,38 @@ $ kubectl patch kdtuser alice --type=merge \
     -p '{"spec":{"disabled":true}}'                          # départ, compte compromis
 ```
 
-`revoke` ferme les sessions ouvertes : la personne reste habilitée et se reconnecte depuis un
-autre poste, celui qui a été perdu ne renouvelle plus rien.
+`revoke` ferme les sessions ouvertes : la personne reste habilitée et se reconnecte depuis un autre
+poste. `disabled` va plus loin : le portail refuse la connexion, le contrôleur ferme les sessions
+en cours, plus aucun renouvellement n'aboutit — et c'est un champ de la spec, donc déclaratif.
 
-`disabled` va plus loin, et se suffit à lui-même : le portail refuse la connexion, le
-contrôleur ferme les sessions en cours, plus aucun renouvellement n'aboutit. C'est un champ de
-la spec, donc le geste est déclaratif — il vit dans votre dépôt GitOps, sans qu'aucun shell ne
-soit ouvert dans un pod.
+Dans les deux cas, le credential en circulation vit sa durée : dix minutes au plus en mode
+certificat, cinq en mode OIDC, `certTtl` en décide.
 
-Dans les deux cas, le credential en circulation vit sa durée : **dix minutes au plus** en mode
-certificat, cinq en mode OIDC. C'est le seul délai irréductible, et `certTtl` en décide.
+Deux autres leviers :
 
-Restent deux leviers qui n'ont pas changé :
-
-- **Retirer le binding d'un groupe** coupe l'accès de tous ses membres instantanément, sans
-  attendre le moindre renouvellement. C'est la raison pour laquelle les droits doivent vivre
-  sur les groupes plutôt que sur les individus.
-- **Un kubeconfig téléchargé depuis le portail** échappe à tout cela : il est autoportant,
-  personne ne le renouvelle, et il reste valable jusqu'à son expiration — huit heures par
-  défaut. C'est le prix du chemin « sans rien installer ». Quand la révocation doit être sans
-  exception, fermez-le : `portal.kubeconfigDownload: false`.
+- **retirer le binding d'un groupe** coupe l'accès de tous ses membres instantanément, sans
+  attendre le moindre renouvellement ;
+- **un kubeconfig téléchargé depuis le portail** est autoportant : personne ne le renouvelle, et il
+  reste valable jusqu'à son expiration, huit heures par défaut. `portal.kubeconfigDownload: false`
+  ferme ce chemin.
 
 ## Obtenir les binaires
-
-Le projet en produit deux, qui ne s'installent pas au même endroit ni par les mêmes gens :
 
 | Binaire | Où | Pour qui |
 | --- | --- | --- |
 | `kdt-identity-server` | dans le cluster, fourni par l'image | contrôleur, portail, commandes d'administration |
 | `kdt-identity` | sur le poste de travail | plugin d'authentification de kubectl |
 
-**Côté administration, il n'y a rien à installer.** Les commandes du serveur s'exécutent dans le
-pod déjà déployé :
+Côté administration, il n'y a rien à installer : les commandes du serveur s'exécutent dans le pod
+déjà déployé. Le chemin est absolu, l'image ne contenant ni shell ni `PATH`.
 
 ```sh
 kubectl -n kdt-identity exec deploy/kdt-identity-controller -- \
     /usr/local/bin/kdt-identity-server invite alice
 ```
 
-Le chemin est absolu parce que l'image ne contient ni shell ni `PATH`.
-
-**Côté poste de travail**, installer le paquet `.deb` ou `.rpm` de la release, extraire le binaire
-de l'image, ou compiler depuis les sources — voir le
-[guide du plugin](docs/plugin.md#installation).
+Côté poste de travail, installer le paquet `.deb` ou `.rpm` de la release, extraire le binaire de
+l'image, ou compiler depuis les sources — voir le [guide du plugin](docs/plugin.md#installation).
 
 ## Installation
 
@@ -386,13 +300,17 @@ helm install kdt-identity kdt/kdt-identity \
     --set ingress.host=identity.example.com
 ```
 
-`apiserverUrl` n'est pas `https://kubernetes.default.svc` : cette adresse finit dans le
-kubeconfig d'un utilisateur, qui n'est pas dans le cluster.
+`apiserverUrl` n'est pas `https://kubernetes.default.svc` : cette adresse finit dans le kubeconfig
+d'un utilisateur, qui n'est pas dans le cluster.
+
+Le chart refuse un ingress sans TLS : le cookie de session porte l'attribut `Secure`, un navigateur
+ne le renverrait pas sur du HTTP. Sans ingress, pour essayer :
+
+```sh
+kubectl -n kdt-identity port-forward svc/kdt-identity-kdt-identity 8080:80
+```
 
 ### Depuis un fichier de valeurs
-
-Les `--set` conviennent à un essai. Pour une installation reproductible, et dès qu'une chaîne
-d'intégration s'en charge, les valeurs se rangent dans un fichier versionné :
 
 ```yaml
 # helm-values.yaml
@@ -423,28 +341,23 @@ networkPolicy:
 ```
 
 ```sh
-helm repo add kdt https://agardenat.github.io/helm-charts
-helm repo update
 helm upgrade --install kdt-identity kdt/kdt-identity --version 1.2.0 \
     --namespace kdt-identity --create-namespace \
     --values helm-values.yaml
 ```
 
-`upgrade --install` est idempotent : la même commande installe la première fois et met à jour
-ensuite, ce qu'attend une chaîne d'intégration qui rejoue le même pipeline. La version du chart est
-épinglée par `--version`, sans quoi la version déployée dépend de la date du pipeline.
+`upgrade --install` installe la première fois et met à jour ensuite. `--version` épingle la version
+du chart, sans quoi la version déployée dépend de la date du pipeline.
 
 #### La clé de session, si le rendu se fait hors du cluster
 
 `sessionKey` laissée vide, le chart engendre une clé au premier déploiement et la relit ensuite
 avec `lookup`, pour qu'une montée de version ne déconnecte pas tout le monde.
 
-`lookup` ne rend quelque chose que si le rendu a accès au cluster. C'est le cas de
-`helm upgrade` et du contrôleur Helm de Flux ; ce n'est pas celui de `helm template`, ni d'un
-outil qui rend le chart avant de l'appliquer — Argo CD par défaut. Là, la clé est régénérée à
-chaque synchronisation, et toutes les sessions ouvertes tombent.
-
-Dans ce cas, fixer la clé explicitement, depuis le gestionnaire de secrets de la chaîne :
+`lookup` ne rend quelque chose que si le rendu a accès au cluster : c'est le cas de `helm upgrade`
+et du contrôleur Helm de Flux, pas de `helm template` ni d'un outil qui rend le chart avant de
+l'appliquer — Argo CD par défaut. Là, la clé est régénérée à chaque synchronisation et toutes les
+sessions ouvertes tombent. Dans ce cas, fixer la clé explicitement :
 
 ```sh
 helm upgrade --install kdt-identity kdt/kdt-identity --version 1.2.0 \
@@ -453,43 +366,31 @@ helm upgrade --install kdt-identity kdt/kdt-identity --version 1.2.0 \
     --set sessionKey="$KDT_SESSION_KEY"
 ```
 
-`KDT_SESSION_KEY` vaut 32 octets en base64, `openssl rand -base64 32`. Elle n'a pas sa place
-dans le fichier de valeurs versionné.
-
-Le chart refuse de s'installer avec un ingress sans TLS. Ce n'est pas du zèle : le cookie de
-session porte l'attribut `Secure`, donc un navigateur ne le renverrait pas sur du HTTP — le
-portail serait inutilisable, et silencieusement.
-
-Sans ingress, pour essayer :
-
-```sh
-kubectl -n kdt-identity port-forward svc/kdt-identity-kdt-identity 8080:80
-```
+`KDT_SESSION_KEY` vaut 32 octets en base64, `openssl rand -base64 32`. Elle n'a pas sa place dans
+le fichier de valeurs versionné.
 
 ### Ce que le chart installe
 
-| Ressource | Pourquoi |
+| Ressource | Rôle |
 |---|---|
 | `ClusterRole` | lecture des CRDs, écriture de leur statut, cycle de vie des CSR |
 | `signers` avec `resourceNames` | l'autorisation d'approuver est restreinte au seul `kubernetes.io/kube-apiserver-client` |
-| `Role` namespacé | les Secrets de credentials, **sans le verbe `list`** : le contrôleur y accède toujours par leur nom, et l'absence de ce verbe empêche d'énumérer les comptes |
+| `Role` namespacé | les Secrets de credentials, **sans le verbe `list`** : le contrôleur y accède par leur nom, et l'absence de ce verbe empêche d'énumérer les comptes |
 | `NetworkPolicy` | apiserver, DNS et SMTP uniquement — le reste est refusé |
 | `ValidatingAdmissionPolicy` | les règles de nommage, rejouées côté apiserver |
 
-Les CRDs et la politique d'admission du chart sont **générées depuis le code**, et un test
-échoue si le YAML committé s'en écarte. Sans ce verrou, le schéma servi par le contrôleur et le
-schéma installé dans le cluster finiraient par diverger en silence.
+Les CRDs et la politique d'admission sont générées depuis le code, et un test échoue si le YAML
+committé s'en écarte.
 
-Sans Helm, pour un essai rapide, avec le binaire du serveur extrait de l'image comme décrit
-dans [Obtenir les binaires](#obtenir-les-binaires) — le chemin dans l'image est
-`/usr/local/bin/kdt-identity-server` :
+Sans Helm, avec le binaire du serveur extrait de l'image
+(`/usr/local/bin/kdt-identity-server`) :
 
 ```sh
 kdt-identity-server crd | kubectl apply -f -
 kdt-identity-server controller
 ```
 
-Les CRDs seules s'appliquent aussi directement depuis le dépôt, sans rien installer :
+Les CRDs seules s'appliquent aussi directement depuis le dépôt :
 
 ```sh
 kubectl apply -f https://raw.githubusercontent.com/agardenat/kdt-identity/main/deploy/helm/kdt-identity/crds/kdt-identity-crds.yaml
@@ -501,15 +402,13 @@ kubectl apply -f https://raw.githubusercontent.com/agardenat/kdt-identity/main/d
 cargo test --workspace
 ```
 
-Les tests de bout en bout créent de vraies CSR et s'authentifient avec le certificat obtenu.
-Ils sont ignorés par défaut :
+Les tests de bout en bout créent de vraies CSR et s'authentifient avec le certificat obtenu. Ils ne
+créent aucun binding RBAC — l'identité de test doit pouvoir s'authentifier sans obtenir le moindre
+droit — et sont ignorés par défaut :
 
 ```sh
 KUBECONFIG=~/.kube/config cargo test -p kdt-identity-server --test e2e_issuance -- --ignored
 ```
-
-Ils ne créent aucun binding RBAC : l'identité de test doit pouvoir s'authentifier sans obtenir
-le moindre droit, et c'est précisément ce qu'ils vérifient.
 
 ## Licence
 
