@@ -53,15 +53,19 @@ précédent — c'est aussi le chemin de réinitialisation.
 $ kubectl patch kdtuser alice --type=merge -p '{"spec":{"disabled":true}}'
 ```
 
-Le compte ne peut plus se connecter au portail ni obtenir de nouveau certificat. Un certificat
-déjà émis reste valide jusqu'à son expiration — au plus tard huit heures, la durée de tout ce
-qu'émet le portail : Kubernetes ne consulte aucune CRL, c'est la contrepartie du modèle par
-certificats. Pour une exclusion immédiate, retirer les bindings qui visent ses groupes.
+Le compte ne peut plus se connecter au portail ni obtenir de nouvel accès.
+
+**En mode `proxy`**, c'est tout : l'accès s'arrête sous `proxy.cacheTtl`, 30 s par défaut, y
+compris pour un kubeconfig téléchargé.
+
+**En mode `certificate`**, un certificat déjà émis reste valide jusqu'à son expiration — dix
+minutes pour le plugin, au plus tard huit heures pour un kubeconfig téléchargé : Kubernetes ne
+consulte aucune CRL, c'est la contrepartie du modèle par certificats. Pour une exclusion
+immédiate, retirer les bindings qui visent ses groupes.
 
 `disabled` se suffit à lui-même : le contrôleur ferme les sessions ouvertes dès qu'il le voit,
-donc plus aucun renouvellement n'aboutit. L'accès s'arrête quand le credential en cours expire,
-soit dix minutes au plus. C'est un champ de la spec : le geste vit dans un dépôt GitOps, sans
-qu'aucun shell ne soit ouvert dans un pod.
+donc plus aucun renouvellement n'aboutit. C'est un champ de la spec : le geste vit dans un dépôt
+GitOps, sans qu'aucun shell ne soit ouvert dans un pod.
 
 ### Fermer les sessions sans désactiver le compte
 
@@ -84,10 +88,11 @@ son mot de passe et son code — que le voleur n'a pas.
 | Poste perdu ou volé | `revoke alice` | sessions fermées, la personne se reconnecte |
 | Départ, compte compromis | `spec.disabled: true` | portail bloqué, sessions fermées, plus aucun renouvellement |
 
-Une réserve dans les deux cas : un kubeconfig téléchargé depuis le portail échappe à tout cela.
-Il est autoportant, personne ne le renouvelle, et il reste valable jusqu'à son expiration —
-huit heures par défaut. Quand la révocation doit être sans exception, fermer ce chemin :
-`portal.kubeconfigDownload: false`.
+Une réserve, **en mode `certificate` seulement** : un kubeconfig téléchargé depuis le portail
+échappe à tout cela. Il est autoportant, personne ne le renouvelle, et il reste valable jusqu'à
+son expiration — huit heures par défaut. Quand la révocation doit être sans exception, deux
+voies : `credentialMode: proxy`, où ce fichier se révoque comme le reste
+([proxy.md](proxy.md)), ou `portal.kubeconfigDownload: false`, qui ferme le chemin.
 
 ### Supprimer
 

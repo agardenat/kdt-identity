@@ -75,7 +75,7 @@ pub fn from_ambient_kubeconfig() -> Result<ClusterEndpoint, EndpointError> {
             .server
             .clone()
             .ok_or(EndpointError::NoServer(cluster_name))?,
-        certificate_authority_pem,
+        certificate_authority_pem: Some(certificate_authority_pem),
     })
 }
 
@@ -101,6 +101,6 @@ pub fn resolve(
     Ok(ClusterEndpoint {
         name: cluster_name.to_string(),
         server: server.to_string(),
-        certificate_authority_pem,
+        certificate_authority_pem: Some(certificate_authority_pem),
     })
 }

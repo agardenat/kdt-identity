@@ -8,6 +8,50 @@ tag `v<version>` qui a déclenché sa publication.
 Les notes de version publiées avec un tag sont la section correspondante de ce fichier, extraite
 par `packaging/changelog-section.sh` : ce fichier est la source, pas une copie.
 
+## [1.4.0] — 2026-09-21
+
+- **feat(server)** — **`credentialMode: proxy`, un kubeconfig standard et révocable**. Le portail
+  remet un fichier qui ne contient qu'un jeton et l'adresse de kdt-identity : `kubectl` et `helm`
+  le lisent sans rien installer, et il cesse de fonctionner dès que l'accès est coupé. C'est le
+  nouveau défaut du chart.
+
+  Jusqu'ici, aucun des deux modes ne donnait les trois à la fois. Un certificat téléchargé ne se
+  révoque pas — Kubernetes ne consulte aucune CRL — et le mode OIDC, qui se révoque, exige de
+  déclarer l'émetteur à l'apiserver. Or les deux mécanismes qui permettent de vérifier un jeton en
+  ligne, webhook d'authentification et émetteur OIDC tiers, se règlent par des options du control
+  plane : aucune des deux n'est ouverte sur AKS, seule la seconde l'est sur EKS et GKE.
+
+  Le proxy contourne la question en se plaçant **devant** le cluster au lieu d'agir dessus. Il
+  vérifie le jeton contre la session enregistrée, relit le compte et ses groupes, puis relaie à
+  l'apiserver en impersonation. L'identité vue reste `kdt:alice` avec ses groupes `kdt:*` : **les
+  `RoleBinding` et `ClusterRoleBinding` existants s'appliquent sans modification**. Aucune option
+  d'apiserver n'est requise, donc toutes les distributions.
+
+  La révocation devient sans exception. `revoke` et `spec.disabled` fermaient déjà toutes les
+  sessions ; elles ferment désormais aussi les kubeconfigs téléchargés, sous `proxy.cacheTtl` —
+  30 s par défaut, et c'est le seul curseur. Retirer quelqu'un d'un `KdtGroup` prend effet tout
+  aussi vite, les groupes étant relus à chaque requête.
+
+  Les connexions promues — `exec`, `attach`, `port-forward`, `cp` — sont transportées sans être
+  lues : le proxy ne parle ni SPDY ni WebSocket, et les démultiplexer reviendrait à réimplémenter
+  `exec` puis à le casser à la prochaine version du canal.
+
+  Rien de plus à publier : le proxy est servi par le portail, sous `/k8s`. Même hôte, même
+  certificat, même Ingress. `proxy.url` et `proxy.listen` permettent de l'exposer séparément.
+
+  Contrepartie à accepter : kdt-identity est sur le chemin des requêtes, donc son indisponibilité
+  coupe ces accès — les kubeconfigs administrateur natifs ne passent pas par lui, on ne peut pas
+  s'enfermer dehors. Et son ServiceAccount a le droit d'impersonation ; ce n'est pas un pouvoir
+  nouveau, approuver une CSR `kube-apiserver-client` permettait déjà de se forger n'importe quelle
+  identité, et le chart **retire** ces règles de signature en mode proxy au lieu de les cumuler.
+
+  Voir [docs/proxy.md](docs/proxy.md).
+
+- **chore(server)** — les sessions portent un **usage** (`refresh` ou `kubeconfig`), avec un
+  plafond compté par usage : des kubeconfigs téléchargés n'évincent plus les sessions du plugin,
+  et un jeton ne vaut pas pour l'autre usage. Les sessions écrites par une version antérieure se
+  relisent en `refresh`, sans migration.
+
 ## [1.3.0] — 2026-09-09
 
 - **feat(server, cli)** — **fédération d'identité sur un fournisseur OpenID Connect**, Entra ID,

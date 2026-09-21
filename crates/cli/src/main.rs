@@ -305,6 +305,14 @@ async fn use_session(
             certificate(http, portal, &subject, &groups, session.token).await
         }
         CredentialMode::Oidc => token(http, portal, session.token).await,
+        // Le plugin n'a rien à faire ici : en mode proxy, le kubeconfig porte lui-même un jeton
+        // et `kubectl` n'appelle personne. Un kubeconfig qui invoque ce plugin sur un tel
+        // déploiement est un reste d'une configuration précédente, et le dire vaut mieux que
+        // d'échouer sur un appel refusé par le portail.
+        CredentialMode::Proxy => Err(anyhow::anyhow!(
+            "ce déploiement remet des kubeconfigs autonomes : téléchargez-en un depuis {portal} \
+             au lieu de passer par ce plugin"
+        )),
     }
     .map_err(Attempt::Unreachable)?;
 

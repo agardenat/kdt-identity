@@ -34,7 +34,7 @@ use kdt_identity_api::naming::Subject;
 use crate::oidc::discovery::{self, DISCOVERY_PATH, JWKS_PATH};
 use crate::oidc::key::JwkSet;
 use crate::oidc::{jwt, SigningMaterial};
-use crate::sessions::SessionStore;
+use crate::sessions::{SessionKind, SessionStore};
 use crate::federation::{provision, Source};
 use crate::ldap::{Directory, LdapError};
 use crate::oidc_auth::{OidcError, Pending, Provider};
@@ -1063,8 +1063,12 @@ async fn download_kubeconfig(
     // La page n'affiche plus ce bouton quand le téléchargement est fermé, mais la route reste
     // atteignable. Émettre ici rendrait un accès de plusieurs heures que « revoke » ne peut
     // pas couper : exactement ce que la fermeture du téléchargement vise à empêcher.
-    if !state.config.kubeconfig_download || state.config.credential_mode == CredentialMode::Oidc {
-        warn!(user = %user, "téléchargement de kubeconfig refusé : mode oidc");
+    //
+    // Le réglage ne concerne que le mode certificat, parce qu'il ne protège que de ce qui n'est
+    // pas révocable. En mode proxy il n'y a rien à fermer : le fichier remis s'éteint avec la
+    // session qui le porte, et c'est tout l'intérêt du mode.
+    if !download_offered(&state.config) {
+        warn!(user = %user, mode = %state.config.credential_mode, "téléchargement de kubeconfig refusé");
         return render_account(
             &state,
             &user,
@@ -1111,32 +1115,42 @@ async fn download_kubeconfig(
         Err(message) => return render_account(&state, &user, Some(&message)).await,
     };
 
-    let credential = match state
-        .issuer
-        .issue_with_generated_key(&subject, &group_subjects, state.config.download_cert_ttl)
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(user = %user, erreur = %e, "émission du certificat en échec");
-            return render_account(
-                &state,
-                &user,
-                Some("L'émission du certificat a échoué. Réessayez dans un instant."),
-            )
-            .await;
+    // Les deux formes divergent ici, et sur le seul point qui compte : l'une embarque de quoi
+    // parler à l'apiserver pour toujours, l'autre un jeton qui ne vaut rien sans le cluster.
+    let (yaml, expire) = match state.config.credential_mode {
+        CredentialMode::Proxy => match issue_proxy_kubeconfig(&state, &kdt_user, &subject).await {
+            Ok(pair) => pair,
+            Err(message) => return render_account(&state, &user, Some(&message)).await,
+        },
+        _ => {
+            let credential = match state
+                .issuer
+                .issue_with_generated_key(&subject, &group_subjects, state.config.download_cert_ttl)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(user = %user, erreur = %e, "émission du certificat en échec");
+                    return render_account(
+                        &state,
+                        &user,
+                        Some("L'émission du certificat a échoué. Réessayez dans un instant."),
+                    )
+                    .await;
+                }
+            };
+
+            match kubeconfig::standalone(&state.endpoint, &subject, &credential) {
+                Ok(yaml) => (yaml, credential.not_after),
+                Err(e) => {
+                    warn!(user = %user, erreur = %e, "assemblage du kubeconfig en échec");
+                    return internal_error();
+                }
+            }
         }
     };
 
-    let yaml = match kubeconfig::standalone(&state.endpoint, &subject, &credential) {
-        Ok(yaml) => yaml,
-        Err(e) => {
-            warn!(user = %user, erreur = %e, "assemblage du kubeconfig en échec");
-            return internal_error();
-        }
-    };
-
-    info!(user = %user, expire = %credential.not_after, "kubeconfig téléchargé");
+    info!(user = %user, %expire, "kubeconfig téléchargé");
     (
         [
             (header::CONTENT_TYPE, "application/yaml".to_string()),
@@ -1147,12 +1161,74 @@ async fn download_kubeconfig(
                     state.endpoint.name, user
                 ),
             ),
-            // Un kubeconfig contient une clé privée : aucun cache, nulle part.
+            // Un kubeconfig porte de quoi entrer dans le cluster : aucun cache, nulle part.
             (header::CACHE_CONTROL, "no-store".to_string()),
         ],
         yaml,
     )
         .into_response()
+}
+
+/// Le portail propose-t-il un kubeconfig à télécharger ?
+///
+/// Décidé au même endroit pour la page et pour la route, faute de quoi l'une pourrait offrir ce
+/// que l'autre refuse.
+fn download_offered(config: &ServerConfig) -> bool {
+    match config.credential_mode {
+        // Rien à fermer : le fichier remis ne vaut que ce que le cluster en dit.
+        CredentialMode::Proxy => true,
+        // Le seul accès qu'une révocation ne rattrape pas, donc le seul qui se ferme.
+        CredentialMode::Certificate => config.kubeconfig_download,
+        // Un jeton signé ne peut pas tenir dans un fichier : il vit cinq minutes.
+        CredentialMode::Oidc => false,
+    }
+}
+
+/// Ouvre une session de kubeconfig et rend le fichier qui la porte.
+///
+/// Rien n'est signé ni émis : le jeton est tiré au sort, seule son empreinte est conservée, et
+/// c'est l'entrée de session dans le cluster qui lui donne sa valeur. La retirer suffit à
+/// éteindre le fichier, où qu'il soit.
+async fn issue_proxy_kubeconfig(
+    state: &AppState,
+    user: &KdtUser,
+    subject: &Subject,
+) -> Result<(String, chrono::DateTime<Utc>), String> {
+    let validity = chrono::Duration::from_std(state.config.download_token_ttl)
+        .expect("durée bornée à la lecture de la configuration");
+    let (token, expires_at) = state
+        .sessions
+        .update(user, |sessions| {
+            let issued = sessions.open(Utc::now(), validity, SessionKind::Kubeconfig);
+            (
+                crate::sessions::kubeconfig_token(subject.name(), &issued).to_string(),
+                issued.session.expires_at,
+            )
+        })
+        .await
+        .map_err(|e| {
+            warn!(user = subject.name(), erreur = %e, "ouverture de session impossible");
+            "L'ouverture de la session a échoué. Réessayez dans un instant.".to_string()
+        })?;
+
+    let endpoint = kubeconfig::ClusterEndpoint {
+        name: state.endpoint.name.clone(),
+        server: crate::proxy::server_url(state.config.proxy_public_url(), &state.endpoint.name),
+        certificate_authority_pem: match state.config.proxy_ca_file.as_deref() {
+            None => None,
+            Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
+                warn!(fichier = %path, erreur = %e, "autorité du proxy illisible");
+                "L'autorité du proxy est illisible.".to_string()
+            })?),
+        },
+    };
+
+    kubeconfig::bearer(&endpoint, subject, &token)
+        .map(|yaml| (yaml, expires_at))
+        .map_err(|e| {
+            warn!(erreur = %e, "assemblage du kubeconfig en échec");
+            "L'assemblage du kubeconfig a échoué.".to_string()
+        })
 }
 
 async fn render_account(state: &AppState, user: &str, error: Option<&str>) -> Response {
@@ -1180,8 +1256,7 @@ async fn render_account(state: &AppState, user: &str, error: Option<&str>) -> Re
             error,
             mode: state.config.credential_mode,
             portal_url: &state.config.portal_url,
-            download: state.config.kubeconfig_download
-                && state.config.credential_mode == CredentialMode::Certificate,
+            download: download_offered(&state.config),
             web_url: state.config.web_url.as_deref(),
         })
         .into_string(),
@@ -1403,7 +1478,7 @@ async fn api_authorize_token(
     let refresh = match state
         .sessions
         .update(&user, |sessions| {
-            let issued = sessions.open(now, validity);
+            let issued = sessions.open(now, validity, SessionKind::Refresh);
             (issued.token.to_string(), issued.session.expires_at)
         })
         .await
@@ -1661,7 +1736,7 @@ async fn api_session(
                     return internal_error_json();
                 }
             };
-            if let Err(e) = sessions.verify(refresh_token, now) {
+            if let Err(e) = sessions.verify(refresh_token, now, SessionKind::Refresh) {
                 // Refus d'identité, pas panne : le client doit repasser par une
                 // authentification complète, et le distinguer lui évite de réessayer en boucle.
                 warn!(user = %request.user, raison = %e, "renouvellement refusé");
@@ -1704,7 +1779,7 @@ async fn api_session(
         match state
             .sessions
             .update(&user, |sessions| {
-                let issued = sessions.open(now, validity);
+                let issued = sessions.open(now, validity, SessionKind::Refresh);
                 (issued.token.to_string(), issued.session.expires_at)
             })
             .await
@@ -1918,7 +1993,7 @@ async fn api_revoke(
 
     let closed = state
         .sessions
-        .update(&user, |sessions| match sessions.verify(&request.refresh_token, now) {
+        .update(&user, |sessions| match sessions.verify(&request.refresh_token, now, SessionKind::Refresh) {
             Ok(id) => {
                 sessions.close(&id);
                 true

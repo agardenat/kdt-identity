@@ -32,12 +32,29 @@ pub const SECRET_BYTES: usize = 32;
 /// Taille de l'identifiant de session, en octets.
 const ID_BYTES: usize = 8;
 
-/// Nombre de sessions simultanées conservées par compte.
+/// Nombre de sessions simultanées conservées par compte, **pour chaque usage**.
 ///
 /// Un poste fixe, un portable, une machine de secours : au-delà, les plus anciennes sont
 /// évincées. Sans plafond, chaque connexion ajouterait une ligne qu'aucun chemin n'efface, et
-/// le `Secret` finirait par grossir sans limite.
+/// le `Secret` finirait par grossir sans limite. Le compte est tenu par `SessionKind` : trois
+/// kubeconfigs téléchargés ne doivent pas évincer les sessions du plugin.
 pub const MAX_SESSIONS: usize = 5;
+
+/// Ce qu'une session autorise.
+///
+/// Les deux usages ne sont pas interchangeables : un jeton de renouvellement ne doit pas ouvrir
+/// le proxy, et un jeton de kubeconfig ne doit pas émettre de certificat. `verify` exige donc
+/// l'usage attendu, et le refus est le même que pour un jeton inconnu.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionKind {
+    /// Droit de renouveler un credential, présenté par le plugin. C'est le défaut en
+    /// désérialisation : les `Secret` écrits avant l'arrivée du proxy n'ont pas ce champ.
+    #[default]
+    Refresh,
+    /// Jeton porté par un kubeconfig téléchargé, présenté au proxy à chaque requête.
+    Kubeconfig,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RefreshError {
@@ -59,6 +76,8 @@ pub struct Session {
     pub secret_hash: String,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    #[serde(default)]
+    pub kind: SessionKind,
 }
 
 /// Toutes les sessions d'un compte.
@@ -83,11 +102,21 @@ impl SessionSet {
         self.sessions.len()
     }
 
+    /// Nombre de sessions d'un usage donné. La vue `:identity` de kdt les compte à part.
+    pub fn count_of(&self, kind: SessionKind) -> usize {
+        self.sessions.iter().filter(|s| s.kind == kind).count()
+    }
+
     /// Ouvre une session valable `validity`, et rend le jeton à remettre au client.
     ///
     /// Les sessions expirées sont retirées au passage : c'est le seul moment où quelqu'un
     /// regarde cette liste, et rien d'autre ne viendrait faire le ménage.
-    pub fn open(&mut self, now: DateTime<Utc>, validity: chrono::Duration) -> NewRefresh {
+    pub fn open(
+        &mut self,
+        now: DateTime<Utc>,
+        validity: chrono::Duration,
+        kind: SessionKind,
+    ) -> NewRefresh {
         self.prune(now);
 
         let mut id_bytes = [0u8; ID_BYTES];
@@ -103,16 +132,22 @@ impl SessionSet {
             secret_hash: hex(&Sha256::digest(secret.as_bytes())),
             issued_at: now,
             expires_at: now + validity,
+            kind,
         };
 
         self.sessions.push(session.clone());
         // Le plafond s'applique après l'ajout : ouvrir une session de plus doit réussir, quitte
         // à ce que la plus ancienne tombe. Refuser la nouvelle laisserait quelqu'un dehors à
         // cause de postes qu'il n'utilise plus.
-        if self.sessions.len() > MAX_SESSIONS {
-            self.sessions.sort_by_key(|s| s.issued_at);
-            let surplus = self.sessions.len() - MAX_SESSIONS;
-            self.sessions.drain(..surplus);
+        while self.count_of(kind) > MAX_SESSIONS {
+            let doyenne = self
+                .sessions
+                .iter()
+                .filter(|s| s.kind == kind)
+                .min_by_key(|s| (s.issued_at, s.id.clone()))
+                .map(|s| s.id.clone())
+                .expect("au moins une session de cet usage vient d'être ajoutée");
+            self.sessions.retain(|s| s.id != doyenne);
         }
 
         NewRefresh {
@@ -121,16 +156,25 @@ impl SessionSet {
         }
     }
 
-    /// Vérifie un jeton présenté et rend l'identifiant de la session correspondante.
+    /// Vérifie un jeton présenté pour l'usage `expect`, et rend l'identifiant de la session.
     ///
     /// La comparaison est à temps constant, et une session inconnue provoque malgré tout un
     /// calcul d'empreinte : sans cela, le temps de réponse distinguerait un identifiant connu
-    /// d'un identifiant inventé.
-    pub fn verify(&self, presented: &str, now: DateTime<Utc>) -> Result<String, RefreshError> {
+    /// d'un identifiant inventé. Un jeton présenté pour le mauvais usage est refusé comme un
+    /// jeton inconnu.
+    pub fn verify(
+        &self,
+        presented: &str,
+        now: DateTime<Utc>,
+        expect: SessionKind,
+    ) -> Result<String, RefreshError> {
         let (id, secret) = presented.split_once('.').ok_or(RefreshError::Invalid)?;
         let digest = Sha256::digest(secret.as_bytes());
 
-        let found = self.sessions.iter().find(|s| s.id == id);
+        let found = self
+            .sessions
+            .iter()
+            .find(|s| s.id == id && s.kind == expect);
         let expected = found
             .and_then(|s| decode_hex(&s.secret_hash))
             .unwrap_or([0u8; 32]);
@@ -170,6 +214,38 @@ impl SessionSet {
     }
 }
 
+/// Préfixe du jeton porté par un kubeconfig téléchargé.
+///
+/// Il permet au proxy d'écarter d'emblée ce qui ne lui appartient pas — un jeton de
+/// `ServiceAccount`, un reste de jeton d'un autre produit — sans lire le moindre `Secret`.
+pub const KUBECONFIG_TOKEN_PREFIX: &str = "kdt_";
+
+/// Compose le jeton remis dans un kubeconfig : `kdt_<compte>_<identifiant>.<secret>`.
+///
+/// Le compte y figure parce que le proxy ne reçoit qu'un en-tête `Authorization` : sans lui,
+/// rien ne dirait quel `Secret` de sessions relire. Ce n'est pas un secret, et le séparateur
+/// est `_` parce que [`NAME_PATTERN`](kdt_identity_api::naming::NAME_PATTERN) l'interdit dans
+/// un nom de compte — contrairement au `.`, qu'il admet.
+pub fn kubeconfig_token(user: &str, issued: &NewRefresh) -> Zeroizing<String> {
+    Zeroizing::new(format!(
+        "{KUBECONFIG_TOKEN_PREFIX}{user}_{}",
+        issued.token.as_str()
+    ))
+}
+
+/// Sépare un jeton de kubeconfig en compte et paire `<identifiant>.<secret>`.
+///
+/// Ne valide pas le compte : c'est à l'appelant de le faire avant d'en dériver un nom de
+/// `Secret`. Rend `None` sur tout ce qui n'a pas la forme attendue.
+pub fn split_kubeconfig_token(presented: &str) -> Option<(&str, &str)> {
+    let rest = presented.strip_prefix(KUBECONFIG_TOKEN_PREFIX)?;
+    let (user, credential) = rest.split_once('_')?;
+    if user.is_empty() || !credential.contains('.') {
+        return None;
+    }
+    Some((user, credential))
+}
+
 fn b64(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -206,9 +282,9 @@ mod tests {
     #[test]
     fn un_jeton_emis_se_verifie() {
         let mut set = SessionSet::default();
-        let issued = set.open(now(), week());
+        let issued = set.open(now(), week(), SessionKind::Refresh);
 
-        assert_eq!(set.verify(&issued.token, now()).unwrap(), issued.session.id);
+        assert_eq!(set.verify(&issued.token, now(), SessionKind::Refresh).unwrap(), issued.session.id);
     }
 
     /// Le secret ne doit pas être conservé en clair : une fuite du Secret ne doit pas rendre
@@ -216,7 +292,7 @@ mod tests {
     #[test]
     fn le_secret_n_est_pas_stocke_en_clair() {
         let mut set = SessionSet::default();
-        let issued = set.open(now(), week());
+        let issued = set.open(now(), week(), SessionKind::Refresh);
         let secret = issued.token.split_once('.').unwrap().1;
 
         let stocke = serde_json::to_string(&set).unwrap();
@@ -226,11 +302,13 @@ mod tests {
     #[test]
     fn un_jeton_expire_est_refuse() {
         let mut set = SessionSet::default();
-        let issued = set.open(now(), Duration::hours(1));
+        let issued = set.open(now(), Duration::hours(1), SessionKind::Refresh);
 
-        assert!(set.verify(&issued.token, now() + Duration::minutes(59)).is_ok());
+        assert!(set
+            .verify(&issued.token, now() + Duration::minutes(59), SessionKind::Refresh)
+            .is_ok());
         assert_eq!(
-            set.verify(&issued.token, now() + Duration::hours(1)),
+            set.verify(&issued.token, now() + Duration::hours(1), SessionKind::Refresh),
             Err(RefreshError::Expired)
         );
     }
@@ -240,38 +318,38 @@ mod tests {
     #[test]
     fn fermer_une_session_invalide_son_jeton() {
         let mut set = SessionSet::default();
-        let issued = set.open(now(), week());
+        let issued = set.open(now(), week(), SessionKind::Refresh);
 
         set.close(&issued.session.id);
-        assert_eq!(set.verify(&issued.token, now()), Err(RefreshError::Invalid));
+        assert_eq!(set.verify(&issued.token, now(), SessionKind::Refresh), Err(RefreshError::Invalid));
     }
 
     #[test]
     fn tout_fermer_invalide_tous_les_jetons() {
         let mut set = SessionSet::default();
-        let a = set.open(now(), week());
-        let b = set.open(now(), week());
+        let a = set.open(now(), week(), SessionKind::Refresh);
+        let b = set.open(now(), week(), SessionKind::Refresh);
 
         assert_eq!(set.close_all(), 2);
-        assert_eq!(set.verify(&a.token, now()), Err(RefreshError::Invalid));
-        assert_eq!(set.verify(&b.token, now()), Err(RefreshError::Invalid));
+        assert_eq!(set.verify(&a.token, now(), SessionKind::Refresh), Err(RefreshError::Invalid));
+        assert_eq!(set.verify(&b.token, now(), SessionKind::Refresh), Err(RefreshError::Invalid));
     }
 
     /// Fermer une session ne doit pas fermer celles des autres postes.
     #[test]
     fn fermer_une_session_epargne_les_autres() {
         let mut set = SessionSet::default();
-        let poste = set.open(now(), week());
-        let portable = set.open(now(), week());
+        let poste = set.open(now(), week(), SessionKind::Refresh);
+        let portable = set.open(now(), week(), SessionKind::Refresh);
 
         set.close(&poste.session.id);
-        assert!(set.verify(&portable.token, now()).is_ok());
+        assert!(set.verify(&portable.token, now(), SessionKind::Refresh).is_ok());
     }
 
     #[test]
     fn un_jeton_falsifie_est_refuse() {
         let mut set = SessionSet::default();
-        let issued = set.open(now(), week());
+        let issued = set.open(now(), week(), SessionKind::Refresh);
         let (id, _) = issued.token.split_once('.').unwrap();
 
         for faux in [
@@ -281,7 +359,7 @@ mod tests {
             String::new(),
             ".".to_string(),
         ] {
-            assert_eq!(set.verify(&faux, now()), Err(RefreshError::Invalid), "{faux:?}");
+            assert_eq!(set.verify(&faux, now(), SessionKind::Refresh), Err(RefreshError::Invalid), "{faux:?}");
         }
     }
 
@@ -289,24 +367,24 @@ mod tests {
     #[test]
     fn le_secret_d_une_session_ne_vaut_pas_pour_une_autre() {
         let mut set = SessionSet::default();
-        let a = set.open(now(), week());
-        let b = set.open(now(), week());
+        let a = set.open(now(), week(), SessionKind::Refresh);
+        let b = set.open(now(), week(), SessionKind::Refresh);
 
         let croise = format!(
             "{}.{}",
             b.session.id,
             a.token.split_once('.').unwrap().1
         );
-        assert_eq!(set.verify(&croise, now()), Err(RefreshError::Invalid));
+        assert_eq!(set.verify(&croise, now(), SessionKind::Refresh), Err(RefreshError::Invalid));
     }
 
     #[test]
     fn les_sessions_expirees_disparaissent_a_l_ouverture_suivante() {
         let mut set = SessionSet::default();
-        set.open(now(), Duration::hours(1));
+        set.open(now(), Duration::hours(1), SessionKind::Refresh);
         assert_eq!(set.len(), 1);
 
-        set.open(now() + Duration::hours(2), week());
+        set.open(now() + Duration::hours(2), week(), SessionKind::Refresh);
         assert_eq!(set.len(), 1, "la session expirée aurait dû être retirée");
     }
 
@@ -317,7 +395,11 @@ mod tests {
         let mut set = SessionSet::default();
         let mut premiere = None;
         for i in 0..MAX_SESSIONS + 3 {
-            let issued = set.open(now() + Duration::seconds(i as i64), week());
+            let issued = set.open(
+                now() + Duration::seconds(i as i64),
+                week(),
+                SessionKind::Refresh,
+            );
             if i == 0 {
                 premiere = Some(issued);
             }
@@ -325,18 +407,127 @@ mod tests {
 
         assert_eq!(set.len(), MAX_SESSIONS);
         assert_eq!(
-            set.verify(&premiere.unwrap().token, now()),
+            set.verify(&premiere.unwrap().token, now(), SessionKind::Refresh),
             Err(RefreshError::Invalid)
         );
+    }
+
+    /// Les deux usages ne se substituent pas l'un à l'autre : un jeton de renouvellement ne doit
+    /// pas ouvrir le proxy, ni l'inverse.
+    #[test]
+    fn un_jeton_ne_vaut_pas_pour_l_autre_usage() {
+        let mut set = SessionSet::default();
+        let plugin = set.open(now(), week(), SessionKind::Refresh);
+        let fichier = set.open(now(), week(), SessionKind::Kubeconfig);
+
+        assert_eq!(
+            set.verify(&plugin.token, now(), SessionKind::Kubeconfig),
+            Err(RefreshError::Invalid)
+        );
+        assert_eq!(
+            set.verify(&fichier.token, now(), SessionKind::Refresh),
+            Err(RefreshError::Invalid)
+        );
+        assert!(set.verify(&plugin.token, now(), SessionKind::Refresh).is_ok());
+        assert!(set
+            .verify(&fichier.token, now(), SessionKind::Kubeconfig)
+            .is_ok());
+    }
+
+    /// Le plafond se compte par usage : télécharger des kubeconfigs ne doit pas déconnecter les
+    /// postes qui utilisent le plugin.
+    #[test]
+    fn le_plafond_se_compte_par_usage() {
+        let mut set = SessionSet::default();
+        let plugin = set.open(now(), week(), SessionKind::Refresh);
+        for i in 0..MAX_SESSIONS + 3 {
+            set.open(
+                now() + Duration::seconds(i as i64),
+                week(),
+                SessionKind::Kubeconfig,
+            );
+        }
+
+        assert_eq!(set.count_of(SessionKind::Kubeconfig), MAX_SESSIONS);
+        assert_eq!(set.count_of(SessionKind::Refresh), 1);
+        assert!(set.verify(&plugin.token, now(), SessionKind::Refresh).is_ok());
+    }
+
+    /// La révocation vaut pour tout, quel que soit l'usage : c'est ce qui rend le kubeconfig
+    /// téléchargé révocable.
+    #[test]
+    fn tout_fermer_coupe_les_deux_usages() {
+        let mut set = SessionSet::default();
+        let plugin = set.open(now(), week(), SessionKind::Refresh);
+        let fichier = set.open(now(), week(), SessionKind::Kubeconfig);
+
+        assert_eq!(set.close_all(), 2);
+        assert_eq!(
+            set.verify(&plugin.token, now(), SessionKind::Refresh),
+            Err(RefreshError::Invalid)
+        );
+        assert_eq!(
+            set.verify(&fichier.token, now(), SessionKind::Kubeconfig),
+            Err(RefreshError::Invalid)
+        );
+    }
+
+    /// Les `Secret` écrits avant le proxy n'ont pas de champ `kind` : ils doivent se relire en
+    /// sessions de renouvellement, pas devenir des jetons de proxy.
+    #[test]
+    fn une_session_sans_usage_se_relit_en_renouvellement() {
+        let ancien = r#"[{"id":"abc","secretHash":"00","issuedAt":"2023-11-14T22:13:20Z","expiresAt":"2033-11-14T22:13:20Z"}]"#;
+
+        let set: SessionSet = serde_json::from_str(ancien).unwrap();
+        assert_eq!(set.iter().next().unwrap().kind, SessionKind::Refresh);
+    }
+
+    #[test]
+    fn le_jeton_de_kubeconfig_se_compose_et_se_separe() {
+        let mut set = SessionSet::default();
+        let issued = set.open(now(), week(), SessionKind::Kubeconfig);
+        let jeton = kubeconfig_token("alice", &issued);
+
+        let (user, credential) = split_kubeconfig_token(&jeton).unwrap();
+        assert_eq!(user, "alice");
+        assert!(set
+            .verify(credential, now(), SessionKind::Kubeconfig)
+            .is_ok());
+    }
+
+    /// Un nom de compte admet le `.` mais jamais le `_` : c'est ce qui rend la séparation non
+    /// ambiguë, y compris quand l'identifiant de session contient lui-même des `_`.
+    #[test]
+    fn un_compte_pointe_se_separe_quand_meme() {
+        let mut set = SessionSet::default();
+        let issued = set.open(now(), week(), SessionKind::Kubeconfig);
+        let jeton = kubeconfig_token("jean.dupont", &issued);
+
+        assert_eq!(split_kubeconfig_token(&jeton).unwrap().0, "jean.dupont");
+    }
+
+    #[test]
+    fn un_jeton_qui_n_est_pas_du_proxy_est_ecarte() {
+        for faux in [
+            "eyJhbGciOiJSUzI1NiIs",
+            "kdt_",
+            "kdt_alice",
+            "kdt_alice_sans-point",
+            "kdt__id.secret",
+            "alice_id.secret",
+            "",
+        ] {
+            assert!(split_kubeconfig_token(faux).is_none(), "{faux:?}");
+        }
     }
 
     #[test]
     fn l_ensemble_fait_l_aller_retour_json() {
         let mut set = SessionSet::default();
-        let issued = set.open(now(), week());
+        let issued = set.open(now(), week(), SessionKind::Refresh);
 
         let relu: SessionSet = serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
         assert_eq!(relu, set);
-        assert!(relu.verify(&issued.token, now()).is_ok());
+        assert!(relu.verify(&issued.token, now(), SessionKind::Refresh).is_ok());
     }
 }

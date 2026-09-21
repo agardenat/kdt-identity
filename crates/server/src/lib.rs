@@ -10,6 +10,7 @@ pub mod mail;
 pub mod manifests;
 pub mod oidc;
 pub mod oidc_auth;
+pub mod proxy;
 pub mod sessions;
 pub mod web;
 

@@ -37,20 +37,33 @@ struct Cli {
 
 /// Le client du cluster, sur le contexte demandé.
 async fn cluster_client(context: Option<&str>) -> anyhow::Result<kube::Client> {
-    let Some(context) = context else {
-        return kube::Client::try_default()
-            .await
-            .context("connexion au cluster");
+    let (client, _) = cluster_client_with_config(context).await?;
+    Ok(client)
+}
+
+/// Le client et la configuration dont il est issu.
+///
+/// Le proxy a besoin des deux : le client pour tout le trafic ordinaire, la configuration pour
+/// ouvrir ses propres connexions lors des promotions — qui ne peuvent pas passer par lui.
+async fn cluster_client_with_config(
+    context: Option<&str>,
+) -> anyhow::Result<(kube::Client, kube::Config)> {
+    let config = match context {
+        None => kube::Config::infer().await.context("connexion au cluster")?,
+        Some(context) => {
+            let options = kube::config::KubeConfigOptions {
+                context: Some(context.to_string()),
+                ..Default::default()
+            };
+            kube::Config::from_kubeconfig(&options)
+                .await
+                .with_context(|| format!("contexte {context:?} du kubeconfig"))?
+        }
     };
 
-    let options = kube::config::KubeConfigOptions {
-        context: Some(context.to_string()),
-        ..Default::default()
-    };
-    let config = kube::Config::from_kubeconfig(&options)
-        .await
-        .with_context(|| format!("contexte {context:?} du kubeconfig"))?;
-    kube::Client::try_from(config).with_context(|| format!("connexion au cluster {context:?}"))
+    let client = kube::Client::try_from(config.clone())
+        .with_context(|| format!("connexion au cluster {:?}", config.cluster_url.to_string()))?;
+    Ok((client, config))
 }
 
 #[derive(Subcommand)]
@@ -188,7 +201,7 @@ fn install_directory_trust() -> anyhow::Result<()> {
 
 async fn serve(context: Option<&str>) -> anyhow::Result<()> {
     let config = ServerConfig::from_env().context("configuration")?;
-    let client = cluster_client(context).await?;
+    let (client, kube_config) = cluster_client_with_config(context).await?;
 
     let endpoint = endpoint::resolve(
         config.apiserver_url.as_deref(),
@@ -228,7 +241,9 @@ async fn serve(context: Option<&str>) -> anyhow::Result<()> {
     // par une clé qui disparaît au redémarrage serait refusé par l'apiserver, qui a mis la
     // précédente en cache. Elle vit dans un Secret, créé au premier démarrage.
     let oidc = match config.credential_mode {
-        CredentialMode::Certificate => None,
+        // Le mode proxy ne signe rien : le jeton qu'il remet est opaque, et c'est kdt-identity
+        // lui-même qui le vérifie à chaque requête. Aucune clé à conserver, donc.
+        CredentialMode::Certificate | CredentialMode::Proxy => None,
         CredentialMode::Oidc => {
             let material = oidc::key::load_or_create(client.clone(), &config.namespace)
                 .await
@@ -287,8 +302,55 @@ async fn serve(context: Option<&str>) -> anyhow::Result<()> {
         }
     };
 
+    // Le proxy n'existe que dans son mode : l'ouvrir ailleurs exposerait une surface dont
+    // personne ne se sert. Monté sur le portail par défaut, sous `/k8s` — même processus, même
+    // hôte, rien de plus à publier. Une écoute propre ne se demande que pour pouvoir exposer
+    // l'un sans l'autre.
+    let proxy = (config.credential_mode == CredentialMode::Proxy).then(|| {
+        tracing::info!(
+            racine = %format!("{}/k8s/{}", config.proxy_public_url(), config.cluster_name),
+            ecoute = %config.proxy_listen.clone().unwrap_or_else(|| "portail".to_string()),
+            revocation = ?config.proxy_cache_ttl,
+            jeton = ?config.download_token_ttl,
+            "proxy d'accès au cluster"
+        );
+        std::sync::Arc::new(kdt_identity_server::proxy::ProxyState::new(
+            client.clone(),
+            kube_config,
+            &config.namespace,
+            kdt_identity_server::proxy::ProxyConfig {
+                cluster_name: config.cluster_name.clone(),
+                cache_ttl: config.proxy_cache_ttl,
+            },
+        ))
+    });
+
+    let separate = match (&proxy, &config.proxy_listen) {
+        (Some(proxy), Some(address)) => {
+            let proxy_listener = tokio::net::TcpListener::bind(address)
+                .await
+                .with_context(|| format!("écoute du proxy sur {address}"))?;
+            Some((proxy_listener, proxy.clone()))
+        }
+        _ => None,
+    };
+    if let Some((proxy_listener, proxy)) = separate {
+        tokio::spawn(async move {
+            if let Err(e) =
+                axum::serve(proxy_listener, kdt_identity_server::proxy::router(proxy)).await
+            {
+                tracing::error!(erreur = %e, "le proxy s'est arrêté");
+            }
+        });
+    }
+
+    let mounted = config.proxy_listen.is_none().then(|| proxy.clone()).flatten();
     let state = web::state(client, config, endpoint, signer, oidc, provider);
-    axum::serve(listener, web::router(state))
+    let router = match mounted {
+        Some(proxy) => web::router(state).merge(kdt_identity_server::proxy::router(proxy)),
+        None => web::router(state),
+    };
+    axum::serve(listener, router)
         .await
         .context("service HTTP")?;
     Ok(())
@@ -458,14 +520,22 @@ async fn revoke(name: &str, context: Option<&str>) -> anyhow::Result<()> {
         1 => println!("{name} : 1 session fermée"),
         n => println!("{name} : {n} sessions fermées"),
     }
-    let fenetre = match config.credential_mode {
-        CredentialMode::Certificate => config.cert_ttl,
-        CredentialMode::Oidc => config.oidc_token_ttl,
-    };
-    println!(
-        "L'accès s'arrête au prochain renouvellement, dans {} au plus.",
-        humanise(fenetre)
-    );
+    // Deux phrases, parce que ce sont deux réalités. Avec un certificat ou un jeton signé,
+    // l'accès en circulation vit sa durée et la révocation ne porte que sur le suivant. Derrière
+    // le proxy, il n'y a rien en circulation : le jeton ne vaut que ce que le cluster en dit.
+    match config.credential_mode {
+        CredentialMode::Proxy => println!(
+            "L'accès s'arrête dans {} au plus, kubeconfigs téléchargés compris.",
+            humanise(config.proxy_cache_ttl)
+        ),
+        mode => println!(
+            "L'accès s'arrête au prochain renouvellement, dans {} au plus.",
+            humanise(match mode {
+                CredentialMode::Oidc => config.oidc_token_ttl,
+                _ => config.cert_ttl,
+            })
+        ),
+    }
     if !user.spec.disabled {
         println!(
             "Le compte reste actif : il peut rouvrir une session. Pour l'en empêcher, \

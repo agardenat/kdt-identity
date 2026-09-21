@@ -27,6 +27,32 @@ pub const DEFAULT_CERT_TTL: Duration = Duration::from_secs(600);
 /// couper — un compromis assumé pour que le portail reste utilisable sans rien installer.
 pub const DEFAULT_DOWNLOAD_CERT_TTL: Duration = Duration::from_secs(8 * 3600);
 
+/// Durée de vie par défaut du jeton porté par un kubeconfig téléchargé, en mode `proxy`.
+///
+/// Sept jours, là où le certificat téléchargé se limite à huit heures, et la différence tient
+/// toute entière à la révocation : ce jeton se retire du cluster à tout moment, donc sa durée
+/// ne borne pas un risque, elle borne un oubli.
+pub const DEFAULT_DOWNLOAD_TOKEN_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Bornes acceptées pour la durée d'un jeton de kubeconfig.
+///
+/// Le plafond existe pour qu'aucun déploiement ne puisse remettre un accès qui ne s'éteint
+/// jamais de lui-même : la révocation est un geste, l'expiration est un filet.
+const DOWNLOAD_TOKEN_TTL_RANGE: (Duration, Duration) = (
+    Duration::from_secs(3600),
+    Duration::from_secs(30 * 24 * 3600),
+);
+
+/// Durée par défaut de réutilisation d'une identité vérifiée par le proxy.
+pub const DEFAULT_PROXY_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Bornes acceptées pour ce cache.
+///
+/// Le plafond est bas : au-delà d'une minute, une révocation cesse d'être perçue comme
+/// immédiate par qui la demande.
+const PROXY_CACHE_TTL_RANGE: (Duration, Duration) =
+    (Duration::from_secs(0), Duration::from_secs(60));
+
 /// Durée de vie par défaut du droit de renouveler.
 ///
 /// Sept jours : c'est l'intervalle entre deux saisies de mot de passe et de code. Aussi long
@@ -303,6 +329,39 @@ pub struct ServerConfig {
     pub kubeconfig_download: bool,
     /// Durée de validité du droit de renouveler, dans les deux modes.
     pub refresh_ttl: Duration,
+    /// Durée de validité du jeton porté par un kubeconfig, en mode `proxy`.
+    ///
+    /// Peut être longue sans danger, contrairement à celle d'un certificat téléchargé : ce
+    /// jeton n'est rien par lui-même, sa validité se relit dans le cluster à chaque requête et
+    /// s'y retire. Jamais illimitée pour autant — un accès doit finir par s'éteindre de
+    /// lui-même, même si personne ne le révoque.
+    pub download_token_ttl: Duration,
+    /// Adresse d'écoute propre au proxy.
+    ///
+    /// Absente — le défaut — le proxy est monté sur le portail, sous `/k8s`. Un seul hôte, un
+    /// seul certificat, un seul Ingress : c'est le même processus, et les séparer coûterait une
+    /// entrée DNS et un certificat de plus pour un gain qui ne se matérialise que si on veut
+    /// vraiment exposer l'un sans l'autre.
+    ///
+    /// Partager l'hôte n'ouvre rien : `kubectl` n'envoie pas de cookie, et le proxy
+    /// n'authentifie que sur `Authorization: Bearer`. Aucune autorité ambiante, donc rien à
+    /// détourner depuis un navigateur.
+    pub proxy_listen: Option<String>,
+    /// Racine publique du proxy, quand elle diffère de celle du portail.
+    ///
+    /// Absente, les kubeconfigs portent celle du portail. Voir [`Self::proxy_public_url`].
+    pub proxy_url: Option<String>,
+    /// Autorité à inscrire dans les kubeconfigs pour vérifier le proxy.
+    ///
+    /// Absente quand le proxy présente un certificat d'une autorité publique : le poste sait
+    /// déjà le vérifier, et l'épingler obligerait à réémettre tous les kubeconfigs au premier
+    /// renouvellement.
+    pub proxy_ca_file: Option<String>,
+    /// Durée pendant laquelle le proxy réutilise une identité déjà vérifiée.
+    ///
+    /// C'est le délai maximal entre une révocation et sa prise d'effet, et le seul curseur : à
+    /// zéro, chaque `kubectl get` relirait un `Secret` et deux objets.
+    pub proxy_cache_ttl: Duration,
     /// Audience attendue dans les jetons, à reporter dans la configuration de l'apiserver.
     pub oidc_audience: String,
     /// Durée de vie d'un jeton d'identité.
@@ -379,10 +438,34 @@ impl ServerConfig {
                 DEFAULT_TOKEN_TTL,
                 TOKEN_TTL_RANGE,
             )?,
+            download_token_ttl: duration_from_env(
+                "KDT_IDENTITY_DOWNLOAD_TOKEN_TTL",
+                DEFAULT_DOWNLOAD_TOKEN_TTL,
+                DOWNLOAD_TOKEN_TTL_RANGE,
+            )?,
+            proxy_listen: env("KDT_IDENTITY_PROXY_LISTEN"),
+            proxy_url: env("KDT_IDENTITY_PROXY_URL")
+                .map(|raw| raw.trim_end_matches('/').to_string()),
+            proxy_ca_file: env("KDT_IDENTITY_PROXY_CA_FILE"),
+            proxy_cache_ttl: duration_from_env(
+                "KDT_IDENTITY_PROXY_CACHE_TTL",
+                DEFAULT_PROXY_CACHE_TTL,
+                PROXY_CACHE_TTL_RANGE,
+            )?,
             web_url: env("KDT_IDENTITY_WEB_URL")
                 .map(|raw| raw.trim_end_matches('/').to_string()),
         }
         .validated()
+    }
+
+    /// Racine sous laquelle le proxy est joignable, telle qu'elle est inscrite dans les
+    /// kubeconfigs remis.
+    ///
+    /// Celle du portail par défaut : le proxy y est monté sous `/k8s`, et un déploiement n'a
+    /// donc rien de plus à publier. Une racine propre ne se déclare que si on lui a donné sa
+    /// propre écoute.
+    pub fn proxy_public_url(&self) -> &str {
+        self.proxy_url.as_deref().unwrap_or(&self.portal_url)
     }
 
     /// Refuse une configuration qui compile mais ne peut pas fonctionner.
@@ -401,6 +484,23 @@ impl ServerConfig {
                     self.portal_url
                 ),
             ));
+        }
+
+        if self.credential_mode == CredentialMode::Proxy {
+            // L'adresse que `kubectl` appellera, qu'elle soit propre au proxy ou celle du
+            // portail : dans les deux cas ce jeton ouvre le cluster et voyage à chaque requête.
+            let public = self.proxy_public_url();
+            let local =
+                public.starts_with("http://localhost") || public.starts_with("http://127.0.0.1");
+            if !public.starts_with("https://") && !local {
+                return Err(ConfigError::Invalid(
+                    "KDT_IDENTITY_PROXY_URL",
+                    format!(
+                        "{public:?} : une racine en https est exigée, ce jeton ouvre le cluster \
+                         et voyage à chaque requête"
+                    ),
+                ));
+            }
         }
 
         // Un code d'autorisation voyage dans une URL, et s'échange contre un droit de session de
@@ -876,6 +976,11 @@ mod tests {
             cert_ttl: DEFAULT_CERT_TTL,
             download_cert_ttl: DEFAULT_DOWNLOAD_CERT_TTL,
             kubeconfig_download: true,
+            download_token_ttl: DEFAULT_DOWNLOAD_TOKEN_TTL,
+            proxy_listen: None,
+            proxy_url: None,
+            proxy_ca_file: None,
+            proxy_cache_ttl: DEFAULT_PROXY_CACHE_TTL,
             refresh_ttl: DEFAULT_REFRESH_TTL,
             oidc_audience: "kdt-identity".to_string(),
             oidc_token_ttl: DEFAULT_TOKEN_TTL,
@@ -948,6 +1053,36 @@ mod tests {
         with_env(&[], || {
             assert_eq!(mode_from_env().unwrap(), CredentialMode::Certificate);
         });
+    }
+
+    /// Sans racine propre, le kubeconfig pointe sur le portail : un seul hôte à publier, et
+    /// c'est le cas courant. Une entrée DNS et un certificat de plus ne doivent pas être le
+    /// prix d'entrée du mode.
+    #[test]
+    fn le_proxy_se_publie_sur_le_portail_par_defaut() {
+        let mut c = config();
+        c.credential_mode = CredentialMode::Proxy;
+
+        assert_eq!(c.proxy_public_url(), "https://identity.example.com");
+        assert!(c.clone().validated().is_ok());
+
+        c.proxy_url = Some("https://kube.example.com".to_string());
+        assert_eq!(c.proxy_public_url(), "https://kube.example.com");
+    }
+
+    /// Ce jeton ouvre le cluster et repart à chaque requête : en clair, il est lisible par tout
+    /// ce qui se trouve sur le chemin.
+    #[test]
+    fn le_proxy_refuse_une_racine_en_clair() {
+        let mut c = config();
+        c.credential_mode = CredentialMode::Proxy;
+        c.proxy_url = Some("http://kube.example.com".to_string());
+        assert!(c.clone().validated().is_err());
+
+        // La boucle locale ne traverse rien : c'est le seul chemin praticable derrière un
+        // `port-forward`, et le refuser interdirait d'essayer le mode.
+        c.proxy_url = Some("http://127.0.0.1:8443".to_string());
+        assert!(c.validated().is_ok());
     }
 
     #[test]

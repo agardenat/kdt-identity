@@ -1,10 +1,13 @@
 {{/*
   Le RBAC de kdt-identity.
 
-  Approuver une CSR « kubernetes.io/kube-apiserver-client » revient à choisir une identité
-  auprès de l'apiserver : ce ServiceAccount est, de fait, équivalent cluster-admin. Chaque
-  règle ci-dessous est donc réduite au strict nécessaire, et le `resourceNames` sur les signers
-  est ce qui empêche kdt-identity d'approuver des demandes pour un autre signeur.
+  Choisir une identité auprès de l'apiserver — en approuvant une CSR
+  « kubernetes.io/kube-apiserver-client », ou en se faisant passer pour quelqu'un — rend ce
+  ServiceAccount, de fait, équivalent cluster-admin. C'est vrai des deux modes, et c'est la
+  nature du produit : un composant qui distribue des identités en détient forcément le pouvoir.
+
+  Chaque règle est donc réduite au strict nécessaire, et les deux familles s'excluent : le mode
+  proxy ne signe pas, les autres n'impersonnent pas.
 */}}
 apiVersion: v1
 kind: ServiceAccount
@@ -46,6 +49,30 @@ rules:
     resources: ["kdtusers/status", "kdtgroups/status"]
     verbs: ["get", "update", "patch"]
 
+{{- if eq .Values.credentialMode "proxy" }}
+
+  # En mode proxy, kdt-identity ne signe plus rien : il relaie, en se faisant passer pour le
+  # compte qui présente un jeton valide. D'où l'échange, et non le cumul — les règles de
+  # signature ci-dessous ne sont pas rendues, et c'est une surface de moins.
+  #
+  # Le pouvoir est du même ordre que celui qu'elles donnaient. `impersonate` sans `resourceNames`
+  # permet de se présenter comme n'importe qui, exactement comme approuver une CSR
+  # « kube-apiserver-client » permettait de s'en forger l'identité : ce ServiceAccount reste, de
+  # fait, équivalent cluster-admin, ni plus ni moins qu'avant.
+  #
+  # `resourceNames` ne borne rien ici : il n'accepte pas de joker, donc couvrir `kdt:*`
+  # supposerait que le contrôleur tienne la liste à jour — et pour l'écrire il lui faudrait
+  # `escalate` sur sa propre règle, ce qui lui rendrait aussitôt le pouvoir que la borne
+  # prétendait lui retirer. La garantie est ailleurs, dans le type `Subject` : le proxy ne sait
+  # construire aucune identité qui ne commence pas par `kdt:`.
+  - apiGroups: [""]
+    resources: ["users", "groups"]
+    verbs: ["impersonate"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["uids"]
+    verbs: ["impersonate"]
+{{- else }}
+
   # Les demandes de signature sont éphémères : créées, approuvées, lues, puis supprimées.
   - apiGroups: ["certificates.k8s.io"]
     resources: ["certificatesigningrequests"]
@@ -64,6 +91,7 @@ rules:
     resources: ["signers"]
     resourceNames: ["kubernetes.io/kube-apiserver-client"]
     verbs: ["approve"]
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

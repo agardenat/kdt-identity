@@ -10,6 +10,13 @@ spec:
     - name: http
       port: {{ .Values.service.port }}
       targetPort: http
+    {{- if and (eq .Values.credentialMode "proxy") .Values.proxy.listen }}
+    # Seulement quand le proxy est publié à sa propre adresse. Monté sur le portail — le
+    # défaut — il passe par le port http comme le reste.
+    - name: kube
+      port: 443
+      targetPort: kube
+    {{- end }}
   selector:
     {{- include "kdt-identity.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: portal

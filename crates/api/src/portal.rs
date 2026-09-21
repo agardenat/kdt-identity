@@ -70,6 +70,13 @@ pub enum CredentialMode {
     /// Jeton signé par kdt-identity, validé par l'apiserver. Se révoque, mais demande que le
     /// control plane connaisse l'émetteur.
     Oidc,
+    /// Jeton opaque vérifié par kdt-identity lui-même, qui relaie ensuite à l'apiserver en
+    /// impersonation.
+    ///
+    /// Le seul mode qui réunit les trois propriétés : un kubeconfig que `kubectl` et `helm`
+    /// lisent sans rien installer, révocable à tout instant, et qui ne demande **aucune** option
+    /// de l'apiserver — donc utilisable là où il ne s'aménage pas, AKS en tête.
+    Proxy,
 }
 
 impl CredentialMode {
@@ -77,6 +84,7 @@ impl CredentialMode {
         match self {
             Self::Certificate => "certificate",
             Self::Oidc => "oidc",
+            Self::Proxy => "proxy",
         }
     }
 }
@@ -94,7 +102,10 @@ impl std::str::FromStr for CredentialMode {
         match raw {
             "certificate" => Ok(Self::Certificate),
             "oidc" => Ok(Self::Oidc),
-            other => Err(format!("mode {other:?} inconnu, attendu certificate ou oidc")),
+            "proxy" => Ok(Self::Proxy),
+            other => Err(format!(
+                "mode {other:?} inconnu, attendu certificate, oidc ou proxy"
+            )),
         }
     }
 }

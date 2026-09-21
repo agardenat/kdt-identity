@@ -100,10 +100,20 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+            {{- if and (eq .Values.credentialMode "proxy") .Values.proxy.listen }}
+            # Second port seulement si le proxy a sa propre adresse : sinon il est servi par
+            # l'écoute du portail, sous `/k8s`.
+            - name: kube
+              containerPort: {{ .Values.proxy.listen | splitList ":" | last }}
+            {{- end }}
           env:
             {{- include "kdt-identity.env" . | nindent 12 }}
             - name: KDT_IDENTITY_LISTEN
               value: "0.0.0.0:8080"
+            {{- if and (eq .Values.credentialMode "proxy") .Values.proxy.listen }}
+            - name: KDT_IDENTITY_PROXY_LISTEN
+              value: {{ .Values.proxy.listen | quote }}
+            {{- end }}
             - name: KDT_IDENTITY_SESSION_KEY
               valueFrom:
                 secretKeyRef:

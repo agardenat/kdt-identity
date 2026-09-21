@@ -16,5 +16,8 @@
 pub mod refresh;
 pub mod store;
 
-pub use refresh::{NewRefresh, RefreshError, Session, SessionSet};
+pub use refresh::{
+    kubeconfig_token, split_kubeconfig_token, NewRefresh, RefreshError, Session, SessionKind,
+    SessionSet,
+};
 pub use store::{SessionStore, SessionStoreError};

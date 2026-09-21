@@ -75,6 +75,24 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 - name: KDT_IDENTITY_OIDC_TOKEN_TTL
   value: {{ .Values.oidc.tokenTtl | quote }}
 {{- end }}
+{{- if eq .Values.credentialMode "proxy" }}
+{{- /*
+  Posées sur les deux déploiements comme le reste : « revoke » nomme le délai de prise d'effet,
+  qui est celui du cache du proxy, et il s'exécute dans le pod du contrôleur.
+*/}}
+{{- if .Values.proxy.url }}
+- name: KDT_IDENTITY_PROXY_URL
+  value: {{ .Values.proxy.url | quote }}
+{{- end }}
+- name: KDT_IDENTITY_PROXY_CACHE_TTL
+  value: {{ .Values.proxy.cacheTtl | quote }}
+- name: KDT_IDENTITY_DOWNLOAD_TOKEN_TTL
+  value: {{ .Values.proxy.tokenTtl | quote }}
+{{- if .Values.proxy.caSecret }}
+- name: KDT_IDENTITY_PROXY_CA_FILE
+  value: /etc/kdt-identity/proxy-ca/ca.crt
+{{- end }}
+{{- end }}
 {{- /*
   Le mode d'authentification est orthogonal au mode de délivrance : le premier dit qui reconnaît
   la personne, le second ce qu'on lui remet. Les quatre combinaisons sont valides.
@@ -214,8 +232,17 @@ app.kubernetes.io/instance: {{ .Release.Name }}
   sans que rien ne dise pourquoi.
 */}}
 {{- define "kdt-identity.validate" -}}
-{{- if not (has .Values.credentialMode (list "certificate" "oidc")) -}}
-{{- fail (printf "credentialMode vaut %q : attendu certificate ou oidc" .Values.credentialMode) -}}
+{{- if not (has .Values.credentialMode (list "proxy" "certificate" "oidc")) -}}
+{{- fail (printf "credentialMode vaut %q : attendu proxy, certificate ou oidc" .Values.credentialMode) -}}
+{{- end -}}
+{{- if eq .Values.credentialMode "proxy" -}}
+{{- $public := default .Values.portalUrl .Values.proxy.url -}}
+{{- if and (not (hasPrefix "https://" $public)) (not (hasPrefix "http://localhost" $public)) (not (hasPrefix "http://127.0.0.1" $public)) -}}
+{{- fail (printf "l'adresse du proxy (%q) doit être en https : ce jeton ouvre le cluster et voyage à chaque requête" $public) -}}
+{{- end -}}
+{{- if and .Values.proxy.listen (not .Values.proxy.url) -}}
+{{- fail "proxy.listen sans proxy.url : une écoute séparée n'a de sens que pour publier le proxy à sa propre adresse" -}}
+{{- end -}}
 {{- end -}}
 {{- if eq .Values.credentialMode "oidc" -}}
 {{- if not (hasPrefix "https://" .Values.portalUrl) -}}

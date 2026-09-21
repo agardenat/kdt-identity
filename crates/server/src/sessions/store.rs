@@ -186,10 +186,20 @@ mod tests {
     #[test]
     fn un_aller_retour_preserve_les_sessions() {
         let mut sessions = SessionSet::default();
-        let issued = sessions.open(now(), chrono::Duration::days(7));
+        let issued = sessions.open(
+            now(),
+            chrono::Duration::days(7),
+            crate::sessions::refresh::SessionKind::Refresh,
+        );
 
         let relu = decode(&secret_with(&sessions)).unwrap();
-        assert!(relu.verify(&issued.token, now()).is_ok());
+        assert!(relu
+            .verify(
+                &issued.token,
+                now(),
+                crate::sessions::refresh::SessionKind::Refresh
+            )
+            .is_ok());
     }
 
     #[test]

@@ -15,6 +15,7 @@ de la source. Chart Helm et image fournis.
 | Guide | Pour qui |
 | --- | --- |
 | [Les modes](docs/modes.md) | choisir, vérifier la compatibilité de son cluster, basculer |
+| [Mode proxy](docs/proxy.md) | un kubeconfig standard et révocable, sans rien configurer |
 | [Le plugin](docs/plugin.md) | postes de travail : installation, cycle de vie, dépannage |
 | [Administration](docs/administration.md) | comptes, groupes, révocation, droits RBAC |
 | [Mode OIDC](docs/oidc.md) | configurer l'apiserver |
@@ -240,8 +241,13 @@ Trois vérifications encadrent les identités, et se recouvrent volontairement :
 
 ### Révocation
 
-Un credential émis vaut jusqu'à son expiration : Kubernetes ne consulte aucune CRL. La révocation
-porte donc sur le droit d'en obtenir un autre, conservé dans le cluster. Deux gestes :
+En mode `proxy`, la révocation est sans exception : rien n'est en circulation, le jeton d'un
+kubeconfig ne vaut que ce que le cluster en dit, et il cesse de valoir sous `proxy.cacheTtl` —
+30 s par défaut.
+
+Dans les deux autres modes, un credential émis vaut jusqu'à son expiration : Kubernetes ne
+consulte aucune CRL. La révocation porte alors sur le droit d'en obtenir un autre, conservé dans
+le cluster. Les deux gestes sont les mêmes partout :
 
 ```console
 $ kubectl -n kdt-identity exec deploy/kdt-identity-controller -- \
@@ -255,16 +261,16 @@ $ kubectl patch kdtuser alice --type=merge \
 poste. `disabled` va plus loin : le portail refuse la connexion, le contrôleur ferme les sessions
 en cours, plus aucun renouvellement n'aboutit — et c'est un champ de la spec, donc déclaratif.
 
-Dans les deux cas, le credential en circulation vit sa durée : dix minutes au plus en mode
-certificat, cinq en mode OIDC, `certTtl` en décide.
+Dans les deux cas, le credential en circulation vit sa durée : 30 s au plus en mode proxy
+(`proxy.cacheTtl`), dix minutes en mode certificat (`certTtl`), cinq en mode OIDC.
 
 Deux autres leviers :
 
 - **retirer le binding d'un groupe** coupe l'accès de tous ses membres instantanément, sans
   attendre le moindre renouvellement ;
-- **un kubeconfig téléchargé depuis le portail** est autoportant : personne ne le renouvelle, et il
-  reste valable jusqu'à son expiration, huit heures par défaut. `portal.kubeconfigDownload: false`
-  ferme ce chemin.
+- **un kubeconfig téléchargé en mode certificat** est autoportant : personne ne le renouvelle, et
+  il reste valable jusqu'à son expiration, huit heures par défaut. `portal.kubeconfigDownload:
+  false` ferme ce chemin — ou `credentialMode: proxy`, où ce fichier se révoque comme le reste.
 
 ## Obtenir les binaires
 

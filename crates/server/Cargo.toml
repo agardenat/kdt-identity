@@ -44,6 +44,17 @@ ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-
 # features que dans le plugin, pour que les deux binaires partagent la pile TLS déjà en place.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.8"
+# Les promotions de connexion — `kubectl exec`, `attach`, `port-forward`, `cp` — ne se relaient
+# pas avec un client HTTP ordinaire : il faut la connexion brute des deux côtés du 101, et une
+# négociation forcée en HTTP/1.1, l'apiserver ne promouvant pas au-dessus de h2. D'où hyper en
+# direct, à côté de `kube::Client` qui reste le chemin de tout le reste.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# Même version que celle dont `kube::Config` enveloppe ses jetons : la lui reprendre évite deux
+# types `SecretString` incompatibles dans le même programme.
+secrecy = "0.10"
 maud = "0.27"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 

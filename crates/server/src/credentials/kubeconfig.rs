@@ -20,7 +20,9 @@ use kdt_identity_api::naming::Subject;
 pub struct ClusterEndpoint {
     pub name: String,
     pub server: String,
-    pub certificate_authority_pem: String,
+    /// `None` quand le poste sait déjà vérifier ce serveur : un proxy derrière un Ingress dont
+    /// le certificat vient d'une autorité publique n'a rien à faire figurer ici.
+    pub certificate_authority_pem: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +82,23 @@ pub fn with_exec_plugin(
     render(endpoint, user, auth)
 }
 
+/// Produit un kubeconfig qui porte un jeton, adressé au proxy et non à l'apiserver.
+///
+/// C'est la seule forme à la fois autonome — aucun binaire à installer, `kubectl` et `helm` la
+/// lisent nativement — et révocable : le jeton n'est rien par lui-même, sa validité se lit dans
+/// le cluster à chaque requête. Le certificat, lui, est autonome mais définitif ; le plugin
+/// `exec` est révocable mais suppose qu'on l'installe.
+pub fn bearer(
+    endpoint: &ClusterEndpoint,
+    user: &Subject,
+    token: &str,
+) -> Result<String, KubeconfigError> {
+    let auth = serde_yaml::to_value(AuthToken {
+        token: token.to_string(),
+    })?;
+    render(endpoint, user, auth)
+}
+
 fn render(
     endpoint: &ClusterEndpoint,
     user: &Subject,
@@ -97,7 +116,10 @@ fn render(
             name: endpoint.name.clone(),
             cluster: Cluster {
                 server: endpoint.server.clone(),
-                certificate_authority_data: b64(&endpoint.certificate_authority_pem),
+                certificate_authority_data: endpoint
+                    .certificate_authority_pem
+                    .as_deref()
+                    .map(b64),
             },
         }],
         users: vec![NamedUser {
@@ -143,7 +165,11 @@ struct NamedCluster {
 #[serde(rename_all = "kebab-case")]
 struct Cluster {
     server: String,
-    certificate_authority_data: String,
+    /// Omis quand le serveur présente un certificat qu'un poste vérifie déjà — le cas d'un proxy
+    /// derrière un Ingress public. L'inscrire quand même obligerait à réémettre tous les
+    /// kubeconfigs au premier renouvellement de ce certificat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certificate_authority_data: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -157,6 +183,11 @@ struct NamedUser {
 struct AuthCertificate {
     client_certificate_data: String,
     client_key_data: String,
+}
+
+#[derive(Serialize)]
+struct AuthToken {
+    token: String,
 }
 
 #[derive(Serialize)]
@@ -195,8 +226,19 @@ mod tests {
         ClusterEndpoint {
             name: "demo".to_string(),
             server: "https://127.0.0.1:6443".to_string(),
-            certificate_authority_pem: "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n"
-                .to_string(),
+            certificate_authority_pem: Some(
+                "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n".to_string(),
+            ),
+        }
+    }
+
+    /// Le proxy tel qu'il est vu du poste : une URL et, ici, une autorité publique qu'il n'y a
+    /// rien à déclarer.
+    fn proxy_endpoint() -> ClusterEndpoint {
+        ClusterEndpoint {
+            name: "demo".to_string(),
+            server: "https://identity.example.com/k8s/demo".to_string(),
+            certificate_authority_pem: None,
         }
     }
 
@@ -249,6 +291,34 @@ mod tests {
             assert!(!yaml.contains("proxy-url"), "{yaml}");
             assert!(!yaml.contains("proxy"), "{yaml}");
         }
+    }
+
+    /// Le kubeconfig du proxy doit être lisible par `kubectl` et `helm` sans rien installer :
+    /// un `token`, et aucun `exec`.
+    #[test]
+    fn le_mode_proxy_ne_porte_qu_un_jeton() {
+        let user = Subject::user("alice").unwrap();
+        let yaml = bearer(&proxy_endpoint(), &user, "kdt_alice_abc.def").unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(parsed["users"][0]["user"]["token"], "kdt_alice_abc.def");
+        assert!(parsed["users"][0]["user"]["exec"].is_null());
+        assert!(parsed["users"][0]["user"]["client-certificate-data"].is_null());
+        assert_eq!(
+            parsed["clusters"][0]["cluster"]["server"],
+            "https://identity.example.com/k8s/demo"
+        );
+        assert_eq!(parsed["current-context"], "kdt:alice@demo");
+    }
+
+    /// Une autorité absente ne doit pas produire une clé vide : `certificate-authority-data: ""`
+    /// fait échouer client-go au lieu de le laisser vérifier avec le magasin du poste.
+    #[test]
+    fn une_autorite_absente_ne_laisse_pas_de_cle_vide() {
+        let user = Subject::user("alice").unwrap();
+        let yaml = bearer(&proxy_endpoint(), &user, "kdt_alice_abc.def").unwrap();
+
+        assert!(!yaml.contains("certificate-authority-data"), "{yaml}");
     }
 
     #[test]

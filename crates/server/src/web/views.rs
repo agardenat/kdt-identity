@@ -316,38 +316,55 @@ pub fn account(account: Account) -> Markup {
                     }
                 }
 
-                p { "L'accès recommandé passe par le plugin " code { "kdt-identity" } ", qui "
-                    "renouvelle vos droits tout seul et permet de les révoquer :" }
-                pre style="overflow-x:auto;background:var(--code-bg);color:var(--code-fg);\
-                           border:1px solid var(--line);padding:.8rem;border-radius:6px;\
-                           font-size:.85em;line-height:1.5" {
-                    code {
-                        "kdt-identity kubeconfig \\\n"
-                        "    --portal " (portal_url) " \\\n"
-                        "    --user " (user) " > ~/.kube/config"
+                // En mode proxy, le plugin n'a plus de raison d'être : le fichier téléchargé
+                // fait déjà tout ce qu'il apportait, sans rien installer. Continuer à le
+                // proposer en premier ferait passer le chemin le plus simple pour un repli.
+                @if mode != CredentialMode::Proxy {
+                    p { "L'accès recommandé passe par le plugin " code { "kdt-identity" } ", qui "
+                        "renouvelle vos droits tout seul et permet de les révoquer :" }
+                    pre style="overflow-x:auto;background:var(--code-bg);color:var(--code-fg);\
+                               border:1px solid var(--line);padding:.8rem;border-radius:6px;\
+                               font-size:.85em;line-height:1.5" {
+                        code {
+                            "kdt-identity kubeconfig \\\n"
+                            "    --portal " (portal_url) " \\\n"
+                            "    --user " (user) " > ~/.kube/config"
+                        }
+                    }
+                    p."sub" style="margin:.8rem 0 1.2rem" {
+                        "Le fichier ne contient aucun secret : il indique seulement à kubectl "
+                        "d'appeler le plugin quand il a besoin d'un accès."
                     }
                 }
-                p."sub" style="margin:.8rem 0 1.2rem" {
-                    "Le fichier ne contient aucun secret : il indique seulement à kubectl "
-                    "d'appeler le plugin quand il a besoin d'un accès."
-                }
 
-                // Le téléchargement n'est proposé que s'il est ouvert, et il est présenté pour
-                // ce qu'il est : un accès qui vit sa durée entière, qu'aucune révocation ne
-                // peut rattraper. Le taire ferait croire les deux chemins équivalents.
+                // Le téléchargement est présenté pour ce qu'il est, et ce n'est pas la même
+                // chose selon le mode : un accès que rien ne rattrape, ou un accès qui s'éteint
+                // avec la session. Dire l'un pour l'autre serait le mensonge le plus coûteux de
+                // cette page.
                 @if download {
                     form method="post" action="/kubeconfig" {
                         input type="hidden" name="csrf" value=(csrf);
                         button type="submit"
                                style="background:transparent;color:var(--fg);\
                                       border:1px solid var(--line)" {
-                            "Télécharger un kubeconfig, sans installer le plugin"
+                            @if mode == CredentialMode::Proxy {
+                                "Télécharger mon kubeconfig"
+                            } @else {
+                                "Télécharger un kubeconfig, sans installer le plugin"
+                            }
                         }
                     }
                     p."sub" style="margin:.8rem 0 0" {
-                        "Ce fichier ne se renouvelle pas et " strong { "ne peut pas être révoqué" }
-                        " : il reste valable jusqu'à son expiration, même si votre accès est "
-                        "coupé entre-temps. Revenez ici pour en obtenir un nouveau."
+                        @if mode == CredentialMode::Proxy {
+                            "Ce fichier s'utilise avec kubectl et helm, sans rien installer. Il "
+                            strong { "cesse de fonctionner dès que votre accès est coupé" }
+                            ", et expire de lui-même s'il n'est pas utilisé."
+                        } @else {
+                            "Ce fichier ne se renouvelle pas et "
+                            strong { "ne peut pas être révoqué" }
+                            " : il reste valable jusqu'à son expiration, même si votre accès est "
+                            "coupé entre-temps. Revenez ici pour en obtenir un nouveau."
+                        }
                     }
                 }
             }
@@ -654,6 +671,29 @@ mod tests {
     fn le_telechargement_annonce_qu_il_n_est_pas_revocable() {
         let rendu = account(demo(CredentialMode::Certificate)).into_string();
         assert!(rendu.contains("ne peut pas être révoqué"), "{rendu}");
+    }
+
+    /// La même phrase serait fausse en mode proxy, et fausse dans le sens le plus coûteux :
+    /// elle ferait renoncer à un fichier qui, lui, s'éteint avec l'accès.
+    #[test]
+    fn le_telechargement_du_proxy_annonce_l_inverse() {
+        let rendu = account(demo(CredentialMode::Proxy)).into_string();
+
+        assert!(!rendu.contains("ne peut pas être révoqué"), "{rendu}");
+        assert!(
+            rendu.contains("cesse de fonctionner dès que votre accès est coupé"),
+            "{rendu}"
+        );
+    }
+
+    /// En mode proxy, le plugin n'apporte plus rien que le fichier ne fasse déjà : le proposer
+    /// ferait passer le chemin le plus simple pour un repli.
+    #[test]
+    fn le_mode_proxy_ne_propose_plus_le_plugin() {
+        let rendu = account(demo(CredentialMode::Proxy)).into_string();
+
+        assert!(!rendu.contains("kdt-identity kubeconfig"), "{rendu}");
+        assert!(rendu.contains("Télécharger mon kubeconfig"), "{rendu}");
     }
 
     /// Le test cherche ce qui déclenche réellement une requête, pas toute occurrence d'une

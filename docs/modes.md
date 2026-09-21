@@ -4,10 +4,10 @@ kdt-identity a **deux modes indépendants**, et il faut les distinguer avant de 
 
 | Axe | Valeur | Répond à | Valeurs |
 |---|---|---|---|
-| Mode de délivrance | `credentialMode` | ce que le portail **remet** | `certificate`, `oidc` |
+| Mode de délivrance | `credentialMode` | ce que le portail **remet** | `proxy`, `certificate`, `oidc` |
 | Mode d'authentification | `authMode` | qui il **reconnaît** | `local`, `ldap`, `oidc` |
 
-Ils se combinent librement : les six couples sont valides. Un annuaire d'entreprise peut aussi
+Ils se combinent librement : les neuf couples sont valides. Un annuaire d'entreprise peut aussi
 bien aboutir à un certificat qu'à un jeton, et changer l'un n'oblige jamais à toucher l'autre.
 
 Ce document traite du mode de délivrance. Pour le mode d'authentification, voir
@@ -18,28 +18,39 @@ comptes vivent dans le cluster et il n'y a rien à configurer.
 jetons que l'apiserver vérifie. En authentification, il **consomme** ceux d'un fournisseur. Les
 deux sont indépendants, et un déploiement peut n'en avoir aucun comme les avoir tous les deux.
 
-## Les deux modes de délivrance
+## Les trois modes de délivrance
 
 Le mode se choisit au déploiement, `credentialMode` dans les valeurs du chart, et vaut pour tout
 le cluster.
 
-| | `certificate` (défaut) | `oidc` |
-|---|---|---|
-| Ce qui est délivré | certificat X.509 signé par la CA du cluster | jeton JWT signé par kdt-identity |
-| Durée | 10 min | 5 min |
-| Configuration de l'apiserver | aucune | émetteur, audience, CA |
-| Révocation | ≤ 10 min | ≤ 5 min |
-| Saisie mot de passe + code | tous les 7 jours | tous les 7 jours |
-| Identité produite | `kdt:alice`, groupes `kdt:*` | identique |
-| Kubeconfig téléchargeable | oui, non révocable | non |
-| Audit d'une session | empreinte du certificat | `jti` unique par jeton |
+| | `proxy` (défaut) | `certificate` | `oidc` |
+|---|---|---|---|
+| Ce qui est délivré | jeton opaque, vérifié par kdt-identity | certificat X.509 signé par la CA du cluster | jeton JWT signé par kdt-identity |
+| Durée | 7 j | 10 min | 5 min |
+| Configuration de l'apiserver | aucune | aucune | émetteur, audience, CA |
+| Révocation | ≤ 30 s | ≤ 10 min | ≤ 5 min |
+| Saisie mot de passe + code | tous les 7 jours | tous les 7 jours | tous les 7 jours |
+| Identité produite | `kdt:alice`, groupes `kdt:*` | identique | identique |
+| Kubeconfig téléchargeable | oui, **révocable** | oui, non révocable | non |
+| Plugin nécessaire | non | non, mais recommandé | oui |
+| kdt-identity sur le chemin | oui | non | non |
+| Audit d'une session | identité impersonnée | empreinte du certificat | `jti` unique par jeton |
 
-La révocation, le renouvellement silencieux et l'identité produite sont **identiques dans les
-deux modes**. Ce qui diffère : ce que le cluster doit accepter, et ce qu'on peut tracer.
+L'identité produite est **identique dans les trois modes**. Ce qui diffère : ce que le cluster
+doit accepter, ce qu'on peut couper, et ce dont dépend l'accès.
 
 ## Choisir
 
-Prenez `certificate` sauf si l'une de ces trois conditions s'applique :
+**`proxy`** est le défaut, et convient partout. C'est le seul mode où un kubeconfig téléchargé
+se révoque, et le seul qui n'exige rien du poste ni du control plane. Sa contrepartie est unique
+et il faut l'accepter : kdt-identity est sur le chemin des requêtes, donc son indisponibilité
+coupe ces accès. Voir [proxy.md](proxy.md).
+
+**`certificate`** quand les clients doivent parler directement à l'apiserver — parce que le
+proxy serait un point de panne de trop, ou parce que le débit compte. Le prix est la révocation :
+un certificat émis vaut jusqu'à son expiration.
+
+**`oidc`** quand l'une de ces trois conditions s'applique :
 
 1. **Le cluster ne signe pas de certificat client.** C'est le cas d'EKS. Voir la table de
    compatibilité ci-dessous.
@@ -113,9 +124,16 @@ La marche à suivre est dans [oidc.md](oidc.md).
 - **La provenance des comptes.** `authMode` est un axe séparé : passer de `certificate` à `oidc`
   ne change rien à la façon dont les personnes s'authentifient, et réciproquement.
 
+## Où le mode proxy fonctionne
+
+Partout. Il ne demande rien à l'apiserver — ni drapeau, ni signeur, ni émetteur déclaré — et
+n'utilise que l'impersonation, qui fait partie de l'API depuis toujours. C'est la seule réponse
+pour AKS, où ni le webhook d'authentification ni un émetteur OIDC tiers ne sont configurables.
+
 ## Changer de mode
 
-Le mode se change rarement, mais il se change sans casse.
+Le mode se change rarement, mais il se change sans casse. Vers `proxy` et depuis `proxy`, voir
+[proxy.md](proxy.md).
 
 **De `certificate` vers `oidc`** :
 
@@ -139,14 +157,19 @@ l'apiserver cesse de reconnaître les jetons.
 
 ## Le kubeconfig téléchargeable
 
-En mode certificat, le portail propose un kubeconfig autoportant, pour les postes où l'on ne
-veut rien installer. Ce fichier :
+Le portail propose un kubeconfig à télécharger, pour les postes où l'on ne veut rien installer.
+Ce qu'il contient, et ce qu'il vaut, dépend du mode.
 
-- contient une clé privée engendrée par le serveur, qui a donc traversé le réseau ;
-- vit `portal.downloadCertTtl` — 8 h par défaut — sans se renouveler ;
-- **n'est pas révocable** : ni `revoke` ni `spec.disabled` ne l'atteignent.
+**En mode `proxy`** : un jeton, et l'adresse du proxy. Aucun secret durable — le jeton ne vaut
+rien sans la session qui le porte dans le cluster. `revoke` et `spec.disabled` l'atteignent comme
+le reste. `portal.kubeconfigDownload` est sans effet : il n'y a rien à fermer.
 
-Quand la révocation doit être sans exception, fermer ce chemin :
+**En mode `certificate`** : un fichier autoportant. Il contient une clé privée engendrée par le
+serveur, qui a donc traversé le réseau ; il vit `portal.downloadCertTtl` — 8 h par défaut — sans
+se renouveler ; et il **n'est pas révocable**, ni par `revoke` ni par `spec.disabled`.
+
+Quand la révocation doit être sans exception, deux voies : passer en mode `proxy`, ou fermer ce
+chemin.
 
 ```yaml
 portal:
@@ -154,3 +177,6 @@ portal:
 ```
 
 La page « Mon accès » propose alors uniquement le plugin.
+
+**En mode `oidc`** : pas de téléchargement. Un jeton signé vit cinq minutes, ce qui ne tient pas
+dans un fichier.
