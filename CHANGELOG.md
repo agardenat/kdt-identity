@@ -8,6 +8,16 @@ tag `v<version>` qui a déclenché sa publication.
 Les notes de version publiées avec un tag sont la section correspondante de ce fichier, extraite
 par `packaging/changelog-section.sh` : ce fichier est la source, pas une copie.
 
+## [1.5.1] — 2026-09-22
+
+- **fix(server)** — l'accès remis à une application porte désormais son propre usage
+  (`application`), et le plafond de cinq sessions se comptant par usage, une application qui
+  renouvelle toutes les dix minutes **n'évince plus les kubeconfigs téléchargés** du compte. En
+  1.5.0 elle ouvrait des sessions de l'usage `kubeconfig` : cinq renouvellements suffisaient à
+  faire tomber le fichier de quelqu'un, dont le `kubectl` s'arrêtait sans que rien n'ait été
+  révoqué. Devant le proxy les deux usages valent la même chose ; un droit de renouveler, lui,
+  n'ouvre toujours rien.
+
 ## [1.5.0] — 2026-09-22
 
 - **feat(server)** — **une application autorisée obtient un accès par le proxy**, là où elle ne

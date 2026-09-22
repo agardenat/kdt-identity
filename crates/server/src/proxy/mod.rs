@@ -43,7 +43,7 @@ use kdt_identity_api::{KdtGroup, KdtUser};
 
 use crate::auth::store::CredentialStore;
 use crate::controller::logic;
-use crate::sessions::{split_kubeconfig_token, SessionKind, SessionStore};
+use crate::sessions::{split_proxy_token, SessionStore};
 
 pub mod upgrade;
 
@@ -293,7 +293,7 @@ async fn authenticate(state: &ProxyState, headers: &HeaderMap) -> Result<Identit
 
     // Écarté sans lire le moindre objet : un jeton de `ServiceAccount` présenté ici n'est pas
     // une erreur, c'est juste un jeton qui ne nous appartient pas.
-    let (user, credential) = split_kubeconfig_token(presented).ok_or(DenyReason::NotOurs)?;
+    let (user, credential) = split_proxy_token(presented).ok_or(DenyReason::NotOurs)?;
     // Le compte sert à composer un nom de `Secret` : il est validé avant, jamais après.
     validate_name(user).map_err(|_| DenyReason::Invalid)?;
 
@@ -338,7 +338,7 @@ impl ProxyState {
             DenyReason::Invalid
         })?;
         sessions
-            .verify(credential, Utc::now(), SessionKind::Kubeconfig)
+            .verify_proxy(credential, Utc::now())
             .map_err(|_| DenyReason::Invalid)?;
 
         let object = self.users.get(user).await.map_err(|_| DenyReason::Invalid)?;

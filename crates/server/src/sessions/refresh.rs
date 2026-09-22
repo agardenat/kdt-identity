@@ -42,9 +42,13 @@ pub const MAX_SESSIONS: usize = 5;
 
 /// Ce qu'une session autorise.
 ///
-/// Les deux usages ne sont pas interchangeables : un jeton de renouvellement ne doit pas ouvrir
-/// le proxy, et un jeton de kubeconfig ne doit pas émettre de certificat. `verify` exige donc
-/// l'usage attendu, et le refus est le même que pour un jeton inconnu.
+/// Les usages ne sont pas interchangeables : un jeton de renouvellement ne doit pas ouvrir le
+/// proxy, et un jeton de proxy ne doit pas émettre de certificat. `verify` exige donc l'usage
+/// attendu, et le refus est le même que pour un jeton inconnu.
+///
+/// Le plafond se compte par usage, et c'est là que la distinction entre les deux usages du proxy
+/// gagne sa place : une application renouvelle son accès toutes les dix minutes, un fichier
+/// téléchargé vit ses jours. Comptés ensemble, les premiers évinceraient les seconds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionKind {
@@ -54,6 +58,9 @@ pub enum SessionKind {
     Refresh,
     /// Jeton porté par un kubeconfig téléchargé, présenté au proxy à chaque requête.
     Kubeconfig,
+    /// Jeton remis à une application autorisée — kdt-web —, présenté au proxy de la même façon.
+    /// Elle le renouvelle toute seule, là où un fichier ne se renouvelle pas.
+    Application,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -190,6 +197,22 @@ impl SessionSet {
         Ok(session.id.clone())
     }
 
+    /// Vérifie un jeton présenté **au proxy**, quel que soit celui des deux usages qui l'ouvre.
+    ///
+    /// Un fichier téléchargé et une application autorisée ne diffèrent que par ce qui les fait
+    /// naître et par le plafond qui les compte : devant le proxy, ils valent la même chose.
+    /// L'expiration n'est pas réessayée comme un autre usage — un jeton périmé est périmé.
+    pub fn verify_proxy(
+        &self,
+        presented: &str,
+        now: DateTime<Utc>,
+    ) -> Result<String, RefreshError> {
+        match self.verify(presented, now, SessionKind::Kubeconfig) {
+            Err(RefreshError::Invalid) => self.verify(presented, now, SessionKind::Application),
+            other => other,
+        }
+    }
+
     /// Ferme une session. Sans effet si elle n'existe pas — se déconnecter deux fois n'est pas
     /// une erreur.
     pub fn close(&mut self, id: &str) {
@@ -220,24 +243,24 @@ impl SessionSet {
 /// `ServiceAccount`, un reste de jeton d'un autre produit — sans lire le moindre `Secret`.
 pub const KUBECONFIG_TOKEN_PREFIX: &str = "kdt_";
 
-/// Compose le jeton remis dans un kubeconfig : `kdt_<compte>_<identifiant>.<secret>`.
+/// Compose le jeton que le proxy lit : `kdt_<compte>_<identifiant>.<secret>`.
 ///
 /// Le compte y figure parce que le proxy ne reçoit qu'un en-tête `Authorization` : sans lui,
 /// rien ne dirait quel `Secret` de sessions relire. Ce n'est pas un secret, et le séparateur
 /// est `_` parce que [`NAME_PATTERN`](kdt_identity_api::naming::NAME_PATTERN) l'interdit dans
 /// un nom de compte — contrairement au `.`, qu'il admet.
-pub fn kubeconfig_token(user: &str, issued: &NewRefresh) -> Zeroizing<String> {
+pub fn proxy_token(user: &str, issued: &NewRefresh) -> Zeroizing<String> {
     Zeroizing::new(format!(
         "{KUBECONFIG_TOKEN_PREFIX}{user}_{}",
         issued.token.as_str()
     ))
 }
 
-/// Sépare un jeton de kubeconfig en compte et paire `<identifiant>.<secret>`.
+/// Sépare un jeton de proxy en compte et paire `<identifiant>.<secret>`.
 ///
 /// Ne valide pas le compte : c'est à l'appelant de le faire avant d'en dériver un nom de
 /// `Secret`. Rend `None` sur tout ce qui n'a pas la forme attendue.
-pub fn split_kubeconfig_token(presented: &str) -> Option<(&str, &str)> {
+pub fn split_proxy_token(presented: &str) -> Option<(&str, &str)> {
     let rest = presented.strip_prefix(KUBECONFIG_TOKEN_PREFIX)?;
     let (user, credential) = rest.split_once('_')?;
     if user.is_empty() || !credential.contains('.') {
@@ -453,6 +476,43 @@ mod tests {
         assert!(set.verify(&plugin.token, now(), SessionKind::Refresh).is_ok());
     }
 
+    /// Une application renouvelle son accès toutes les dix minutes. Comptée avec les fichiers
+    /// téléchargés, elle les aurait tous évincés en moins d'une heure — et quelqu'un aurait vu
+    /// son `kubectl` s'arrêter sans que personne n'ait rien révoqué.
+    #[test]
+    fn une_application_qui_renouvelle_n_evince_pas_les_kubeconfigs() {
+        let mut set = SessionSet::default();
+        let fichier = set.open(now(), week(), SessionKind::Kubeconfig);
+        for i in 0..MAX_SESSIONS + 3 {
+            set.open(
+                now() + Duration::seconds(i as i64),
+                week(),
+                SessionKind::Application,
+            );
+        }
+
+        assert_eq!(set.count_of(SessionKind::Kubeconfig), 1);
+        assert_eq!(set.count_of(SessionKind::Application), MAX_SESSIONS);
+        assert!(set.verify_proxy(&fichier.token, now()).is_ok());
+    }
+
+    /// Devant le proxy, les deux usages valent la même chose — et le troisième, non : un droit
+    /// de renouveler ne doit pas ouvrir le cluster.
+    #[test]
+    fn le_proxy_accepte_ses_deux_usages_et_pas_le_troisieme() {
+        let mut set = SessionSet::default();
+        let fichier = set.open(now(), week(), SessionKind::Kubeconfig);
+        let application = set.open(now(), week(), SessionKind::Application);
+        let plugin = set.open(now(), week(), SessionKind::Refresh);
+
+        assert!(set.verify_proxy(&fichier.token, now()).is_ok());
+        assert!(set.verify_proxy(&application.token, now()).is_ok());
+        assert_eq!(
+            set.verify_proxy(&plugin.token, now()),
+            Err(RefreshError::Invalid)
+        );
+    }
+
     /// La révocation vaut pour tout, quel que soit l'usage : c'est ce qui rend le kubeconfig
     /// téléchargé révocable.
     #[test]
@@ -486,9 +546,9 @@ mod tests {
     fn le_jeton_de_kubeconfig_se_compose_et_se_separe() {
         let mut set = SessionSet::default();
         let issued = set.open(now(), week(), SessionKind::Kubeconfig);
-        let jeton = kubeconfig_token("alice", &issued);
+        let jeton = proxy_token("alice", &issued);
 
-        let (user, credential) = split_kubeconfig_token(&jeton).unwrap();
+        let (user, credential) = split_proxy_token(&jeton).unwrap();
         assert_eq!(user, "alice");
         assert!(set
             .verify(credential, now(), SessionKind::Kubeconfig)
@@ -501,9 +561,9 @@ mod tests {
     fn un_compte_pointe_se_separe_quand_meme() {
         let mut set = SessionSet::default();
         let issued = set.open(now(), week(), SessionKind::Kubeconfig);
-        let jeton = kubeconfig_token("jean.dupont", &issued);
+        let jeton = proxy_token("jean.dupont", &issued);
 
-        assert_eq!(split_kubeconfig_token(&jeton).unwrap().0, "jean.dupont");
+        assert_eq!(split_proxy_token(&jeton).unwrap().0, "jean.dupont");
     }
 
     #[test]
@@ -517,7 +577,7 @@ mod tests {
             "alice_id.secret",
             "",
         ] {
-            assert!(split_kubeconfig_token(faux).is_none(), "{faux:?}");
+            assert!(split_proxy_token(faux).is_none(), "{faux:?}");
         }
     }
 

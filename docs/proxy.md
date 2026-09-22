@@ -84,6 +84,10 @@ qui est remis, donc un retrait s'applique à l'application aussi vite qu'à `kub
 ferme son accès dans la seconde, là où un certificat de dix minutes la laissait travailler jusqu'à
 son expiration.
 
+La session ouverte porte l'usage `application`, et le plafond de cinq sessions se compte par
+usage : une application qui renouvelle toutes les dix minutes n'évince pas les kubeconfigs
+téléchargés du compte. Devant le proxy, les deux usages valent la même chose.
+
 ### Le publier séparément
 
 Pour exposer le proxy et le portail à deux adresses — n'ouvrir que l'une, les protéger
@@ -136,7 +140,7 @@ autorisées. `spec.disabled` produit le même effet, et interdit en plus toute r
 
 ```
 alice : 2 sessions fermées
-L'accès s'arrête dans 30 s au plus, kubeconfigs téléchargés compris.
+L'accès s'arrête dans 30 s au plus, kubeconfigs téléchargés et applications compris.
 ```
 
 Retirer un compte d'un `KdtGroup` prend effet tout aussi vite : les groupes sont relus à chaque

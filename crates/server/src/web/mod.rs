@@ -1204,8 +1204,14 @@ async fn issue_proxy_kubeconfig(
     user: &KdtUser,
     subject: &Subject,
 ) -> Result<(String, chrono::DateTime<Utc>), String> {
-    let (token, expires_at) =
-        open_proxy_session(state, user, subject, state.config.download_token_ttl).await?;
+    let (token, expires_at) = open_proxy_session(
+        state,
+        user,
+        subject,
+        state.config.download_token_ttl,
+        SessionKind::Kubeconfig,
+    )
+    .await?;
     let endpoint = proxy_endpoint(state)?;
 
     kubeconfig::bearer(&endpoint, subject, &token)
@@ -1222,22 +1228,25 @@ async fn issue_proxy_kubeconfig(
 /// c'est l'entrée de session dans le cluster qui lui donne sa valeur. La retirer suffit à
 /// éteindre l'accès, où qu'il soit — fichier téléchargé comme application.
 ///
-/// La durée est passée par l'appelant : un fichier vit ses jours parce que personne ne le
-/// renouvelle, une application n'a besoin que du temps d'y revenir.
+/// La durée et l'usage viennent de l'appelant : un fichier vit ses jours parce que personne ne le
+/// renouvelle, une application n'a besoin que du temps d'y revenir. Les deux usages ouvrent la
+/// même chose devant le proxy, mais le plafond les compte séparément — sans quoi une application
+/// qui renouvelle toutes les dix minutes évincerait les kubeconfigs téléchargés d'un compte.
 async fn open_proxy_session(
     state: &AppState,
     user: &KdtUser,
     subject: &Subject,
     validity: std::time::Duration,
+    kind: SessionKind,
 ) -> Result<(String, chrono::DateTime<Utc>), String> {
     let validity =
         chrono::Duration::from_std(validity).expect("durée bornée à la lecture de la configuration");
     state
         .sessions
         .update(user, |sessions| {
-            let issued = sessions.open(Utc::now(), validity, SessionKind::Kubeconfig);
+            let issued = sessions.open(Utc::now(), validity, kind);
             (
-                crate::sessions::kubeconfig_token(subject.name(), &issued).to_string(),
+                crate::sessions::proxy_token(subject.name(), &issued).to_string(),
                 issued.session.expires_at,
             )
         })
@@ -1966,8 +1975,15 @@ async fn api_proxy_credential(
 
     // Les groupes ne voyagent pas : contrairement à un certificat, ils ne sont pas figés dans ce
     // qui est remis. Le proxy les relit à chaque requête, ce qui rend un retrait immédiat.
-    let (token, expires_at) =
-        match open_proxy_session(&state, &kdt_user, &subject, state.config.cert_ttl).await {
+    let (token, expires_at) = match open_proxy_session(
+        &state,
+        &kdt_user,
+        &subject,
+        state.config.cert_ttl,
+        SessionKind::Application,
+    )
+    .await
+    {
             Ok(pair) => pair,
             Err(e) => {
                 warn!(user = %name, erreur = %e, "ouverture de session impossible");

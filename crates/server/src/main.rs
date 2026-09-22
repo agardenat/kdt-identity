@@ -525,7 +525,7 @@ async fn revoke(name: &str, context: Option<&str>) -> anyhow::Result<()> {
     // le proxy, il n'y a rien en circulation : le jeton ne vaut que ce que le cluster en dit.
     match config.credential_mode {
         CredentialMode::Proxy => println!(
-            "L'accès s'arrête dans {} au plus, kubeconfigs téléchargés compris.",
+            "L'accès s'arrête dans {} au plus, kubeconfigs téléchargés et applications compris.",
             humanise(config.proxy_cache_ttl)
         ),
         mode => println!(
