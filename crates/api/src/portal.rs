@@ -23,6 +23,8 @@ pub const SESSION_PATH: &str = "/api/v1/session";
 pub const CREDENTIAL_PATH: &str = "/api/v1/credentials";
 /// Chemin de la demande de jeton, en mode OIDC.
 pub const TOKEN_PATH: &str = "/api/v1/token";
+/// Chemin de la demande d'un accès par le proxy, en mode proxy.
+pub const PROXY_PATH: &str = "/api/v1/proxy";
 /// Chemin de la fermeture d'une session OIDC.
 pub const REVOKE_PATH: &str = "/api/v1/revoke";
 /// Chemin d'entrée du flow d'autorisation, où le navigateur est envoyé.
@@ -383,6 +385,35 @@ pub struct CredentialResponse {
     pub expires_at: String,
 }
 
+/// Ce qu'une application présente pour obtenir un accès par le proxy.
+///
+/// Même jeton de session que pour un certificat : ce qui change est ce qu'on demande, pas la
+/// façon de prouver qui demande.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyCredentialRequest {
+    pub token: String,
+}
+
+/// De quoi parler au cluster par le proxy : où, avec quoi, et jusqu'à quand.
+///
+/// L'adresse est rendue par le serveur plutôt que composée par le client : elle dépend du
+/// déploiement — le proxy est servi par le portail sous `/k8s`, ou publié à sa propre racine —
+/// et la recomposer ailleurs ferait diverger les deux règles.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyCredentialResponse {
+    /// Jeton à présenter en `Authorization: Bearer`. Vérifié à chaque requête, donc révocable.
+    pub token: String,
+    /// Racine du cluster, chemin compris : `<proxy>/k8s/<cluster>`.
+    pub server: String,
+    /// Expiration au format RFC 3339.
+    pub expires_at: String,
+    /// Autorité à vérifier, si le certificat du proxy n'est pas d'une autorité publique.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_authority: Option<String>,
+}
+
 /// Ce qu'une application présente pour échanger un code d'autorisation.
 ///
 /// Le `code_verifier` est ce qui prouve que celle qui échange le code est celle qui l'a demandé :
@@ -459,6 +490,20 @@ mod tests {
         let relu: CredentialRequest =
             serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
         assert_eq!(relu.csr, request.csr);
+
+        let issued = ProxyCredentialResponse {
+            token: "kdt_alice.secret".into(),
+            server: "https://identity.example.com/k8s/demo".into(),
+            expires_at: "2026-09-22T12:00:00Z".into(),
+            certificate_authority: None,
+        };
+        let json = serde_json::to_value(&issued).unwrap();
+        assert!(json.get("expiresAt").is_some(), "{json}");
+        // L'autorité absente ne voyage pas : un champ `null` obligerait chaque client à
+        // distinguer « pas d'autorité » de « autorité vide ».
+        assert!(json.get("certificateAuthority").is_none(), "{json}");
+        let relu: ProxyCredentialResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(relu.server, issued.server);
     }
 
     /// Un serveur antérieur au mode OIDC ne renvoie pas ce champ. Le client doit alors lire

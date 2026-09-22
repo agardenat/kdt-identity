@@ -40,8 +40,8 @@ use crate::ldap::{Directory, LdapError};
 use crate::oidc_auth::{OidcError, Pending, Provider};
 use kdt_identity_api::portal::{
     AuthMode, AuthorizeTokenRequest, CredentialMode, CredentialRequest, CredentialResponse,
-    PortalDescriptor, RevokeRequest, SessionGrant, SessionRequest, SessionResponse, TokenRequest,
-    TokenResponse,
+    PortalDescriptor, ProxyCredentialRequest, ProxyCredentialResponse, RevokeRequest, SessionGrant,
+    SessionRequest, SessionResponse, TokenRequest, TokenResponse,
 };
 use kdt_identity_api::{KdtGroup, KdtUser};
 use kube::api::{Api, ListParams};
@@ -181,6 +181,16 @@ pub fn router(state: Shared) -> Router {
     let router = match state.config.auth_mode {
         AuthMode::Local => router.route("/activate", get(activate_page).post(activate_submit)),
         AuthMode::Ldap | AuthMode::Oidc => router,
+    };
+
+    // La demande d'accès par le proxy n'existe que là où il y a un proxy. Montée ailleurs, elle
+    // ouvrirait des sessions de kubeconfig que rien ne consommerait — et une application les
+    // prendrait pour un accès qui marche.
+    let router = match state.config.credential_mode {
+        CredentialMode::Proxy => {
+            router.route(kdt_identity_api::portal::PROXY_PATH, post(api_proxy_credential))
+        }
+        CredentialMode::Certificate | CredentialMode::Oidc => router,
     };
 
     // Les points d'accès OIDC n'existent qu'en mode OIDC. Le document de découverte est
@@ -1194,9 +1204,35 @@ async fn issue_proxy_kubeconfig(
     user: &KdtUser,
     subject: &Subject,
 ) -> Result<(String, chrono::DateTime<Utc>), String> {
-    let validity = chrono::Duration::from_std(state.config.download_token_ttl)
-        .expect("durée bornée à la lecture de la configuration");
-    let (token, expires_at) = state
+    let (token, expires_at) =
+        open_proxy_session(state, user, subject, state.config.download_token_ttl).await?;
+    let endpoint = proxy_endpoint(state)?;
+
+    kubeconfig::bearer(&endpoint, subject, &token)
+        .map(|yaml| (yaml, expires_at))
+        .map_err(|e| {
+            warn!(erreur = %e, "assemblage du kubeconfig en échec");
+            "L'assemblage du kubeconfig a échoué.".to_string()
+        })
+}
+
+/// Ouvre une session de kubeconfig et rend le jeton qui la porte.
+///
+/// Rien n'est signé ni émis : le jeton est tiré au sort, seule son empreinte est conservée, et
+/// c'est l'entrée de session dans le cluster qui lui donne sa valeur. La retirer suffit à
+/// éteindre l'accès, où qu'il soit — fichier téléchargé comme application.
+///
+/// La durée est passée par l'appelant : un fichier vit ses jours parce que personne ne le
+/// renouvelle, une application n'a besoin que du temps d'y revenir.
+async fn open_proxy_session(
+    state: &AppState,
+    user: &KdtUser,
+    subject: &Subject,
+    validity: std::time::Duration,
+) -> Result<(String, chrono::DateTime<Utc>), String> {
+    let validity =
+        chrono::Duration::from_std(validity).expect("durée bornée à la lecture de la configuration");
+    state
         .sessions
         .update(user, |sessions| {
             let issued = sessions.open(Utc::now(), validity, SessionKind::Kubeconfig);
@@ -1209,9 +1245,12 @@ async fn issue_proxy_kubeconfig(
         .map_err(|e| {
             warn!(user = subject.name(), erreur = %e, "ouverture de session impossible");
             "L'ouverture de la session a échoué. Réessayez dans un instant.".to_string()
-        })?;
+        })
+}
 
-    let endpoint = kubeconfig::ClusterEndpoint {
+/// Où joindre le cluster par le proxy, et avec quelle autorité le vérifier.
+fn proxy_endpoint(state: &AppState) -> Result<kubeconfig::ClusterEndpoint, String> {
+    Ok(kubeconfig::ClusterEndpoint {
         name: state.endpoint.name.clone(),
         server: crate::proxy::server_url(state.config.proxy_public_url(), &state.endpoint.name),
         certificate_authority_pem: match state.config.proxy_ca_file.as_deref() {
@@ -1221,14 +1260,7 @@ async fn issue_proxy_kubeconfig(
                 "L'autorité du proxy est illisible.".to_string()
             })?),
         },
-    };
-
-    kubeconfig::bearer(&endpoint, subject, &token)
-        .map(|yaml| (yaml, expires_at))
-        .map_err(|e| {
-            warn!(erreur = %e, "assemblage du kubeconfig en échec");
-            "L'assemblage du kubeconfig a échoué.".to_string()
-        })
+    })
 }
 
 async fn render_account(state: &AppState, user: &str, error: Option<&str>) -> Response {
@@ -1883,6 +1915,85 @@ async fn api_credential(
             }
         }
     }
+}
+
+/// Remet à une application de quoi parler au cluster par le proxy.
+///
+/// C'est l'équivalent, en mode proxy, de la demande de certificat : même jeton de session
+/// présenté, même relecture des groupes, et une durée courte que l'appelante renouvelle. Ce qui
+/// change est ce qui est remis — un jeton qui ne vaut rien sans le cluster, et que `revoke`
+/// éteint dans la seconde, là où un certificat vit jusqu'à son expiration.
+async fn api_proxy_credential(
+    State(state): State<Shared>,
+    axum::Json(request): axum::Json<ProxyCredentialRequest>,
+) -> Response {
+    let Ok(name) = state
+        .signer
+        .verify(purpose::API_CREDENTIAL, &request.token, Utc::now().timestamp())
+    else {
+        warn!("jeton d'émission absent, invalide ou expiré");
+        return unauthorized_json();
+    };
+
+    // Le compte est relu ici, et non déduit du jeton de session : entre l'ouverture et cette
+    // demande, il a pu être désactivé. Le proxy le relira à chaque requête, mais ouvrir une
+    // session pour un compte fermé n'a aucun sens.
+    let Ok(kdt_user) = state.users.get(&name).await else {
+        warn!(user = %name, "compte introuvable");
+        return unauthorized_json();
+    };
+    let activated = state
+        .store
+        .get(&name)
+        .await
+        .ok()
+        .flatten()
+        .map(|c| c.is_activated())
+        .unwrap_or(false);
+    let phase = logic::phase(&kdt_user, activated);
+    if !logic::may_request_own_credential(phase) {
+        warn!(user = %name, ?phase, "émission refusée");
+        return unauthorized_json();
+    }
+
+    let (subject, _) = match subjects(&state, &name).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(user = %name, erreur = %e, "groupes illisibles");
+            return internal_error_json();
+        }
+    };
+
+    // Les groupes ne voyagent pas : contrairement à un certificat, ils ne sont pas figés dans ce
+    // qui est remis. Le proxy les relit à chaque requête, ce qui rend un retrait immédiat.
+    let (token, expires_at) =
+        match open_proxy_session(&state, &kdt_user, &subject, state.config.cert_ttl).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(user = %name, erreur = %e, "ouverture de session impossible");
+                return internal_error_json();
+            }
+        };
+
+    let endpoint = match proxy_endpoint(&state) {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            warn!(user = %name, erreur = %e, "adresse du proxy indisponible");
+            return internal_error_json();
+        }
+    };
+
+    info!(user = %name, %expires_at, "accès par le proxy remis");
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        axum::Json(ProxyCredentialResponse {
+            token,
+            server: endpoint.server,
+            expires_at: expires_at.to_rfc3339(),
+            certificate_authority: endpoint.certificate_authority_pem,
+        }),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------- API OIDC

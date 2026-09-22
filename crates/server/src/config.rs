@@ -317,7 +317,8 @@ pub struct ServerConfig {
     pub ldap: Option<LdapConfig>,
     /// Présente si et seulement si `auth_mode` vaut `oidc`.
     pub oidc_auth: Option<OidcAuthConfig>,
-    /// Durée de validité des certificats remis au plugin.
+    /// Durée de validité de ce qui est remis à un client qui sait renouveler : le certificat du
+    /// plugin, ou le jeton de proxy d'une application.
     pub cert_ttl: Duration,
     /// Durée de validité des certificats téléchargés depuis le portail.
     pub download_cert_ttl: Duration,

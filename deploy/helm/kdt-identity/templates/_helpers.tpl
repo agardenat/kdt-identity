@@ -80,6 +80,13 @@ app.kubernetes.io/instance: {{ .Release.Name }}
   Posées sur les deux déploiements comme le reste : « revoke » nomme le délai de prise d'effet,
   qui est celui du cache du proxy, et il s'exécute dans le pod du contrôleur.
 */}}
+{{- /*
+  La même durée qu'en mode certificat, et pour la même raison : c'est ce que vit un accès remis
+  à une application qui sait le renouveler — kdt-web. Sans rapport avec `proxy.tokenTtl`, qui
+  est celle du fichier téléchargé, que personne ne renouvelle.
+*/}}
+- name: KDT_IDENTITY_CERT_TTL
+  value: {{ .Values.certTtl | quote }}
 {{- if .Values.proxy.url }}
 - name: KDT_IDENTITY_PROXY_URL
   value: {{ .Values.proxy.url | quote }}

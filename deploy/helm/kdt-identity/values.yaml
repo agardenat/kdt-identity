@@ -143,7 +143,10 @@ proxy:
   # doit finir par s'éteindre de lui-même, même si personne ne pense à le révoquer.
   tokenTtl: 7d
 
-# Durée de validité des certificats remis au plugin, entre 10m et 30d. Sans effet en mode oidc.
+# Durée de validité de ce qui est remis à un client qui sait renouveler, entre 10m et 30d :
+# le certificat du plugin en mode certificate, le jeton de proxy d'une application — kdt-web —
+# en mode proxy. Sans effet en mode oidc, et sans rapport avec `proxy.tokenTtl`, qui est celle
+# du fichier téléchargé, que personne ne renouvelle.
 #
 # Dix minutes, soit le plancher de l'API Kubernetes : c'est le délai maximal entre une
 # révocation et sa prise d'effet, et il ne coûte rien puisque le plugin renouvelle tout seul.

@@ -8,6 +8,25 @@ tag `v<version>` qui a déclenché sa publication.
 Les notes de version publiées avec un tag sont la section correspondante de ce fichier, extraite
 par `packaging/changelog-section.sh` : ce fichier est la source, pas une copie.
 
+## [1.5.0] — 2026-09-22
+
+- **feat(server)** — **une application autorisée obtient un accès par le proxy**, là où elle ne
+  pouvait jusqu'ici demander qu'un certificat ou un jeton OIDC. En mode `proxy`, le portail monte
+  `POST /api/v1/proxy` : contre le jeton de session déjà rendu par `/api/v1/session`, il ouvre une
+  session de kubeconfig et rend l'adresse du cluster, le jeton et sa date d'expiration.
+
+  Sans cela, un déploiement en mode proxy n'avait rien à remettre à kdt-web : le proxy n'accepte
+  que les sessions de type `kubeconfig`, et seul le bouton de téléchargement du portail en ouvrait
+  une. Le flow d'autorisation aboutissait à une session que l'application ne pouvait pas employer.
+
+  L'accès vit `certTtl` — dix minutes par défaut —, l'application le renouvelle comme elle
+  renouvelait un certificat, et deux propriétés apparaissent au passage : ses groupes ne sont plus
+  figés dans ce qui est remis, donc un retrait s'y applique aussi vite qu'à `kubectl`, et `revoke`
+  coupe désormais son accès sous `proxy.cacheTtl` — ce qu'un certificat de dix minutes ne
+  permettait pas. La route n'est montée qu'en mode proxy.
+
+  Voir [docs/proxy.md](docs/proxy.md).
+
 ## [1.4.0] — 2026-09-21
 
 - **feat(server)** — **`credentialMode: proxy`, un kubeconfig standard et révocable**. Le portail

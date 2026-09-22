@@ -186,6 +186,13 @@ portail accepte. Il n'y a pas de registre d'applications ni d'enregistrement à 
 Ce que l'application obtient est un droit de session ordinaire : il compte dans les sessions du
 compte, `revoke` le ferme, `spec.disabled` le coupe.
 
+Ce qu'elle en tire suit le mode du déploiement, comme pour le plugin : un certificat en mode
+`certificate`, un jeton d'identité en mode `oidc`, et en mode `proxy` un accès par le proxy —
+l'adresse du cluster et un jeton, obtenus sur `/api/v1/proxy`, valables `certTtl` et renouvelés
+sans que personne ne se reconnecte. Ce dernier est le seul que `revoke` coupe **aussi** du côté de
+l'application, et dans la seconde : elle parle au cluster à travers le proxy, qui relit le compte
+et ses groupes à chaque requête.
+
 > **Servez l'application sous le même domaine enregistrable que le portail.** Le cookie de session
 > est `SameSite=Strict` : `kdt.example.com` et `identity.example.com` le partagent, un domaine
 > étranger ne le recevra pas et chaque autorisation repassera par une connexion complète.

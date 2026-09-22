@@ -33,6 +33,7 @@ le cluster.
 | Identité produite | `kdt:alice`, groupes `kdt:*` | identique | identique |
 | Kubeconfig téléchargeable | oui, **révocable** | oui, non révocable | non |
 | Plugin nécessaire | non | non, mais recommandé | oui |
+| Ce qu'une application autorisée obtient | un accès par le proxy, coupé par `revoke` | un certificat de 10 min | un jeton de 5 min |
 | kdt-identity sur le chemin | oui | non | non |
 | Audit d'une session | identité impersonnée | empreinte du certificat | `jti` unique par jeton |
 

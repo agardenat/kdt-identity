@@ -61,6 +61,29 @@ certificat, même Ingress. Le kubeconfig remis pointe sur
 Partager l'hôte n'ouvre rien : `kubectl` n'envoie pas de cookie, et le proxy n'authentifie que
 sur `Authorization: Bearer`.
 
+### Les applications autorisées
+
+Une application qui a reçu un droit de session — kdt-web — ne télécharge pas de fichier : elle
+demande un accès sur `POST /api/v1/proxy`, en présentant le jeton de session que lui a rendu
+`/api/v1/session`, et reçoit l'adresse du cluster, un jeton et sa date d'expiration.
+
+```json
+{
+  "token": "kdt_alice.…",
+  "server": "https://identity.example.com/k8s/production",
+  "expiresAt": "2026-09-22T12:10:00Z"
+}
+```
+
+L'accès vit `certTtl` — dix minutes par défaut —, l'application le renouvelle comme elle
+renouvellerait un certificat, et la route n'est montée qu'en mode proxy : un client qui la trouve
+sait qu'il y a un proxy à joindre.
+
+Deux conséquences qui n'existent pas dans les autres modes : les groupes ne sont pas figés dans ce
+qui est remis, donc un retrait s'applique à l'application aussi vite qu'à `kubectl` ; et `revoke`
+ferme son accès dans la seconde, là où un certificat de dix minutes la laissait travailler jusqu'à
+son expiration.
+
 ### Le publier séparément
 
 Pour exposer le proxy et le portail à deux adresses — n'ouvrir que l'une, les protéger
@@ -82,6 +105,7 @@ Le chart ajoute alors un port au pod et au Service ; l'Ingress est à votre char
 | `proxy.cacheTtl` | `30s` | délai maximal entre une révocation et sa prise d'effet |
 | `proxy.tokenTtl` | `7d` | durée de vie du jeton, entre `1h` et `30d` |
 | `proxy.caSecret` | — | autorité à inscrire dans les kubeconfigs, si le certificat n'est pas public |
+| `certTtl` | `10m` | durée de l'accès remis à une application autorisée, qui le renouvelle |
 
 `cacheTtl` est le **seul** curseur du délai de révocation. Il existe pour ne pas relire un
 `Secret` et deux objets à chaque `kubectl get`. À `0s`, la révocation est immédiate et chaque
@@ -107,8 +131,8 @@ explicitement.
 kdt-identity-server revoke alice
 ```
 
-ferme toutes les sessions d'un compte — plugin **et** kubeconfigs téléchargés. `spec.disabled`
-produit le même effet, et interdit en plus toute réouverture.
+ferme toutes les sessions d'un compte — plugin, kubeconfigs téléchargés **et** applications
+autorisées. `spec.disabled` produit le même effet, et interdit en plus toute réouverture.
 
 ```
 alice : 2 sessions fermées
